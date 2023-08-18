@@ -24,10 +24,10 @@ setup(
     author_email="robert.kalinowski@sharkbits.com",
     packages=find_packages(),
     platforms="any",
-    python_requires='>=3.8',
+    python_requires='>=3.9',
     license='MIT',
     install_requires=[
-        "polib==1.1.1",
+        "polib==1.2.0",
     ],
     entry_points={
         "console_scripts": [
