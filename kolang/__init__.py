@@ -12,9 +12,10 @@ import sys
 import re
 import string
 from dataclasses import dataclass, field
-from typing import Union, Optional, NamedTuple
+from typing import Union, Optional, Any, NamedTuple
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+from enum import Enum, auto
 import json
 import argparse
 try:
@@ -41,7 +42,7 @@ logger = logging.Logger('kolang')
 
 
 __author__ = 'rysson'
-__version__ = '0.1.6'
+__version__ = '0.1.7'
 
 
 # Monkey Patching
@@ -61,6 +62,31 @@ _real_BaseFile_metadata_as_entry = polib._BaseFile.metadata_as_entry
 polib._BaseFile.metadata_as_entry = _BaseFile_metadata_as_entry
 
 
+class FuncType(Enum):
+    L = auto()                     # L()
+    GetLocalizedString = auto()    # getLocalizedString()
+    Localize = auto()              # $LOCALIZE[]
+
+
+@name_tuple_field
+class L8Func(NamedTuple):
+    #: Function regex pattern.
+    pattern: str
+    #: Funtion type (LL / getLocalizedString)
+    type: FuncType = FuncType.GetLocalizedString
+    #: Where this function is allowed.
+    paths: set[Path] = None
+
+    def __str__(self) -> str:
+        return self.pattern
+
+    def is_allowed(self, path: Path) -> bool:
+        if self.paths is None:
+            return True
+        path = path.resolve()
+        return any(path.is_relative_to(p) for p in self.paths)
+
+
 @name_tuple_field
 class AddonConf(NamedTuple):
     #: Paths to scan.
@@ -69,6 +95,8 @@ class AddonConf(NamedTuple):
     langs: set[str] = field(default_factory=set)
     #: Paths to skip.
     skip: set[str] = field(default_factory=set)
+    #: Extra python localzed function/method to detect.
+    l8funcs: list[L8Func] = field(default_factory=list)
 
 
 class XmlInput(NamedTuple):
@@ -215,7 +243,8 @@ class Translate(TranslateBase):
     _RE_PO_VAL = re.compile(r'\s*"((?:\\.|[^"])*)"')
 
     def __init__(self, *, dry_run=False, stats=True, id_from=30100, id_policy='max', handle_getLocalizedString=True,
-                 mark_translated=False, mark_obsoleted=True, backup_pattern='{}~', wrap_width: 999999):
+                 mark_translated=False, mark_obsoleted=True, backup_pattern='{}~',
+                 po_wrap_width: int = 999999, encoding: str = 'utf8'):
         self.xml_inputs: list[XmlInput] = []
         self.py_inputs: list[PyInput] = []
         self._ids: set[int] = set()
@@ -229,7 +258,8 @@ class Translate(TranslateBase):
         self.mark_translated = mark_translated
         self.mark_obsoleted = mark_obsoleted
         self.backup_pattern = backup_pattern
-        self.po_wrap_width = wrap_width
+        self.po_wrap_width = po_wrap_width
+        self.encoding = encoding
 
     def _add_label(self, label, *, used=True):
         """Add label to existing data (by ID and by TEXT)."""
@@ -290,12 +320,17 @@ class Translate(TranslateBase):
 
         root = tree.getroot()
         for node in root.iterfind('.//heading'):
+            logger.debug(f'  found XML heading, value {node.text!r}')
             add(node.text, NodeValue(node, None))
         for attr in ('label', 'help'):
             for node in root.iterfind(f'.//*[@{attr}]'):
-                add(node.get(attr), NodeValue(node, attr))
+                text = node.get(attr)
+                if text:
+                    logger.debug(f'  found XML node {node.tag} attr {attr}, value {text!r}')
+                add(text, NodeValue(node, attr))
         for node in root.iterfind('.//*[@lvalues]'):
             for i, text in enumerate(node.get('lvalues').split('|')):
+                logger.debug(f'  found XML lvalue {text!r}')
                 add(text, NodeValue(node, 'lvalues', index=i))
 
     def load_xml(self, path: Union[str, Path], base: Optional[Union[str, Path]] = None):
@@ -308,7 +343,8 @@ class Translate(TranslateBase):
         self._scan_xml(tree)
         return tree
 
-    def load_py(self, path: Union[str, Path], base: Optional[Union[str, Path]] = None):
+    def load_py(self, path: Union[str, Path], base: Optional[Union[str, Path]] = None, *,
+                l8funcs: Optional[list[L8Func]] = None) -> None:
         """Load strings from Python source and keep data."""
         def rstr(name='str'):
             pat = '|'.join((
@@ -331,7 +367,7 @@ class Translate(TranslateBase):
 
         if base is not None:
             base = Path(base)
-        with open(path) as f:
+        with open(path, encoding=self.encoding) as f:
             data = f.read()
         file = PyInput(path, data, base)
         self.py_inputs.append(file)
@@ -339,8 +375,13 @@ class Translate(TranslateBase):
         _R_CM = r'#\s*(?P<comment>.*)'
         _R_LL = fr'\b(?P<label>LL?)\s*(?P<label_bracket>\()\s*(?:(?P<mid>\d+)\s*,\s*)?{rstr("msg")}\s*\)'
         pat = f'{_R_CM}|{rstr()}|{_R_LL}'
+        l8funcs = list(l8funcs)
         if self.handle_getLocalizedString:
-            pat += fr'|\bgetLocalizedString\s*\((?P<gls>\s*(?:(?P<gls_id>\d+)|{rstr("gls_text")})\s*)\)'
+            l8funcs.append(L8Func('getLocalizedString'))
+        gls_funcs = [f for f in l8funcs if f.type == FuncType.GetLocalizedString and f.is_allowed(path)]
+        if gls_funcs:
+            ff = '|'.join(fr'(?:{f})' for f in gls_funcs)
+            pat += fr'|\b(?P<gls_func>{ff})\s*\(\s*(?P<gls>(?:(?P<gls_id>\d+)|{rstr("gls_text")}))\s*[),]'
         R = re.compile(pat)
         RS = re.compile(r'\$LOCALIZE\[(?:(?P<id>\d+)|(?P<text>(?:[\\%].|\[(?:[\\%].|[^]])*\]|[^]])+))\]')
         RS_ESC = re.compile(r'[\\%](.)')
@@ -375,24 +416,31 @@ class Translate(TranslateBase):
             # getLocalizedString()
             elif r['gls'] is not None:
                 mid = r['gls_id']
+                func = r['gls_func']
+                text = rval(r, 'gls_text')
+                logger.debug(f'  found func {func!r}, id {mid}, text {text!r}')
                 if mid is None:
                     tr = Trans(file, start=r.start('gls'), end=r.end('gls'))
                 else:
                     mid = int(mid)
-                label = Label(mid, rval(r, 'gls_text'))
+                label = Label(mid, text)
             if label is not None:
                 if tr is not None:
                     label.trans.append(tr)
                 self._add_label(label)
 
-    def _load_input(self, path: Path):
+    def _load_input(self, path: Path, *, l8funcs: Optional[list[L8Func]] = None) -> None:
         """Load single file (XML / py) and keep data."""
         logger.info(f'Loading source {path}')
         if path.suffix == '.py':
-            return self.load_py(path)
+            return self.load_py(path, l8funcs=l8funcs)
         return self.load_xml(path)
 
-    def load_input(self, path: Union[str, Path], *, skip: set[Path] = set()):
+    def load_input(self,
+                   path: Union[str, Path],
+                   *,
+                   skip: set[Path] = set(),
+                   l8funcs: Optional[list[L8Func]] = None) -> None:
         """Load input file / py-dir (XML / py) and keep data."""
         res = None
         path = Path(path)
@@ -403,9 +451,9 @@ class Translate(TranslateBase):
                 if any(p.resolve().is_relative_to(s) for s in skip):
                     pass
                 else:
-                    res = self._load_input(p)
+                    res = self._load_input(p, l8funcs=l8funcs)
         else:
-            res = self._load_input(path)
+            res = self._load_input(path, l8funcs=l8funcs)
         return res
 
     def load_settings(self, path: Optional[Union[str, Path, None]] = None):
@@ -515,7 +563,7 @@ class Translate(TranslateBase):
             logger.debug(f'Write py:  {input.path.resolve()}')
         else:
             path = self._write_entry(input.path.resolve(), base=input.base)
-            with open(path, 'w') as f:
+            with open(path, 'w', encoding=self.encoding) as f:
                 f.write(input.data)
 
     def translate(self, lang: str, path: Optional[Union[str, Path, None]] = None):
@@ -616,14 +664,22 @@ class Translate(TranslateBase):
         return AddonConf(paths=paths)
 
     def load_addon_config(self, path: Path) -> AddonConf:
+        def l8paths(paths: Union[list[str], str]) -> set[Path]:
+            if not paths:
+                return None
+            if isinstance(paths, str):
+                paths = (paths, )
+            return {p for pp in paths for p in Path(base.parent).glob(pp)}
+
         if path.is_dir():
             path = path / '.translation.json'
             if not path.exists():
                 return None
-        with open(path) as f:
+        with open(path, encoding='utf8') as f:
             conf = json.load(f)
         options = conf.get('options', {})
-        for attr in ('id-from', 'mark-translated', 'mark-obsoleted', 'backup-pattern', 'po-wrap-width'):
+        for attr in ('id-from', 'mark-translated', 'mark-obsoleted', 'backup-pattern', 'po-wrap-width',
+                     'encoding'):
             if attr in options:
                 setattr(self, attr.replace('-', '_'), options[attr])
         if 'get-localized-string' in options:
@@ -648,11 +704,19 @@ class Translate(TranslateBase):
                 paths.extend(path.glob(pat.name))
         skip = {Path(p) for p in conf.get('skip', [])}
         langs = {self.lang_code(L) for L in conf.get('languages', ())}
-        return AddonConf(paths=paths, langs=langs, skip=skip)
+        l8funcs = []
+        for fitem in conf.get('localized-functions', []):
+            if isinstance(fitem, str):
+                fitem = {'name': fitem}
+            if (pat := fitem.get('regex')):
+                l8funcs.append(L8Func(pat, paths=l8paths(fitem.get('path'))))
+            elif (name := fitem.get('name')):
+                l8funcs.append(L8Func(re.escape(name), paths=l8paths(fitem.get('path'))))
+        return AddonConf(paths=paths, langs=langs, skip=skip, l8funcs=l8funcs)
         # if not bak.is_relative_to(path.parent):
         #     ValueError('Backup path {bak} is outsiede of source {path}')
 
-    def load_addon(self, path, *, skip: set[Path] = set()):
+    def load_addon(self, path, *, skip: set[Path] = set(), l8funcs: Optional[list[L8Func]] = None) -> None:
         if not (path / 'addon.xml').exists():
             logger.warning(f'Invalid addon folder {path!r}, no addon.xml')
         conf = self.load_addon_config(path)
@@ -662,17 +726,17 @@ class Translate(TranslateBase):
             skip = set(Path(s) for s in skip or ()) | conf.skip
             skip = {s.resolve() for s in skip}
             for p in conf.paths:
-                self.load_input(p, skip=skip)
+                self.load_input(p, skip=skip, l8funcs=l8funcs)
 
 
 def process(inputs, *, args, langs=None, output=None, atype=None):
     trans = Translate(dry_run=args.dry_run, id_from=args.id_from, id_policy=args.id_policy,
                       handle_getLocalizedString=args.gls, backup_pattern=args.backup_pattern,
                       mark_translated=args.mark_translated, mark_obsoleted=args.mark_obsoleted,
-                      wrap_width=args.wrap_width,
+                      po_wrap_width=args.po_wrap_width,
                       )
     if args.verbose:
-        logging.basicConfig(level=logging.INFO)
+        logging.basicConfig(level=args.verbose)
         if logger.parent is None:
             logger.parent = logging.root
     else:
@@ -680,12 +744,13 @@ def process(inputs, *, args, langs=None, output=None, atype=None):
 
     if not args.enable_xml_etree:
         try:
-            from lxml import etree as _
+            from lxml import etree as _  # noqa: F401
         except ImportError:
             logger.fatal(' Missing lxml module, try `pip install lxml` or use --enable-xml-etree')
             sys.exit(1)
 
     langs = {trans.lang_code(L) for L in langs or ()}
+    l8funcs = [L8Func(re.escape(name)) for name in args.localized_functions or ()]
     base = ''
     conf = None
     if not output:
@@ -696,6 +761,7 @@ def process(inputs, *, args, langs=None, output=None, atype=None):
                 conf = trans.load_addon_config(path)
                 if conf:
                     langs |= conf.langs
+                    l8funcs += conf.l8funcs
                 logger.info(f'Language storage is in {path}')
                 break
 
@@ -737,11 +803,11 @@ def process(inputs, *, args, langs=None, output=None, atype=None):
         path = Path(path).resolve()
         if path.is_dir():
             if (path / 'addon.xml').exists():
-                trans.load_addon(path, skip=args.skip)
+                trans.load_addon(path, skip=args.skip, l8funcs=l8funcs)
             else:
                 logger.warning(f'There is NOT an addon in {path}, skipping')
         else:
-            trans.load_input(path)
+            trans.load_input(path, l8funcs=l8funcs)
     trans.scan()
     trans.generate()
     trans.write()
@@ -751,6 +817,22 @@ def process(inputs, *, args, langs=None, output=None, atype=None):
         if pattern:
             path = output / pattern.format(lang=lang, lang_lower=lang.lower())
         trans.translate(lang, path)
+
+
+def copy_kolang_py(output: Path = Path()) -> None:
+    mod = Path(__file__).parent.parent
+    if mod.is_file():  # pyz
+        from zipfile import ZipFile
+        with ZipFile(str(mod)) as z:
+            with z.open('kolang/kolang.py') as f:
+                content = f.read().decode()
+    else:
+        content = (mod / 'kolang' / 'kolang.py').read_text(encoding='utf8')
+    output /= 'kolang.py'
+    if output.exists():
+        logger.error(f'{output} already exists, remove it if you want get generate new kolang.py')
+    else:
+        output.write_text(content, encoding='utf8')
 
 
 def lang_type(ss):
@@ -778,6 +860,8 @@ def main(argv=None):
                    help='handle getLocalizedString() [default]')
     p.add_argument('--no-get-localized-string', dest='gls', action='store_false',
                    help='skip getLocalizedString()')
+    p.add_argument('-f', '--localized-function', dest='localized_functions', metavar='FUNC', action='append',
+                   help='extra get-localized-string function name')
     p.add_argument('--mark-obsoleted', action='store_true', default=True,
                    help='mark non-used translations as obsoleted [default]')
     p.add_argument('--no-mark-obsoleted', dest='mark_obsoleted', action='store_false',
@@ -786,14 +870,21 @@ def main(argv=None):
     p.add_argument('--backup-pattern', metavar='PATTERN', default='{}~', help='pattern for backup files [{}~]')
     p.add_argument('--no-backup-pattern', action='store_const', const=False, dest='backup_pattern',
                    help='no backup files')
-    p.add_argument('--wrap-width', metavar='WIDTH', default=999999, type=int, help='.po wrap width')
-    p.add_argument('--verbose', action='store_true', help='be more verbose')
+    p.add_argument('--encoding', default='utf8', help='force files encoding [utf8]')
+    p.add_argument('--po-wrap-width', metavar='WIDTH', default=999999, type=int, help='.po wrap width [999999]')
+    p.add_argument('--verbose', action='store_const', const=logging.INFO, help='be more verbose')
+    p.add_argument('--debug', action='store_const', const=logging.DEBUG, dest='verbose', help='be much more verbose')
     p.add_argument('--dry-run', action='store_true', help='do not modify anything')
     p.add_argument('--enable-xml-etree', action='store_true',
                    help='allow use xml.etree, XML comment are NOT supperted')
+    p.add_argument('--generate-kolang-py', action='store_true',
+                   help='generate kolang.py to use its L() in addon/plugin')
     p.add_argument('input', metavar='PATH', nargs='+', type=Path, help='path XML or PY file or addon folder')
     args = p.parse_args(argv)
     # print(args)
+    if args.generate_kolang_py:
+        copy_kolang_py(args.input[0])
+        return
     process(args.input, output=args.translation, langs=args.language, args=args)
 
 
