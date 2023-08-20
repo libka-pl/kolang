@@ -42,7 +42,7 @@ logger = logging.Logger('kolang')
 
 
 __author__ = 'rysson'
-__version__ = '0.1.7'
+__version__ = '0.1.8'
 
 
 # Monkey Patching
@@ -372,7 +372,7 @@ class Translate(TranslateBase):
         file = PyInput(path, data, base)
         self.py_inputs.append(file)
 
-        _R_CM = r'#\s*(?P<comment>.*)'
+        _R_CM = r'#[^\S\r\n]*(?P<comment>[^\r\n]+)'
         _R_LL = fr'\b(?P<label>LL?)\s*(?P<label_bracket>\()\s*(?:(?P<mid>\d+)\s*,\s*)?{rstr("msg")}\s*\)'
         pat = f'{_R_CM}|{rstr()}|{_R_LL}'
         l8funcs = list(l8funcs)
