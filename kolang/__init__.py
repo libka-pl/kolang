@@ -12,7 +12,8 @@ import sys
 import re
 import string
 from dataclasses import dataclass, field
-from typing import Union, Optional, Any, NamedTuple
+from itertools import chain
+from typing import Union, Optional, NamedTuple
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
@@ -42,7 +43,7 @@ logger = logging.Logger('kolang')
 
 
 __author__ = 'rysson'
-__version__ = '0.1.7'
+__version__ = '0.1.8'
 
 
 # Monkey Patching
@@ -66,6 +67,12 @@ class FuncType(Enum):
     L = auto()                     # L()
     GetLocalizedString = auto()    # getLocalizedString()
     Localize = auto()              # $LOCALIZE[]
+
+
+class XmlType(Enum):
+    Auto = auto()                  # auto-detect or unsupported like includes, variables
+    Settings = auto()              # settings.xml
+    Window = auto()                # skin/*.xml
 
 
 @name_tuple_field
@@ -131,7 +138,6 @@ class SafeFormatter(string.Formatter):
 
 def node_error(node: Element, msg: Optional[str] = None) -> None:
     """Log XML node error."""
-    # breakpoint()
     try:
         lno: int = node.sourceline
         if msg:
@@ -143,7 +149,7 @@ def node_error(node: Element, msg: Optional[str] = None) -> None:
         logger.warning(f'Node {node.tag} error{msg}')
 
 
-#: Source file (.py) translate info
+#: Source file (.py) translate info / translate in NodeValue
 class Trans(NamedTuple):
     file: PyInput
     start: int
@@ -167,7 +173,7 @@ class LabelList(list):
 
     def add(self, label):
         """Add label in new ID, otherwise merge."""
-        for i, lb in enumerate(self):
+        for lb in self:
             if lb.id is None and label.id is not None:
                 lb.id = label.id  # still label ID if was None
             if lb.id == label.id or label.id is None:
@@ -177,27 +183,41 @@ class LabelList(list):
                     assert label.text == lb.text
                 lb.nodes |= label.nodes
                 lb.trans.extend(label.trans)
-                # return i
                 return lb
         self.append(label)
         # return len(self) - 1
         return label
 
 
-class NodeValue:
+class NodeValue(NamedTuple):
     """Pseudo xml-node, points to node and one of old select "lvalues"."""
 
-    def __init__(self, node, attr, *, index=None):
-        self.node = node
-        self.attr = attr
-        self.index = index
+    #: XML node.
+    node: Element
+    #: Attribute name.
+    attr: str = None
+    #: Index in "lvalues" settings attribute.
+    index: int = None
+    #: Regex match for take substring of the value.
+    trans: Trans = None
 
     def __getattr__(self, key):
         return getattr(self.node, key)
 
-    def set_label(self, value):
+    def replace(self, text: str, value: str) -> str:
+        tr = self.trans
+        if not tr:
+            return value
+        if tr.fmt is not None:
+            value = tr.fmt.format(value=value, id=value)
+        return f'{text[:tr.start]}{value}{text[tr.end:]}'
+
+    def set_label(self, value: str) -> None:
         if self.attr is None:
-            self.node.text = value
+            if self.trans:
+                self.node.text = self.replace(self.node.text, value)
+            else:
+                self.node.text = value
         elif self.attr == 'lvalues':
             lst = self.node.get(self.attr, '').split('|')
             if len(lst) < self.index:
@@ -206,7 +226,10 @@ class NodeValue:
                 lst[self.index] = value
             self.node.set(self.attr, '|'.join(lst))
         else:
-            self.node.set(self.attr, value)
+            if self.trans:
+                self.node.set(self.attr, self.replace(self.node.get(self.attr, ''), value))
+            else:
+                self.node.set(self.attr, value)
 
 
 class TranslateBase:
@@ -241,6 +264,9 @@ class Translate(TranslateBase):
     _RE_READ_PO = re.compile(r'(?:^|\n)(?P<var>(?:msgctxt|msgid|msgstr))[ \t]*'
                              r'(?:[ \t]*[\n]"(?P<val>(?:\\.|[^"])*))+"')
     _RE_PO_VAL = re.compile(r'\s*"((?:\\.|[^"])*)"')
+    _RE_LOCALIZE = re.compile(r'\$LOCALIZE\[((?:\[[^]*]|"[^"]*"|[^]])*)\]')
+    # _RE_SKIP_LABEL = re.compile(r'\$\w+\[')
+    _RE_SKIP_LABEL = re.compile(r'\$(?:LOCALIZE|ADDON)\[')
 
     def __init__(self, *, dry_run=False, stats=True, id_from=30100, id_policy='max', handle_getLocalizedString=True,
                  mark_translated=False, mark_obsoleted=True, backup_pattern='{}~',
@@ -304,7 +330,7 @@ class Translate(TranslateBase):
             self._ids.add(label.id)
         return label
 
-    def _scan_xml(self, tree: ElementTree):
+    def _scan_xml(self, tree: ElementTree, xtype: XmlType = XmlType.Auto):
         """Scan single XML."""
         def add(text, node):
             if text is None:
@@ -319,19 +345,44 @@ class Translate(TranslateBase):
                 self._add_label(label)
 
         root = tree.getroot()
-        for node in root.iterfind('.//heading'):
-            logger.debug(f'  found XML heading, value {node.text!r}')
-            add(node.text, NodeValue(node, None))
-        for attr in ('label', 'help'):
-            for node in root.iterfind(f'.//*[@{attr}]'):
-                text = node.get(attr)
-                if text:
-                    logger.debug(f'  found XML node {node.tag} attr {attr}, value {text!r}')
-                add(text, NodeValue(node, attr))
-        for node in root.iterfind('.//*[@lvalues]'):
-            for i, text in enumerate(node.get('lvalues').split('|')):
-                logger.debug(f'  found XML lvalue {text!r}')
-                add(text, NodeValue(node, 'lvalues', index=i))
+        if xtype == XmlType.Auto:
+            if root.tag == 'settings':
+                xtype = XmlType.Settings
+            elif root.tag == 'window':
+                xtype = XmlType.Window
+
+        # -- settings.xml
+        if xtype == XmlType.Settings:
+            for node in root.iterfind('.//heading'):
+                logger.debug(f'  found set.XML heading, value {node.text!r}')
+                add(node.text, NodeValue(node, None))
+            for attr in ('label', 'help'):
+                for node in root.iterfind(f'.//*[@{attr}]'):
+                    text = node.get(attr)
+                    if text:
+                        logger.debug(f'  found set.XML node {node.tag} attr {attr}, value {text!r}')
+                    add(text, NodeValue(node, attr))
+            for node in root.iterfind('.//*[@lvalues]'):
+                for i, text in enumerate(node.get('lvalues').split('|')):
+                    logger.debug(f'  found set.XML lvalue {text!r}')
+                    add(text, NodeValue(node, 'lvalues', index=i))
+        # -- skin/window.xml
+        elif xtype == XmlType.Window:
+            # <label>TEXT</label>, w/o `$LOCALIZE[`
+            for node in root.iterfind('.//label'):
+                if not self._RE_SKIP_LABEL.search(node.text):
+                    logger.debug(f'  found win.XML label, value {node.text!r}')
+                    add(node.text, NodeValue(node, None,
+                                             trans=Trans(None, start=0, end=len(node.text), fmt='$LOCALIZE[{id}]')))
+            # <any>$LOCALIZE[...]</any>
+            for node in root.xpath('.//*[text()[contains(.,"$LOCALIZE[")]]'):
+                mm = list(self._RE_LOCALIZE.finditer(node.text))
+                for m in reversed(mm):  # from the end to avoid span move on text replace
+                    logger.debug(f'  found win.XML $LOCALIZE[], value {m[0]!r}')
+                    if m.re.groups:  # sub-expression used
+                        add(m[1], NodeValue(node, None, trans=Trans(None, *m.span(1), fmt=None)))
+                    else:
+                        add(m[0], NodeValue(node, None, trans=Trans(None, *m.span(), fmt=None)))
 
     def load_xml(self, path: Union[str, Path], base: Optional[Union[str, Path]] = None):
         """Load XML and keep data."""
@@ -372,7 +423,7 @@ class Translate(TranslateBase):
         file = PyInput(path, data, base)
         self.py_inputs.append(file)
 
-        _R_CM = r'#\s*(?P<comment>.*)'
+        _R_CM = r'#[^\S\r\n]*(?P<comment>[^\r\n]+)'
         _R_LL = fr'\b(?P<label>LL?)\s*(?P<label_bracket>\()\s*(?:(?P<mid>\d+)\s*,\s*)?{rstr("msg")}\s*\)'
         pat = f'{_R_CM}|{rstr()}|{_R_LL}'
         l8funcs = list(l8funcs)
@@ -447,7 +498,7 @@ class Translate(TranslateBase):
         if not path.exists():
             logger.warning('Path does not exist: {!r}, skipping.'.format(str(path)))
         elif path.is_dir():
-            for p in path.glob('**/*.py'):
+            for p in chain(path.glob('**/*.xml'), path.glob('**/*.py')):
                 if any(p.resolve().is_relative_to(s) for s in skip):
                     pass
                 else:
@@ -456,9 +507,9 @@ class Translate(TranslateBase):
             res = self._load_input(path, l8funcs=l8funcs)
         return res
 
-    def load_settings(self, path: Optional[Union[str, Path, None]] = None):
-        path = Path(path or '')
-        return self.load_input(path / 'resources' / 'settings.xml')
+    # def load_settings(self, path: Optional[Union[str, Path, None]] = None):
+    #     path = Path(path or '')
+    #     return self.load_input(path / 'resources' / 'settings.xml')
 
     def load_translate(self, path: Union[str, Path]):
         """Load XML and keep data."""
@@ -478,10 +529,10 @@ class Translate(TranslateBase):
         # 1. translations (strings.po) must be loaded
         # 2. scan current inputs (xml)
         # 3. merge id and text labels
-        ...  # TODO: do it
+        ...  # TODO: do it – for sure? I don't think so.
 
-    def generate(self):
-        """Generate new lables."""
+    def generate(self) -> int:
+        """Generate new lables. Return number of new translations."""
         if self.id_policy == 'min':
             def nextid():
                 nonlocal lidgen
@@ -500,9 +551,11 @@ class Translate(TranslateBase):
 
             lidgen = max(self._by_id, default=self.id_from)
 
+        new_trans_count = 0
         for lst in self._by_text.values():
             for label in lst:
                 if label.id is None:
+                    new_trans_count += 1
                     label.id = nextid()
                     best = self._by_id.setdefault(label.id, label)
                     if label is not best:
@@ -519,6 +572,7 @@ class Translate(TranslateBase):
             fmt = f'{{before}}{tr.fmt}{{after}}'
             tr.file.data = fmt.format(before=tr.file.data[:tr.start], after=tr.file.data[tr.end:], label=label)
             self._ids.add(label.id)
+        return new_trans_count
 
     def write(self):
         for input in self.xml_inputs:
@@ -566,10 +620,12 @@ class Translate(TranslateBase):
             with open(path, 'w', encoding=self.encoding) as f:
                 f.write(input.data)
 
-    def translate(self, lang: str, path: Optional[Union[str, Path, None]] = None):
+    def translate(self, lang: str, path: Optional[Union[str, Path, None]] = None, *,
+                  new_trans_count: Optional[int] = None) -> None:
         path = Path(path)
         if self.dry_run:
-            logger.debug(f'Make dir:  {path}')
+            if not path.parent.exists():
+                logger.debug(f'Make dir:  {path.parent}')
         else:
             path.parent.mkdir(parents=True, exist_ok=True)
         now = local_now()
@@ -636,11 +692,13 @@ class Translate(TranslateBase):
         if self.stats:
             N = len(po)
             ob = len(set(self._by_id) - self._ids)
+            # nw = len(self._ids) - len(ie)
+            nw = '' if new_trans_count is None else f', new: {new_trans_count}'
             tr = sum(1 for e in po if e.msgstr)
             if lang == 'en_GB':  # base language (no translation needed)
-                print(f'Language {lang}: translated: ---- ({tr}/{N}), obsolete: {ob}')
+                print(f'Language {lang}: translated: ---- ({tr}/{N}), obsolete: {ob}{nw}')
             else:
-                print(f'Language {lang}: translated: {100 * tr / (N or 1):3.0f}% ({tr}/{N}), obsolete: {ob}')
+                print(f'Language {lang}: translated: {100 * tr / (N or 1):3.0f}% ({tr}/{N}), obsolete: {ob}{nw}')
         if self.dry_run:
             logger.debug(f'Write po:  {path}')
         else:
@@ -658,6 +716,7 @@ class Translate(TranslateBase):
         for p in (
             path / 'resources' / 'lib',
             path / 'lib',
+            path / 'resources' / 'skins',
         ):
             if p.exists():
                 paths.append(p)
@@ -672,19 +731,19 @@ class Translate(TranslateBase):
             return {p for pp in paths for p in Path(base.parent).glob(pp)}
 
         if path.is_dir():
-            path = path / '.translation.json'
+            path = path / '.kolang.json'
             if not path.exists():
                 return None
         with open(path, encoding='utf8') as f:
             conf = json.load(f)
         options = conf.get('options', {})
-        for attr in ('id-from', 'mark-translated', 'mark-obsoleted', 'backup-pattern', 'po-wrap-width',
-                     'encoding'):
+        for attr in ('id-from', 'id-policy', 'mark-translated', 'mark-obsoleted', 'backup-pattern',
+                     'po-wrap-width', 'encoding'):
             if attr in options:
                 setattr(self, attr.replace('-', '_'), options[attr])
         if 'get-localized-string' in options:
             self.handle_getLocalizedString = options['get-localized-string']
-        base = path
+        base = path.parent
         paths = []
         for source in conf.get('sources', []):
             if isinstance(source, str):
@@ -693,21 +752,24 @@ class Translate(TranslateBase):
                 ac = self.load_addon_files(addon)
                 paths.extend(ac.paths)
             elif (path := source.get('path')):
-                path = base.parent / Path(path)
+                path = base / Path(path)
                 if path.exists():
                     paths.append(path)
                 else:
                     logger.warning(f'Source {str(path)!r} does not exist')
             elif (pat := source.get('glob')):
                 pat = Path(pat)
-                path = base.parent / pat.parent
+                path = base / pat.parent
                 paths.extend(path.glob(pat.name))
-        skip = {Path(p) for p in conf.get('skip', [])}
+        skip = {p for pp in conf.get('skip', []) for p in base.glob(pp)}
         langs = {self.lang_code(L) for L in conf.get('languages', ())}
         l8funcs = []
         for fitem in conf.get('localized-functions', []):
             if isinstance(fitem, str):
                 fitem = {'name': fitem}
+            ftype = fitem.get('type')
+            if ftype:
+                ftype = FuncType[ftype]
             if (pat := fitem.get('regex')):
                 l8funcs.append(L8Func(pat, paths=l8paths(fitem.get('path'))))
             elif (name := fitem.get('name')):
@@ -729,7 +791,7 @@ class Translate(TranslateBase):
                 self.load_input(p, skip=skip, l8funcs=l8funcs)
 
 
-def process(inputs, *, args, langs=None, output=None, atype=None):
+def process(inputs, *, args, langs=None, output=None):
     trans = Translate(dry_run=args.dry_run, id_from=args.id_from, id_policy=args.id_policy,
                       handle_getLocalizedString=args.gls, backup_pattern=args.backup_pattern,
                       mark_translated=args.mark_translated, mark_obsoleted=args.mark_obsoleted,
@@ -749,6 +811,8 @@ def process(inputs, *, args, langs=None, output=None, atype=None):
             logger.fatal(' Missing lxml module, try `pip install lxml` or use --enable-xml-etree')
             sys.exit(1)
 
+    if args.config:
+        trans.load_addon_config(args.config)
     langs = {trans.lang_code(L) for L in langs or ()}
     l8funcs = [L8Func(re.escape(name)) for name in args.localized_functions or ()]
     base = ''
@@ -767,6 +831,7 @@ def process(inputs, *, args, langs=None, output=None, atype=None):
 
     addon_type = 'resources/language/resource.language.{lang_lower}/strings.po'
     skin_type = 'language/resource.language.{lang_lower}/strings.po'
+    atype = args.type
     output = Path(output or base)
     pattern = ''
     if output.is_dir():
@@ -809,14 +874,17 @@ def process(inputs, *, args, langs=None, output=None, atype=None):
         else:
             trans.load_input(path, l8funcs=l8funcs)
     trans.scan()
-    trans.generate()
-    trans.write()
+    new_trans_count = trans.generate()
+    if langs:
+        trans.write()
+    else:
+        logger.warning('No languages defined, skip file writting. Use -L ...')
 
     for lang in sorted(langs):
         path = output
         if pattern:
             path = output / pattern.format(lang=lang, lang_lower=lang.lower())
-        trans.translate(lang, path)
+        trans.translate(lang, path, new_trans_count=new_trans_count)
 
 
 def copy_kolang_py(output: Path = Path()) -> None:
@@ -872,6 +940,7 @@ def main(argv=None):
                    help='no backup files')
     p.add_argument('--encoding', default='utf8', help='force files encoding [utf8]')
     p.add_argument('--po-wrap-width', metavar='WIDTH', default=999999, type=int, help='.po wrap width [999999]')
+    p.add_argument('-c', '--config', type=Path, help='load config [ADDON/.kolang.json]')
     p.add_argument('--verbose', action='store_const', const=logging.INFO, help='be more verbose')
     p.add_argument('--debug', action='store_const', const=logging.DEBUG, dest='verbose', help='be much more verbose')
     p.add_argument('--dry-run', action='store_true', help='do not modify anything')
