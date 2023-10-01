@@ -67,6 +67,8 @@ options:
                         skip getLocalizedString()
   -f FUNC, --localized-function FUNC
                         extra get-localized-string function name
+  --addon-id ADDON.ID   force addon id for $ADDON[]
+  --no-addon-id         disable addon id, skip $ADDON[]
   --mark-obsoleted      mark non-used translations as obsoleted [default]
   --no-mark-obsoleted   ignore non-used translations
   -s PATH, --skip PATH  skip path
@@ -81,7 +83,6 @@ options:
   --verbose             be more verbose
   --debug               be much more verbose
   --dry-run             do not modify anything
-  --enable-xml-etree    allow use xml.etree, XML comment are NOT supperted
   --generate-kolang-py  generate kolang.py to use its L() in addon/plugin
 ```
 
@@ -96,6 +97,7 @@ And same examples (`languages`, `sources`).
 ```json
 {
 	"options": {
+		"addon-id": null,
 		"id-from": 30100,
 		"id-policy": "max",
 		"mark-translated": false,
