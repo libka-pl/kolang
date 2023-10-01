@@ -13,7 +13,7 @@ import re
 import string
 from dataclasses import dataclass, field
 from itertools import chain
-from typing import Union, Optional, NamedTuple
+from typing import Union, Optional, Literal, NamedTuple
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
@@ -43,7 +43,7 @@ logger = logging.Logger('kolang')
 
 
 __author__ = 'rysson'
-__version__ = '0.1.8'
+__version__ = '0.1.9'
 
 
 # Monkey Patching
@@ -64,9 +64,10 @@ polib._BaseFile.metadata_as_entry = _BaseFile_metadata_as_entry
 
 
 class FuncType(Enum):
-    L = auto()                     # L()
-    GetLocalizedString = auto()    # getLocalizedString()
-    Localize = auto()              # $LOCALIZE[]
+    L = auto()                     # L(num, text)
+    GetLocalizedString = auto()    # getLocalizedString(num)
+    Localize = auto()              # $LOCALIZE[num]
+    Addon = auto()                 # $ADDON[id num]
 
 
 class XmlType(Enum):
@@ -110,6 +111,7 @@ class XmlInput(NamedTuple):
     path: Path
     tree: ElementTree
     base: Path
+    declaration: str = None
 
 
 @dataclass
@@ -134,6 +136,11 @@ class SafeFormatter(string.Formatter):
             return super().get_field(field_name, args, kwargs)
         except (KeyError, AttributeError, IndexError):
             return '{%s}' % field_name, ()
+
+
+def debug_print(text: str, *, indent: int = 4) -> None:
+    ind = '\n' + ' ' * indent
+    logger.debug(ind + text.replace('\n', ind))
 
 
 def node_error(node: Element, msg: Optional[str] = None) -> None:
@@ -199,23 +206,22 @@ class NodeValue(NamedTuple):
     #: Index in "lvalues" settings attribute.
     index: int = None
     #: Regex match for take substring of the value.
-    trans: Trans = None
+    trans: list[Trans] = None
 
     def __getattr__(self, key):
         return getattr(self.node, key)
 
-    def replace(self, text: str, value: str) -> str:
-        tr = self.trans
-        if not tr:
-            return value
-        if tr.fmt is not None:
-            value = tr.fmt.format(value=value, id=value)
-        return f'{text[:tr.start]}{value}{text[tr.end:]}'
+    def replace(self, text: str, value: str, *, addon: Optional[str] = None) -> str:
+        for tr in self.trans or ():
+            if tr.fmt is not None:
+                value = tr.fmt.format(value=value, id=value, addon=addon)
+            text = f'{text[:tr.start]}{value}{text[tr.end:]}'
+        return text
 
-    def set_label(self, value: str) -> None:
+    def set_label(self, value: str, addon: Optional[str] = None) -> None:
         if self.attr is None:
             if self.trans:
-                self.node.text = self.replace(self.node.text, value)
+                self.node.text = self.replace(self.node.text, value, addon=addon)
             else:
                 self.node.text = value
         elif self.attr == 'lvalues':
@@ -227,7 +233,8 @@ class NodeValue(NamedTuple):
             self.node.set(self.attr, '|'.join(lst))
         else:
             if self.trans:
-                self.node.set(self.attr, self.replace(self.node.get(self.attr, ''), value))
+                self.node.set(self.attr,
+                              self.replace(self.node.get(self.attr, ''), value, addon=addon))
             else:
                 self.node.set(self.attr, value)
 
@@ -264,13 +271,27 @@ class Translate(TranslateBase):
     _RE_READ_PO = re.compile(r'(?:^|\n)(?P<var>(?:msgctxt|msgid|msgstr))[ \t]*'
                              r'(?:[ \t]*[\n]"(?P<val>(?:\\.|[^"])*))+"')
     _RE_PO_VAL = re.compile(r'\s*"((?:\\.|[^"])*)"')
-    _RE_LOCALIZE = re.compile(r'\$LOCALIZE\[((?:\[[^]*]|"[^"]*"|[^]])*)\]')
-    # _RE_SKIP_LABEL = re.compile(r'\$\w+\[')
+    _RE_LOCALIZE = re.compile(r'\$LOCALIZE\[(?:\s*(?P<id>\d+)\s*|(?P<text>(?:\[[^]*]|"[^"]*"|[^]])*))\]')
+    _RE_ADDON = re.compile(r'\$ADDON\[(?:(?P<addon>[A-Za-z]\w*(?:\.\w+)+)\s+)?'
+                           r'(?:\s*(?P<id>\d+)\s*|(?P<text>(?:\[[^]*]|"[^"]*"|[^]])*))\]')
+    #                        r'(?:\s*(?P<id>\d+)\s*|(?P<text>(?:\[[^]*]|"[^"]*"|(?<!\$ADDON)[^]])*))\]')
     _RE_SKIP_LABEL = re.compile(r'\$(?:LOCALIZE|ADDON)\[')
 
-    def __init__(self, *, dry_run=False, stats=True, id_from=30100, id_policy='max', handle_getLocalizedString=True,
-                 mark_translated=False, mark_obsoleted=True, backup_pattern='{}~',
-                 po_wrap_width: int = 999999, encoding: str = 'utf8'):
+    _RE_XML_DECL: re.Pattern = re.compile(r'''\s*<?(?:"(?:\.|[^"])*"|'(?:\.|[^'])*'|[^>])*>\s*''')
+
+    def __init__(self, *,
+                 dry_run: bool = False,
+                 stats: bool = True,
+                 id_from: int = 30100,
+                 id_policy: Literal['min', 'max'] = 'max',
+                 handle_getLocalizedString: bool = True,
+                 addon_id: Optional[str] = None,
+                 mark_translated: bool = False,
+                 mark_obsoleted: bool = True,
+                 backup_pattern: Optional[str] = '{}~',
+                 po_wrap_width: int = 999999,
+                 encoding: str = 'utf8',
+                 ) -> None:
         self.xml_inputs: list[XmlInput] = []
         self.py_inputs: list[PyInput] = []
         self._ids: set[int] = set()
@@ -279,13 +300,22 @@ class Translate(TranslateBase):
         self.dry_run = dry_run
         self.stats = stats
         self.handle_getLocalizedString = handle_getLocalizedString
+        #: Lowest avaliable ID.
         self.id_from = id_from
-        self.id_policy = id_policy
-        self.mark_translated = mark_translated
-        self.mark_obsoleted = mark_obsoleted
+        #: New ID policy:  min – lower avaliavle, max – above last used.
+        self.id_policy: Literal['min', 'max'] = id_policy
+        #: Addon ID for $ADDON[] XML label.
+        self.addon_id: str = addon_id
+        # Copy all EN entries as translated texts (fake translation).
+        self.mark_translated: bool = mark_translated
+        #: Mark translation in PO as oboslete if not used in py & xml.
+        self.mark_obsoleted: bool = mark_obsoleted
+        #: Backap pattern {} for source files. If false (None, False, "") backup is skipped.
         self.backup_pattern = backup_pattern
+        #: Max PO line length, 999999 means no wrap.
         self.po_wrap_width = po_wrap_width
-        self.encoding = encoding
+        #: Source file enocding. Should be utf-8.
+        self.encoding: str = encoding
 
     def _add_label(self, label, *, used=True):
         """Add label to existing data (by ID and by TEXT)."""
@@ -293,9 +323,10 @@ class Translate(TranslateBase):
         if label is None:
             return
         if label.id is not None:
-            # if lid < 30000:  # TODO: make option
-            #     return
+            if label.id < 30000:  # TODO: make option
+                logger.warning('Label #{label.id} < #30000')
             L1 = self._by_id.setdefault(label.id, label)
+            L1.nodes |= label.nodes  # XXX XXX XXX
         if label.text:
             lst = self._by_text.setdefault(label.text, LabelList())
             L2 = lst.add(label)
@@ -344,6 +375,16 @@ class Translate(TranslateBase):
                 label.nodes.add(node)
                 self._add_label(label)
 
+        def is_enabled(node: Element) -> bool:
+            # if node.attrib.get('translate') == 'false':
+            #     return False
+            prev = node.getprevious()
+            if not isinstance(prev, etree._Comment):
+                return True
+            opt = {k.strip(): v.strip() for op in rx_opt_split.split(prev.text) if op for k, _, v in (op.partition('='),)}
+            return opt.get('translate') != 'false'
+
+        rx_opt_split = re.compile(r'\s*:\s*')
         root = tree.getroot()
         if xtype == XmlType.Auto:
             if root.tag == 'settings':
@@ -369,28 +410,49 @@ class Translate(TranslateBase):
         # -- skin/window.xml
         elif xtype == XmlType.Window:
             # <label>TEXT</label>, w/o `$LOCALIZE[`
-            for node in root.iterfind('.//label'):
-                if not self._RE_SKIP_LABEL.search(node.text):
-                    logger.debug(f'  found win.XML label, value {node.text!r}')
-                    add(node.text, NodeValue(node, None,
-                                             trans=Trans(None, start=0, end=len(node.text), fmt='$LOCALIZE[{id}]')))
+            if self.addon_id:
+                for node in root.iterfind('.//label'):
+                    if is_enabled(node) and not self._RE_SKIP_LABEL.search(node.text):
+                        logger.debug(f'  found win.XML label, value {node.text!r}')
+                        add(node.text, NodeValue(node, None, trans=(Trans(None, start=0, end=len(node.text),
+                                                                          fmt='$ADDON[{addon} {id}]'),)))
             # <any>$LOCALIZE[...]</any>
-            for node in root.xpath('.//*[text()[contains(.,"$LOCALIZE[")]]'):
-                mm = list(self._RE_LOCALIZE.finditer(node.text))
+            if False:  # skins, not supported yet. skipping..
+                for node in root.xpath('.//*[text()[contains(.,"$LOCALIZE[")]]'):
+                    if is_enabled(node):
+                        text = node.text
+                        mm = list(self._RE_LOCALIZE.finditer(text))
+                        for m in reversed(mm):  # from the end to avoid span move on text replace
+                            logger.debug(f'  found win.XML $LOCALIZE[], value {m[0]!r}')
+                            start, end = m.span('id') if m['id'] else m.span('text')
+                            add(text[start:end], NodeValue(node, None, trans=(Trans(None, start, end, fmt=None),)))
+
+            # $ADDON[ID TEXT]
+            for node in root.xpath('.//*[text()[contains(.,"$ADDON[")]]'):
+                text = node.text
+                mm = list(self._RE_ADDON.finditer(text))
                 for m in reversed(mm):  # from the end to avoid span move on text replace
-                    logger.debug(f'  found win.XML $LOCALIZE[], value {m[0]!r}')
-                    if m.re.groups:  # sub-expression used
-                        add(m[1], NodeValue(node, None, trans=Trans(None, *m.span(1), fmt=None)))
-                    else:
-                        add(m[0], NodeValue(node, None, trans=Trans(None, *m.span(), fmt=None)))
+                    if self.addon_id and m['addon'] and self.addon_id != m['addon']:
+                        continue
+                    if not is_enabled(node):
+                        continue
+                    logger.debug(f'  found win.XML $ADDON[], value {m["text"] or "#"+m["id"]!r}, addon {m["addon"]!r}')
+                    start, end = m.span('id') if m['id'] else m.span('text')
+                    trans = [Trans(None, start, end, fmt=None)]
+                    if self.addon_id and not m['addon']:
+                        trans.append(Trans(None, start, start, fmt=f'{self.addon_id} '))
+                    add(text[start:end], NodeValue(node, None, trans=tuple(trans)))
 
     def load_xml(self, path: Union[str, Path], base: Optional[Union[str, Path]] = None):
         """Load XML and keep data."""
         path = Path(path)
         if base is not None:
             base = Path(base)
+        content = path.read_text()
         tree = etree.parse(str(path))
-        self.xml_inputs.append(XmlInput(path, tree, base))
+        m: re.Match = self._RE_XML_DECL.match(content)
+        decl: str = m and m[0]
+        self.xml_inputs.append(XmlInput(path, tree, base, declaration=decl))
         self._scan_xml(tree)
         return tree
 
@@ -564,7 +626,7 @@ class Translate(TranslateBase):
                     self._ids.add(label.id)
         for label in self._by_id.values():
             for node in label.nodes:
-                node.set_label(str(label.id))
+                node.set_label(str(label.id), addon=self.addon_id)
                 self._ids.add(label.id)
         trans = sorted(((label, tr) for label in self._by_id.values() for tr in label.trans),
                        key=lambda x: -x[1].start)
@@ -606,11 +668,16 @@ class Translate(TranslateBase):
         return path
 
     def _write_xml(self, input):
+        decl = input.declaration or ''
         if self.dry_run:
             logger.debug(f'Write xml: {input.path.resolve()}')
+            if (logger.level or logging.root.level) <= logging.DEBUG - 2:
+                # etree.indent(input.tree)
+                debug_print(decl + etree.tostring(input.tree).decode())
         else:
             path = self._write_entry(input.path.resolve(), base=input.base)
-            input.tree.write(str(path), encoding='utf-8')
+            path.write_bytes(decl.encode(self.encoding) + etree.tostring(input.tree))
+            # input.tree.write(str(path), encoding='utf-8', xml_declaration=False)
 
     def _write_py(self, input):
         if self.dry_run:
@@ -701,6 +768,8 @@ class Translate(TranslateBase):
                 print(f'Language {lang}: translated: {100 * tr / (N or 1):3.0f}% ({tr}/{N}), obsolete: {ob}{nw}')
         if self.dry_run:
             logger.debug(f'Write po:  {path}')
+            if (logger.level or logging.root.level) < logging.DEBUG:
+                debug_print(po.__unicode__())
         else:
             po.save(path)
 
@@ -730,6 +799,7 @@ class Translate(TranslateBase):
                 paths = (paths, )
             return {p for pp in paths for p in Path(base.parent).glob(pp)}
 
+        # read options for config file
         if path.is_dir():
             path = path / '.kolang.json'
             if not path.exists():
@@ -738,7 +808,7 @@ class Translate(TranslateBase):
             conf = json.load(f)
         options = conf.get('options', {})
         for attr in ('id-from', 'id-policy', 'mark-translated', 'mark-obsoleted', 'backup-pattern',
-                     'po-wrap-width', 'encoding'):
+                     'addon-id', 'po-wrap-width', 'encoding'):
             if attr in options:
                 setattr(self, attr.replace('-', '_'), options[attr])
         if 'get-localized-string' in options:
@@ -774,9 +844,15 @@ class Translate(TranslateBase):
                 l8funcs.append(L8Func(pat, paths=l8paths(fitem.get('path'))))
             elif (name := fitem.get('name')):
                 l8funcs.append(L8Func(re.escape(name), paths=l8paths(fitem.get('path'))))
+        # read default addon id from addon.xml
+        if self.addon_id is None and (base / 'addon.xml').exists():
+            atree = etree.parse(str(base / 'addon.xml'))
+            aroot = atree.getroot()
+            if aroot.tag == 'addon':
+                aid = aroot.attrib.get('id')
+                if aid:
+                    self.addon_id = aid
         return AddonConf(paths=paths, langs=langs, skip=skip, l8funcs=l8funcs)
-        # if not bak.is_relative_to(path.parent):
-        #     ValueError('Backup path {bak} is outsiede of source {path}')
 
     def load_addon(self, path, *, skip: set[Path] = set(), l8funcs: Optional[list[L8Func]] = None) -> None:
         if not (path / 'addon.xml').exists():
@@ -792,7 +868,7 @@ class Translate(TranslateBase):
 
 
 def process(inputs, *, args, langs=None, output=None):
-    trans = Translate(dry_run=args.dry_run, id_from=args.id_from, id_policy=args.id_policy,
+    trans = Translate(dry_run=args.dry_run, id_from=args.id_from, id_policy=args.id_policy, addon_id=args.addon_id,
                       handle_getLocalizedString=args.gls, backup_pattern=args.backup_pattern,
                       mark_translated=args.mark_translated, mark_obsoleted=args.mark_obsoleted,
                       po_wrap_width=args.po_wrap_width,
@@ -804,7 +880,7 @@ def process(inputs, *, args, langs=None, output=None):
     else:
         logging.basicConfig()
 
-    if not args.enable_xml_etree:
+    if not getattr(args, 'enable_xml_etree', None):
         try:
             from lxml import etree as _  # noqa: F401
         except ImportError:
@@ -903,7 +979,7 @@ def copy_kolang_py(output: Path = Path()) -> None:
         output.write_text(content, encoding='utf8')
 
 
-def lang_type(ss):
+def parse_lang_arg(ss):
     rlang = re.compile(r'[a-z]{2,3}(?:_[a-zA-Z]{2})?')
     ss = [s.strip() for s in ss.split(',') if s.strip()]
     for s in ss:
@@ -912,13 +988,42 @@ def lang_type(ss):
     return ss
 
 
+class ConstIncAction(argparse.Action):
+
+    def __init__(self,
+                 option_strings,
+                 dest,
+                 const=0,
+                 default=None,
+                 required=False,
+                 help=None,
+                 metavar=None,
+                 inc=1):
+        super().__init__(
+            option_strings=option_strings,
+            dest=dest,
+            nargs=0,
+            const=const,
+            default=default,
+            required=required,
+            help=help)
+        self.inc = inc
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        val = getattr(namespace, self.dest, None)
+        if val is None:
+            setattr(namespace, self.dest, self.const)
+        else:
+            setattr(namespace, self.dest, val + self.inc)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description='Translate tool for Kodi XML (like gettext)')
     p.add_argument('--version', action='version', version=__version__)
     p.add_argument('--type', choices=('addon', 'skin'), help='add-on folder structure')
     p.add_argument('-t', '--translation', metavar='PATH', action='append', type=Path,
                    help='path string.po or folder with it or to resource folder, default "."')
-    p.add_argument('-L', '--language', metavar='LANG', action='extend', type=lang_type,
+    p.add_argument('-L', '--language', metavar='LANG', action='extend', type=parse_lang_arg,
                    help='new language like "en", "en_US", "pl"')
     p.add_argument('--mark-translated', action='store_true', help='copy original string to all non-translated entries')
     p.add_argument('--remove', action='store_true', help='remove unsused translations : IGNORED')
@@ -930,6 +1035,9 @@ def main(argv=None):
                    help='skip getLocalizedString()')
     p.add_argument('-f', '--localized-function', dest='localized_functions', metavar='FUNC', action='append',
                    help='extra get-localized-string function name')
+    p.add_argument('--addon-id', metavar='ADDON.ID', help='force addon id for $ADDON[]')
+    p.add_argument('--no-addon-id', dest='addon_id', action='store_const', const=False,
+                   help='disable addon id, skip $ADDON[]')
     p.add_argument('--mark-obsoleted', action='store_true', default=True,
                    help='mark non-used translations as obsoleted [default]')
     p.add_argument('--no-mark-obsoleted', dest='mark_obsoleted', action='store_false',
@@ -942,15 +1050,17 @@ def main(argv=None):
     p.add_argument('--po-wrap-width', metavar='WIDTH', default=999999, type=int, help='.po wrap width [999999]')
     p.add_argument('-c', '--config', type=Path, help='load config [ADDON/.kolang.json]')
     p.add_argument('--verbose', action='store_const', const=logging.INFO, help='be more verbose')
-    p.add_argument('--debug', action='store_const', const=logging.DEBUG, dest='verbose', help='be much more verbose')
+    p.add_argument('--debug', action=ConstIncAction, const=logging.DEBUG, inc=-1, dest='verbose',
+                   help='be much more verbose')
     p.add_argument('--dry-run', action='store_true', help='do not modify anything')
-    p.add_argument('--enable-xml-etree', action='store_true',
-                   help='allow use xml.etree, XML comment are NOT supperted')
+    # p.add_argument('--enable-xml-etree', action='store_true',
+    #                help='allow use xml.etree, XML comment are NOT supported')
     p.add_argument('--generate-kolang-py', action='store_true',
                    help='generate kolang.py to use its L() in addon/plugin')
     p.add_argument('input', metavar='PATH', nargs='+', type=Path, help='path XML or PY file or addon folder')
     args = p.parse_args(argv)
-    # print(args)
+    # print(args); exit()
+
     if args.generate_kolang_py:
         copy_kolang_py(args.input[0])
         return
