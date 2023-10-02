@@ -43,7 +43,7 @@ logger = logging.Logger('kolang')
 
 
 __author__ = 'rysson'
-__version__ = '0.1.9'
+__version__ = '0.1.10'
 
 
 # Monkey Patching
@@ -277,7 +277,7 @@ class Translate(TranslateBase):
     #                        r'(?:\s*(?P<id>\d+)\s*|(?P<text>(?:\[[^]*]|"[^"]*"|(?<!\$ADDON)[^]])*))\]')
     _RE_SKIP_LABEL = re.compile(r'\$(?:LOCALIZE|ADDON)\[')
 
-    _RE_XML_DECL: re.Pattern = re.compile(r'''\s*<?(?:"(?:\.|[^"])*"|'(?:\.|[^'])*'|[^>])*>\s*''')
+    _RE_XML_DECL: re.Pattern = re.compile(r'''\s*<\?(?:"(?:\.|[^"])*"|'(?:\.|[^'])*'|[^>])*>\s*''')
 
     def __init__(self, *,
                  dry_run: bool = False,
@@ -448,7 +448,7 @@ class Translate(TranslateBase):
         path = Path(path)
         if base is not None:
             base = Path(base)
-        content = path.read_text()
+        content = path.read_text(encoding=self.encoding)
         tree = etree.parse(str(path))
         m: re.Match = self._RE_XML_DECL.match(content)
         decl: str = m and m[0]
@@ -676,7 +676,7 @@ class Translate(TranslateBase):
                 debug_print(decl + etree.tostring(input.tree).decode())
         else:
             path = self._write_entry(input.path.resolve(), base=input.base)
-            path.write_bytes(decl.encode(self.encoding) + etree.tostring(input.tree))
+            path.write_bytes(decl.encode(self.encoding) + etree.tostring(input.tree, encoding=self.encoding))
             # input.tree.write(str(path), encoding='utf-8', xml_declaration=False)
 
     def _write_py(self, input):
