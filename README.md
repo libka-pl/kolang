@@ -36,12 +36,13 @@ Run tool
 ```
 python kolang.pyz --help
 
-usage: __main__.py [-h] [--version] [--type {addon,skin}] [-t PATH] [-L LANG] [--mark-translated] [--remove]
-                   [--id-from NUM] [--id-policy {max,min}] [--get-localized-string] [--no-get-localized-string]
-                   [-f FUNC] [--mark-obsoleted] [--no-mark-obsoleted] [-s PATH] [--backup-pattern PATTERN]
-                   [--no-backup-pattern] [--encoding ENCODING] [--po-wrap-width WIDTH] [--verbose] [--debug]
-                   [--dry-run] [--enable-xml-etree] [--generate-kolang-py]
-                   PATH [PATH ...]
+usage: kolang [-h] [--version] [--type {addon,skin}] [-t PATH] [-L LANG] [--mark-translated] [--remove]
+              [--id-from NUM] [--id-policy {max,min}] [--id-reserve ID[-ID]...] [--get-localized-string]
+              [--no-get-localized-string] [-f FUNC] [--addon-id ADDON.ID] [--no-addon-id]
+              [--obsolete {keep,mark,remove}] [-s PATH] [--backup-pattern PATTERN] [--no-backup-pattern]
+              [--encoding ENCODING] [--po-wrap-width WIDTH] [-c CONFIG] [--verbose]
+              [--debug] [--dry-run] [--generate-kolang-py]
+              PATH [PATH ...]
 
 Translate tool for Kodi XML (like gettext)
 
@@ -61,6 +62,8 @@ options:
   --id-from NUM         lowest label ID (start from) [30100]
   --id-policy {max,min}
                         new label ID policy [max]
+  --id-reserve ID[-ID]...
+                        reserve IDs, move another to keep the range empty
   --get-localized-string
                         handle getLocalizedString() [default]
   --no-get-localized-string
@@ -69,8 +72,8 @@ options:
                         extra get-localized-string function name
   --addon-id ADDON.ID   force addon id for $ADDON[]
   --no-addon-id         disable addon id, skip $ADDON[]
-  --mark-obsoleted      mark non-used translations as obsoleted [default]
-  --no-mark-obsoleted   ignore non-used translations
+  --obsolete {keep,mark,remove}
+                        what to do with obsolete/non-used translations [keep]
   -s PATH, --skip PATH  skip path
   --backup-pattern PATTERN
                         pattern for backup files [{}~]
@@ -102,7 +105,7 @@ And same examples (`languages`, `sources`).
 		"id-policy": "max",
 		"mark-translated": false,
 		"get-localized-string": true,
-		"mark-obsoleted": true,
+		"obsoleted": "mark",
 		"backup-pattern": "{}~",
         "po-wrap-width": 999999,
         "encoding": "utf-8"
