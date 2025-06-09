@@ -13,10 +13,11 @@ import re
 import string
 from dataclasses import dataclass, field
 from itertools import chain
-from typing import Union, Optional, Any, Literal, TYPE_CHECKING
+from typing import Union, Optional, Any, Literal, overload, TYPE_CHECKING
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
+from fnmatch import fnmatch
 import json
 import argparse
 if TYPE_CHECKING:
@@ -308,6 +309,7 @@ class Translate(TranslateBase):
     def __init__(self, *,
                  dry_run: bool = False,
                  dump_output: bool = False,
+                 dump_translations: str | None = None,
                  stats: bool = True,
                  id_from: int = 30100,
                  id_policy: Literal['min', 'max'] = 'max',
@@ -327,6 +329,7 @@ class Translate(TranslateBase):
         self._by_text: dict[str, LabelList] = {}
         self.dry_run = dry_run
         self.dump_output = dump_output
+        self.dump_translations = dump_translations
         self.stats = stats
         self.handle_getLocalizedString = handle_getLocalizedString
         #: Lowest avaliable ID.
@@ -451,7 +454,7 @@ class Translate(TranslateBase):
         elif xtype == XmlType.Window:
             # <label>TEXT</label>, w/o `$LOCALIZE[`
             if self.addon_id:
-                for node in root.iterfind('.//label'):
+                for node in root.xpath('.//label|.//hinttext'):
                     if is_enabled(node) and not self._RE_SKIP_LABEL.search(node.text):
                         logger.debug(f'  found win.XML label, value {node.text!r}')
                         add(node.text, NodeValue(node, None, trans=(Trans(None, start=0, end=len(node.text),
@@ -526,7 +529,7 @@ class Translate(TranslateBase):
         self.py_inputs.append(file)
 
         _R_CM = r'#[^\S\r\n]*(?P<comment>[^\r\n]+)'
-        _R_LL = fr'\b(?P<label>LL?)\s*(?P<label_bracket>\()\s*(?:(?P<mid>\d+)\s*,\s*)?{rstr("msg")}\s*\)'
+        _R_LL = fr'\b(?P<label>LL?)\s*(?P<label_bracket>\()\s*(?:(?P<mid>\d+)\s*,\s*)?{rstr("msg")}\s*(?:,.*?)\)'
         pat = f'{_R_CM}|{rstr()}|{_R_LL}'
         l8funcs = list(l8funcs or ())
         if self.handle_getLocalizedString:
@@ -554,7 +557,7 @@ class Translate(TranslateBase):
                 else:
                     mid = int(mid)
                     tr = Trans(file, start=r.start('mid'), end=r.end('mid'))
-                label = Label(mid, msg)
+                label = Label(mid, unescape(msg))
             # " $LOCALIZE[] "
             elif s is not None:
                 for r in RS.finditer(s):
@@ -564,7 +567,7 @@ class Translate(TranslateBase):
                     if r['text'] is not None:
                         tr = Trans(file, start=sstart + r.start('text'), end=sstart + r.end('text'))
                         text = RS_ESC.sub(r'\1', r['text'])
-                        label = Label(mid, text)
+                        label = Label(mid, unescape(text))
                     elif mid is not None:
                         self._ids.add(mid)  # mark as used
             # getLocalizedString()
@@ -577,7 +580,7 @@ class Translate(TranslateBase):
                     tr = Trans(file, start=r.start('gls'), end=r.end('gls'))
                 else:
                     mid = int(mid)
-                label = Label(mid, text)
+                label = Label(mid, unescape(text))
             if label is not None:
                 if tr is not None:
                     label.trans.append(tr)
@@ -731,6 +734,8 @@ class Translate(TranslateBase):
     def _write_py(self, input):
         if self.dry_run:
             logger.debug(f'Write py:  {input.path.resolve()}')
+            if self.dump_output:
+                print(input.data)
         else:
             path = self._write_entry(input.path.resolve(), base=input.base)
             with open(path, 'w', encoding=self.encoding, newline='') as f:
@@ -835,6 +840,8 @@ class Translate(TranslateBase):
             logger.debug(f'Write po:  {path}')
             if (logger.level or logging.root.level) < logging.DEBUG:
                 debug_print(po.__unicode__())
+            if self.dump_translations and fnmatch(lang, self.dump_translations):
+                print(po.__unicode__())
         else:
             po.save(path)
 
@@ -936,8 +943,24 @@ class Translate(TranslateBase):
                 self.load_input(p, skip=skip, l8funcs=l8funcs)
 
 
+@overload
+def unescape(text: str) -> str:  ...
+
+
+@overload
+def unescape(text: Literal[None]) -> None:  ...
+
+
+def unescape(text: str | None) -> str | None:
+    """Unescape string from Python source."""
+    if text is None:
+        return None
+    return text.encode('latin-1', 'backslashreplace').decode('unicode-escape')
+
+
 def process(inputs, *, args, langs=None, output=None):
     trans = Translate(dry_run=args.dry_run, dump_output=args.debug_cat_output,
+                      dump_translations=args.debug_cat_translation,
                       id_from=args.id_from, id_policy=args.id_policy, addon_id=args.addon_id,
                       handle_getLocalizedString=args.gls, backup_pattern=args.backup_pattern,
                       mark_translated=args.mark_translated,
@@ -1148,6 +1171,7 @@ def main(argv=None):
                    help='be much more verbose')
     p.add_argument('--dry-run', action='store_true', help='do not modify anything')
     p.add_argument('--debug-cat-output', action='store_true', help='print output file if --dry-run')
+    p.add_argument('--debug-cat-translation', metavar='LOCALE', help='print output translation if --dry-run')
     p.add_argument('--test-plural', help='test plural form and exit')
     # p.add_argument('--enable-xml-etree', action='store_true',
     #                help='allow use xml.etree, XML comment are NOT supported')

@@ -40,9 +40,16 @@ if TYPE_CHECKING:
     from ast import stmt
 
 
+FALLBACK_LOCALE: str = 'en-US'
+
+
 def kodi_locale() -> str:
     """Return kodi locale (pl-PL)."""
-    import xbmc
+    try:
+        import xbmc
+    except ModuleNotFoundError:
+        # DEBUG & TESTS  (run w/o Kodi)
+        return FALLBACK_LOCALE
     # For locale codes see: https://datahub.io/core/language-codes
     locale: str = xbmc.getLanguage(xbmc.ISO_639_1, True)  # locale: language with region
     if not locale or locale == '-':  # Kodi fack-up, eg. for en-NZ kodi returns "-"
@@ -60,7 +67,7 @@ def kodi_locale() -> str:
             else:
                 locale = ''
     if not locale:
-        return 'en-US'
+        return FALLBACK_LOCALE
     locale, sep, region = locale.partition('-')
     if sep:
         locale = f'{locale}-{region.upper()}'
@@ -97,16 +104,14 @@ class LabelGetter:
         try:
             from simpleeval import SimpleEval
         except ModuleNotFoundError:
-            import xbmc
-            xbmc.log('No simpleeval module', xbmc.LOGWARNING)
+            _log('No simpleeval module', 'warning')
             return {}
         path = Path(__file__).parent.parent / 'resources' / 'language' / 'rules.json'
         try:
             with open(path) as f:
                 data = json.load(f)
         except OSError:
-            import xbmc
-            xbmc.log(f'Missing laguage rules {path}', xbmc.LOGINFO)
+            _log(f'Missing laguage rules {path}')
             return {}
         se = SimpleEval()
         return {k: tuple(se.parse(v) for v in vv) for k, vv in data.get('plural', {}).items()}
@@ -126,15 +131,15 @@ class LabelGetter:
         return self._rule
 
     @overload
-    def __call__(self, id: int, string: str, /, *, n: Optional[int] = None) -> str: ...
+    def __call__(self, id: int, string: str, /, *, n: Optional[int] = None, **kwargs) -> str: ...
 
     @overload
-    def __call__(self, id: int, /, *, n: Optional[int] = None) -> str: ...
+    def __call__(self, id: int, /, *, n: Optional[int] = None, **kwargs) -> str: ...
 
     @overload
-    def __call__(self, string: str, /, *, n: Optional[int] = None) -> str: ...
+    def __call__(self, string: str, /, *, n: Optional[int] = None, **kwargs) -> str: ...
 
-    def __call__(self, *args, n: Optional[int] = None) -> str:
+    def __call__(self, *args, n: Optional[int] = None, **kwargs) -> str:
         """L(). Get localized string. If there is no ID there string is returned without translation."""
         sid: Optional[int]
         text: str
@@ -160,11 +165,11 @@ class LabelGetter:
             forms = text.split('|||')
             for rule, frm in zip(self.rules(), forms):
                 if se.eval('', previously_parsed=rule):
-                    return frm.format(n=n)
+                    return frm.format(n=n, **kwargs)
             else:
-                return forms[-1].format(n=n)
+                return forms[-1].format(n=n, **kwargs)
 
-    def get_text(self, string: str, /, *, n: Optional[int] = None) -> str:
+    def get_text(self, string: str, /, *, n: Optional[int] = None, **kwargs) -> str:
         """Get value of already translated label. Useful for number forms."""
         text = string
         if n is None:
@@ -178,9 +183,9 @@ class LabelGetter:
             forms = text.split('|||')
             for rule, frm in zip(self.rules(), forms):
                 if se.eval('', previously_parsed=rule):
-                    return frm.format(n=n)
+                    return frm.format(n=n, **kwargs)
             else:
-                return forms[-1].format(n=n)
+                return forms[-1].format(n=n, **kwargs)
 
 
 class KodiLabels:
@@ -264,6 +269,22 @@ def reset() -> None:
     """Reset all getters."""
     for getter in _label_getters.values():
         getter.reset()
+
+
+def _log(msg: str, level: Literal['info', 'warning', 'error'] = 'info') -> None:
+    """Log message to Kodi log."""
+    try:
+        import xbmc
+        if level == 'error':
+            xbmc.log(msg, xbmc.LOGERROR)
+        elif level == 'warning':
+            xbmc.log(msg, xbmc.LOGWARNING)
+        else:  # default is info
+            xbmc.log(msg, xbmc.LOGINFO)
+    except ModuleNotFoundError:
+        # debug and tests
+        import sys
+        print(msg, file=sys.stderr)
 
 
 #: Language label getter (translation) for current itself.
