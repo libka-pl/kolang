@@ -66,6 +66,7 @@ polib._BaseFile.metadata_as_entry = _BaseFile_metadata_as_entry
 class GenerateStats:
     new: int
     moved: int = 0
+    obsolete: int = 0
 
 
 class FuncType(Enum):
@@ -532,7 +533,7 @@ class Translate(TranslateBase):
         self.py_inputs.append(file)
 
         _R_CM = r'#[^\S\r\n]*(?P<comment>[^\r\n]+)'
-        _R_LL = fr'\b(?P<label>LL?)\s*(?P<label_bracket>\()\s*(?:(?P<mid>\d+)\s*,\s*)?{rstr("msg")}\s*(?:,.*?)\)'
+        _R_LL = fr'\b(?P<label>LL?)\s*(?P<label_bracket>\()\s*(?:(?P<mid>\d+)\s*,\s*)?{rstr("msg")}\s*(?:,.*?)?\)'
         pat = f'{_R_CM}|{rstr()}|{_R_LL}'
         l8funcs = list(l8funcs or ())
         if self.handle_getLocalizedString:
@@ -620,9 +621,10 @@ class Translate(TranslateBase):
     #     path = Path(path or '')
     #     return self.load_input(path / 'resources' / 'settings.xml')
 
-    def load_translate(self, path: Union[str, Path]):
+    def load_translate(self, path: Union[str, Path]) -> GenerateStats:
         """Load XML and keep data."""
         pofile = polib.pofile(path)
+        was_obsolete = 0
         for entry in pofile:
             text = entry.msgid
             if self._RE_LABEL_NUM.fullmatch(text) and '[empty]' in entry.comment:
@@ -632,6 +634,9 @@ class Translate(TranslateBase):
             else:
                 label = Label(int(r.group(1)), entry.msgid)
             self._add_label(label, used=False)
+            if entry.obsolete:
+                was_obsolete += 1
+        return GenerateStats(new=0, moved=0, obsolete=was_obsolete)
 
     def scan(self):
         """Scan all loaded XML files."""
@@ -650,6 +655,7 @@ class Translate(TranslateBase):
                     return n
             raise ValueError('No new label ID avaliable')
 
+        was_obsolete = len(set(self._by_id) - self._ids)
         if self.id_policy == 'min':
             lidgen = self.id_from
         else:
@@ -687,7 +693,7 @@ class Translate(TranslateBase):
             fmt = f'{{before}}{tr.fmt}{{after}}'
             tr.file.data = fmt.format(before=tr.file.data[:tr.start], after=tr.file.data[tr.end:], label=label)
             self._ids.add(label.id)
-        return GenerateStats(new=new_trans_count, moved=len(collision))
+        return GenerateStats(new=new_trans_count, moved=len(collision), obsolete=was_obsolete)
 
     def write(self):
         for input in self.xml_inputs:
@@ -745,7 +751,7 @@ class Translate(TranslateBase):
                 f.write(input.data)
 
     def translate(self, lang: str, path: Optional[Union[str, Path, None]] = None, *,
-                  stats: Optional[GenerateStats] = None) -> None:
+                  stats: GenerateStats | None = None, old_stats: GenerateStats | None) -> None:
         path = Path(path)
         if self.dry_run:
             if not path.parent.exists():
@@ -832,6 +838,8 @@ class Translate(TranslateBase):
             # nw = len(self._ids) - len(ie)
             nw = mv = ''
             if stats:
+                if old_stats and ob != old_stats.obsolete:
+                    ob = f'{ob} (+{ob - old_stats.obsolete})'
                 nw = f', new: {stats.new}'
                 if stats.moved:
                     mv = f', moved: {stats.moved}'
@@ -1030,12 +1038,13 @@ def process(inputs, *, args, langs=None, output=None):
                 L, sep, C = L.partition('_')
                 langs.add(f'{L}{sep}{C.upper()}')
 
+    was: dict[str, GenerateStats] = {}
     for lang in langs:
         path = output
         if pattern:
             path = output / pattern.format(lang=lang, lang_lower=lang.lower())
         if path.exists():
-            trans.load_translate(path)
+            was[lang] = trans.load_translate(path)
 
     for path in inputs:
         path = Path(path).resolve()
@@ -1063,7 +1072,7 @@ def process(inputs, *, args, langs=None, output=None):
         path = output
         if pattern:
             path = output / pattern.format(lang=lang, lang_lower=lang.lower())
-        trans.translate(lang, path, stats=stats)
+        trans.translate(lang, path, stats=stats, old_stats=was.get(lang))
 
 
 def copy_kolang_py(output: Path = Path()) -> None:
