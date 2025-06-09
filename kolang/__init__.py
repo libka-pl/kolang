@@ -33,7 +33,7 @@ else:
     except ImportError:
         # standard implementation
         from xml.etree import ElementTree as etree
-import polib
+from . import polib
 from .plural import plural_forms
 
 import logging

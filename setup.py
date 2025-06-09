@@ -27,7 +27,6 @@ setup(
     python_requires='>=3.9',
     license='MIT',
     install_requires=[
-        "polib==1.2.0",
     ],
     entry_points={
         "console_scripts": [

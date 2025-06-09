@@ -12,6 +12,6 @@ build/kolang.pyz: Makefile kolang/__init__.py
 	cp -r kolang build/kolang/kolang
 	cp -r kolang/__main__.py build/kolang
 	find -name __pycache__ -print0 | xargs -0 rm -r
-	rm -r build/kolang/*.dist-info
+	rm -rf build/kolang/*.dist-info
 	( cd build && python3 -m zipapp -p '/usr/bin/env python3' kolang )
 
