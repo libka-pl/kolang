@@ -13,29 +13,27 @@ import re
 import string
 from dataclasses import dataclass, field
 from itertools import chain
-from typing import Union, Optional, Any, Literal, NamedTuple
+from typing import Union, Optional, Any, Literal, TYPE_CHECKING
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 import json
 import argparse
-try:
-    # faster implementation
+if TYPE_CHECKING:
     from lxml import etree
+    from lxml.etree import _ElementTree as ElementTree
+    from lxml.etree import _Element as Element
+    # from xml.etree.ElementTree import ElementTree
+    # from xml.etree.Element import Element
+else:
     try:
-        from lxml.etree import _ElementTree as ElementTree
-        from lxml.etree import _Element as Element
+        # faster implementation
+        from lxml import etree
     except ImportError:
-        from lxml.etree import ElementTree as ElementTree
-        from lxml.etree import Element as Element
-except ImportError:
-    # standard implementation
-    from xml.etree import ElementTree as etree
-    from xml.etree.ElementTree import ElementTree
-    from xml.etree.Element import Element
+        # standard implementation
+        from xml.etree import ElementTree as etree
 import polib
 from .plural import plural_forms
-from .hacks import name_tuple_field
 
 import logging
 import logging.config
@@ -43,7 +41,7 @@ logger = logging.Logger('kolang')
 
 
 __author__ = 'rysson'
-__version__ = '0.1.11'
+__version__ = '0.1.12'
 
 
 # Monkey Patching
@@ -63,7 +61,8 @@ _real_BaseFile_metadata_as_entry = polib._BaseFile.metadata_as_entry
 polib._BaseFile.metadata_as_entry = _BaseFile_metadata_as_entry
 
 
-class GenerateStats(NamedTuple):
+@dataclass(frozen=True)
+class GenerateStats:
     new: int
     moved: int = 0
 
@@ -81,8 +80,9 @@ class XmlType(Enum):
     Window = auto()                # skin/*.xml
 
 
-@name_tuple_field
-class L8Func(NamedTuple):
+# @name_tuple_field
+@dataclass(frozen=True)
+class L8Func:
     #: Function regex pattern.
     pattern: str
     #: Funtion type (LL / getLocalizedString)
@@ -100,8 +100,9 @@ class L8Func(NamedTuple):
         return any(path.is_relative_to(p) for p in self.paths)
 
 
-@name_tuple_field
-class AddonConf(NamedTuple):
+# @name_tuple_field
+@dataclass(frozen=True)
+class AddonConf:
     #: Paths to scan.
     paths: list[Path]
     #: Extra languages.
@@ -112,7 +113,8 @@ class AddonConf(NamedTuple):
     l8funcs: list[L8Func] = field(default_factory=list)
 
 
-class XmlInput(NamedTuple):
+@dataclass(frozen=True)
+class XmlInput:
     path: Path
     tree: ElementTree
     base: Path
@@ -179,7 +181,8 @@ def node_error(node: Element, msg: Optional[str] = None) -> None:
 
 
 #: Source file (.py) translate info / translate in NodeValue
-class Trans(NamedTuple):
+@dataclass(frozen=True)
+class Trans:
     file: PyInput
     start: int
     end: int
@@ -218,17 +221,18 @@ class LabelList(list[Label]):
         return label
 
 
-class NodeValue(NamedTuple):
+@dataclass(frozen=True)
+class NodeValue:
     """Pseudo xml-node, points to node and one of old select "lvalues"."""
 
     #: XML node.
     node: Element
     #: Attribute name.
-    attr: str = None
+    attr: str | None = None
     #: Index in "lvalues" settings attribute.
-    index: int = None
+    index: int | None = None
     #: Regex match for take substring of the value.
-    trans: list[Trans] = None
+    trans: list[Trans] | None = None
 
     def __getattr__(self, key):
         return getattr(self.node, key)
@@ -248,7 +252,7 @@ class NodeValue(NamedTuple):
                 self.node.text = value
         elif self.attr == 'lvalues':
             lst = self.node.get(self.attr, '').split('|')
-            if len(lst) < self.index:
+            if self.index is None or len(lst) < self.index:
                 lst.append(value)
             else:
                 lst[self.index] = value
@@ -303,6 +307,7 @@ class Translate(TranslateBase):
 
     def __init__(self, *,
                  dry_run: bool = False,
+                 dump_output: bool = False,
                  stats: bool = True,
                  id_from: int = 30100,
                  id_policy: Literal['min', 'max'] = 'max',
@@ -321,6 +326,7 @@ class Translate(TranslateBase):
         self._by_id: dict[int, Label] = {}
         self._by_text: dict[str, LabelList] = {}
         self.dry_run = dry_run
+        self.dump_output = dump_output
         self.stats = stats
         self.handle_getLocalizedString = handle_getLocalizedString
         #: Lowest avaliable ID.
@@ -328,7 +334,7 @@ class Translate(TranslateBase):
         #: New ID policy:  min – lower avaliavle, max – above last used.
         self.id_policy: Literal['min', 'max'] = id_policy
         #: Addon ID for $ADDON[] XML label.
-        self.addon_id: str = addon_id
+        self.addon_id: str | None = addon_id
         # Copy all EN entries as translated texts (fake translation).
         self.mark_translated: bool = mark_translated
         #: Mark translation in PO as oboslete if not used in py & xml. If false remove or don't touch.
@@ -412,10 +418,13 @@ class Translate(TranslateBase):
             prev = node.getprevious()
             if not isinstance(prev, etree._Comment):
                 return True
-            opt = {k.strip(): v.strip() for op in rx_opt_split.split(prev.text) if op for k, _, v in (op.partition('='),)}
+            opt = {k.strip(): v.strip()
+                   for op in rx_opt_split.split(prev.text) if op
+                   for k, sep, v in (op.partition('='),) if sep}
             return opt.get('translate') != 'false'
 
         rx_opt_split = re.compile(r'\s*:\s*')
+        # rx_opt_split = re.compile(r'\s*:\s*')
         root = tree.getroot()
         if xtype == XmlType.Auto:
             if root.tag == 'settings':
@@ -519,7 +528,7 @@ class Translate(TranslateBase):
         _R_CM = r'#[^\S\r\n]*(?P<comment>[^\r\n]+)'
         _R_LL = fr'\b(?P<label>LL?)\s*(?P<label_bracket>\()\s*(?:(?P<mid>\d+)\s*,\s*)?{rstr("msg")}\s*\)'
         pat = f'{_R_CM}|{rstr()}|{_R_LL}'
-        l8funcs = list(l8funcs)
+        l8funcs = list(l8funcs or ())
         if self.handle_getLocalizedString:
             l8funcs.append(L8Func('getLocalizedString'))
         gls_funcs = [f for f in l8funcs if f.type == FuncType.GetLocalizedString and f.is_allowed(path)]
@@ -712,6 +721,8 @@ class Translate(TranslateBase):
             if (logger.level or logging.root.level) <= logging.DEBUG - 2:
                 # etree.indent(input.tree)
                 debug_print(decl + etree.tostring(input.tree).decode())
+            if self.dump_output:
+                print((decl.encode(self.encoding) + etree.tostring(input.tree, encoding=self.encoding)).decode(self.encoding))
         else:
             path = self._write_entry(input.path.resolve(), base=input.base)
             path.write_bytes(decl.encode(self.encoding) + etree.tostring(input.tree, encoding=self.encoding))
@@ -792,7 +803,7 @@ class Translate(TranslateBase):
             for entry in po:
                 if (r := self._RE_LABEL_NUM.fullmatch(entry.msgctxt)) is not None:
                     mid = int(r.group('id'))
-                    if mid not in self._ids:
+                    if mid not in self._ids and mid not in self._moved_ids:
                         entry.obsolete = True
         elif self.obsolete is ObsoleteAction.REMOVE:
             to_remove = [i for i, entry in enumerate(po)
@@ -800,7 +811,7 @@ class Translate(TranslateBase):
                              and ((mid := int(mch.group('id'))) in self._moved_ids or mid not in self._ids))]
             for i in reversed(to_remove):
                 del po[i]
-        elif self._moved_ids:
+        if self._moved_ids:
             to_remove = [i for i, entry in enumerate(po)
                          if ((mch := self._RE_LABEL_NUM.fullmatch(entry.msgctxt)) is not None
                              and int(mch.group('id')) in self._moved_ids)]
@@ -926,7 +937,8 @@ class Translate(TranslateBase):
 
 
 def process(inputs, *, args, langs=None, output=None):
-    trans = Translate(dry_run=args.dry_run, id_from=args.id_from, id_policy=args.id_policy, addon_id=args.addon_id,
+    trans = Translate(dry_run=args.dry_run, dump_output=args.debug_cat_output,
+                      id_from=args.id_from, id_policy=args.id_policy, addon_id=args.addon_id,
                       handle_getLocalizedString=args.gls, backup_pattern=args.backup_pattern,
                       mark_translated=args.mark_translated,
                       po_wrap_width=args.po_wrap_width, reserved_ids=args.id_reserve,
@@ -1093,6 +1105,12 @@ class ConstIncAction(argparse.Action):
             setattr(namespace, self.dest, val + self.inc)
 
 
+def plural_expr(code: str) -> None:
+    from simpleeval import simple_eval
+    info = next(iter(p for p in plural_forms if p.code == code))
+    print(simple_eval(info.forms))
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description='Translate tool for Kodi XML (like gettext)')
     p.add_argument('--version', action='version', version=__version__)
@@ -1129,6 +1147,8 @@ def main(argv=None):
     p.add_argument('--debug', action=ConstIncAction, const=logging.DEBUG, inc=-1, dest='verbose',
                    help='be much more verbose')
     p.add_argument('--dry-run', action='store_true', help='do not modify anything')
+    p.add_argument('--debug-cat-output', action='store_true', help='print output file if --dry-run')
+    p.add_argument('--test-plural', help='test plural form and exit')
     # p.add_argument('--enable-xml-etree', action='store_true',
     #                help='allow use xml.etree, XML comment are NOT supported')
     p.add_argument('--generate-kolang-py', action='store_true',
@@ -1139,6 +1159,9 @@ def main(argv=None):
         args.obsolete = ObsoleteAction(args.obsolete)
     # print(args); exit()
 
+    if args.test_plural:
+        plural_expr(args.test_plural)
+        return
     if args.generate_kolang_py:
         copy_kolang_py(args.input[0])
         return
