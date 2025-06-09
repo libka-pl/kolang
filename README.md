@@ -4,6 +4,9 @@ Handle `./resources/language/resource.language.*/strings.po` and XML files.
 
 Licence: MIT.
 
+Used modules:
+  - polib (https://github.com/izimobil/polib, MIT).
+
 
 ### Install
 
@@ -36,13 +39,12 @@ Run tool
 ```
 python kolang.pyz --help
 
-usage: kolang [-h] [--version] [--type {addon,skin}] [-t PATH] [-L LANG] [--mark-translated] [--remove]
-              [--id-from NUM] [--id-policy {max,min}] [--id-reserve ID[-ID]...] [--get-localized-string]
-              [--no-get-localized-string] [-f FUNC] [--addon-id ADDON.ID] [--no-addon-id]
-              [--obsolete {keep,mark,remove}] [-s PATH] [--backup-pattern PATTERN] [--no-backup-pattern]
-              [--encoding ENCODING] [--po-wrap-width WIDTH] [-c CONFIG] [--verbose]
-              [--debug] [--dry-run] [--generate-kolang-py]
-              PATH [PATH ...]
+usage: kolang-0.1.12.pyz [-h] [--version] [--type {addon,skin}] [-t PATH] [-L LANG] [--mark-translated]
+  [--remove] [--id-from NUM] [--id-policy {max,min}] [--id-reserve ID[-ID]...] [--get-localized-string]
+  [--no-get-localized-string] [-f FUNC] [--addon-id ADDON.ID] [--no-addon-id] [--obsolete {keep,mark,remove}]
+  [-s PATH] [--backup-pattern PATTERN] [--no-backup-pattern] [--encoding ENCODING] [--po-wrap-width WIDTH]
+  [-c CONFIG] [--single-line-msg] [--multi-line-msg] [--verbose] [--debug] [--dry-run] [--debug-cat-output]
+  [--debug-cat-translation LOCALE] [--test-plural TEST_PLURAL] [--generate-kolang-py] PATH [PATH ...]
 
 Translate tool for Kodi XML (like gettext)
 
@@ -83,9 +85,16 @@ options:
                         .po wrap width [999999]
   -c CONFIG, --config CONFIG
                         load config [ADDON/.kolang.json]
+  --single-line-msg     write po messages in single line [default]
+  --multi-line-msg      write po messages in many lines if \n is used
   --verbose             be more verbose
   --debug               be much more verbose
   --dry-run             do not modify anything
+  --debug-cat-output    print output file if --dry-run
+  --debug-cat-translation LOCALE
+                        print output translation if --dry-run
+  --test-plural TEST_PLURAL
+                        test plural form and exit
   --generate-kolang-py  generate kolang.py to use its L() in addon/plugin
 ```
 
