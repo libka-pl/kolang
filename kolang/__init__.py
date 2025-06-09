@@ -321,6 +321,7 @@ class Translate(TranslateBase):
                  po_wrap_width: int = 999999,
                  encoding: str = 'utf8',
                  reserved_ids: Optional[ranges] = None,
+                 multi_line_msg: bool = False,
                  ) -> None:
         self.xml_inputs: list[XmlInput] = []
         self.py_inputs: list[PyInput] = []
@@ -352,6 +353,8 @@ class Translate(TranslateBase):
         self.reserved_ids: ranges = reserved_ids or ranges()
         #: Moved IDs  - existings IDs if they were in reserved_ids.
         self._moved_ids: set[int] = set()
+        #: True if po msg are splited into mulitple lines.
+        self.multi_line_msg: bool = multi_line_msg
 
     def _add_label(self, label: Label, *, used=True):
         """Add label to existing data (by ID and by TEXT)."""
@@ -750,6 +753,7 @@ class Translate(TranslateBase):
         else:
             path.parent.mkdir(parents=True, exist_ok=True)
         now = local_now()
+        polib._BaseEntry.SPLIT_LINES = self.multi_line_msg
         if path.exists():
             po = polib.pofile(path, wrapwidth=self.po_wrap_width)
         else:
@@ -880,7 +884,7 @@ class Translate(TranslateBase):
             conf = json.load(f)
         options = conf.get('options', {})
         for attr in ('id-from', 'id-policy', 'mark-translated', 'backup-pattern',
-                     'addon-id', 'po-wrap-width', 'encoding'):
+                     'addon-id', 'po-wrap-width', 'encoding', 'multi-line-msg'):
             if attr in options:
                 setattr(self, attr.replace('-', '_'), options[attr])
         if (val := options.get('mark-obsoleted')) is not None:
@@ -963,7 +967,7 @@ def process(inputs, *, args, langs=None, output=None):
                       dump_translations=args.debug_cat_translation,
                       id_from=args.id_from, id_policy=args.id_policy, addon_id=args.addon_id,
                       handle_getLocalizedString=args.gls, backup_pattern=args.backup_pattern,
-                      mark_translated=args.mark_translated,
+                      mark_translated=args.mark_translated, multi_line_msg=args.multi_line_msg,
                       po_wrap_width=args.po_wrap_width, reserved_ids=args.id_reserve,
                       )
     if args.verbose:
@@ -1166,6 +1170,8 @@ def main(argv=None):
     p.add_argument('--encoding', default='utf8', help='force files encoding [utf8]')
     p.add_argument('--po-wrap-width', metavar='WIDTH', default=999999, type=int, help='.po wrap width [999999]')
     p.add_argument('-c', '--config', type=Path, help='load config [ADDON/.kolang.json]')
+    p.add_argument('--single-line-msg', action='store_false', dest='multi_line_msg', default=False, help='write po messages in single line [default]')
+    p.add_argument('--multi-line-msg', action='store_true', default=False, help='write po messages in many lines if \\n is used')
     p.add_argument('--verbose', action='store_const', const=logging.INFO, help='be more verbose')
     p.add_argument('--debug', action=ConstIncAction, const=logging.DEBUG, inc=-1, dest='verbose',
                    help='be much more verbose')
