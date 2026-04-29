@@ -42,7 +42,7 @@ logger = logging.Logger('kolang')
 
 
 __author__ = 'rysson'
-__version__ = '0.1.12'
+__version__ = '0.1.13'
 
 
 # Monkey Patching
@@ -129,6 +129,24 @@ class PyInput:
     data: str = field(repr=False)
     base: Path
 
+    def replace(self, fmt: str, label: Label, start: int, end: int) -> None:
+        self.data = fmt.format(before=self.data[:start], after=self.data[end:], label=label)
+
+
+@dataclass
+class XmlValueInput:
+    """Value in XML file, used only in PY in XML."""
+    node: NodeValue
+
+    def replace(self, fmt: str, label: Label, start: int, end: int) -> None:
+        node = self.node.node
+        if self.node.attr is None:
+            text = node.text or ''
+            node.text = fmt.format(before=text[:start], after=text[end:], label=label)
+        else:
+            text = node.get(self.node.attr, '')
+            node.set(self.node.attr, fmt.format(before=text[:start], after=text[end:], label=label))
+
 
 def local_now():
     tz = timezone(timedelta(seconds=round((datetime.now() - datetime.utcnow()).total_seconds())))
@@ -185,21 +203,27 @@ def node_error(node: Element, msg: Optional[str] = None) -> None:
 #: Source file (.py) translate info / translate in NodeValue
 @dataclass(frozen=True)
 class Trans:
-    file: PyInput
+    file: PyInput | XmlValueInput | None
     start: int
     end: int
     fmt: str = '{label.id}'
+
+    def replace(self, label: Label, *, fmt: str | None = None) -> None:
+        if fmt is None:
+            fmt = f'{{before}}{self.fmt}{{after}}'
+        if self.file is not None:
+            self.file.replace(fmt, label, start=self.start, end=self.end)
 
 
 @dataclass
 class Label:
     """Single label occurace in xml or py."""
 
-    id: Optional[int]
-    text: Optional[str] = None
-    nodes: set[Element] = field(default_factory=set)
+    id: int | None
+    text: str | None = None
+    nodes: set[NodeValue] = field(default_factory=set)
     trans: list[Trans] = field(default_factory=list)
-    ref: Optional[Label] = None
+    ref: Label | None = None
 
 
 class LabelList(list[Label]):
@@ -235,6 +259,8 @@ class NodeValue:
     index: int | None = None
     #: Regex match for take substring of the value.
     trans: list[Trans] | None = None
+    #: Python source node text ar attribute.
+    python: bool = False
 
     def __getattr__(self, key):
         return getattr(self.node, key)
@@ -248,7 +274,7 @@ class NodeValue:
 
     def set_label(self, value: str, addon: Optional[str] = None) -> None:
         if self.attr is None:
-            if self.trans:
+            if self.trans and self.node.text is not None:
                 self.node.text = self.replace(self.node.text, value, addon=addon)
             else:
                 self.node.text = value
@@ -407,7 +433,7 @@ class Translate(TranslateBase):
 
     def _scan_xml(self, tree: ElementTree, xtype: XmlType = XmlType.Auto):
         """Scan single XML."""
-        def add(text, node):
+        def add(text: str, node: NodeValue) -> None:
             if text is None:
                 node_error(node, 'Empty node/attr (string expected)')
                 return
@@ -432,6 +458,7 @@ class Translate(TranslateBase):
 
         rx_opt_split = re.compile(r'\s*:\s*')
         # rx_opt_split = re.compile(r'\s*:\s*')
+        node: Element
         root = tree.getroot()
         if xtype == XmlType.Auto:
             if root.tag == 'settings':
@@ -459,7 +486,7 @@ class Translate(TranslateBase):
             # <label>TEXT</label>, w/o `$LOCALIZE[`
             if self.addon_id:
                 for node in root.xpath('.//label|.//hinttext'):
-                    if is_enabled(node) and not self._RE_SKIP_LABEL.search(node.text):
+                    if is_enabled(node) and node.text and not self._RE_SKIP_LABEL.search(node.text):
                         logger.debug(f'  found win.XML label, value {node.text!r}')
                         add(node.text, NodeValue(node, None, trans=(Trans(None, start=0, end=len(node.text),
                                                                           fmt='$ADDON[{addon} {id}]'),)))
@@ -489,6 +516,21 @@ class Translate(TranslateBase):
                     if self.addon_id and not m['addon']:
                         trans.append(Trans(None, start, start, fmt=f'{self.addon_id} '))
                     add(text[start:end], NodeValue(node, None, trans=tuple(trans)))
+            # python templates <ff:vars/> and any in {}
+            # for node in root.xpath('.//*[text()[contains(.,"{") and contains(.,"}")]]'):
+            if 1:  # XXX  to now, just replace on load as a text
+                def xml_py(node: Element):
+                    if node.text:
+                        nd = NodeValue(node, python=True)
+                        if node.text is not None:
+                            self._replace_py(node.text, file=XmlValueInput(nd), node=nd)
+                    for attr, value in node.attrib.items():
+                        nd = NodeValue(node, attr, python=True)
+                        self._replace_py(value, file=XmlValueInput(nd), node=nd)
+                    for elem in node:
+                        xml_py(elem)
+                # rx = re.compile('')
+                xml_py(root)
 
     def load_xml(self, path: Union[str, Path], base: Optional[Union[str, Path]] = None):
         """Load XML and keep data."""
@@ -506,6 +548,24 @@ class Translate(TranslateBase):
     def load_py(self, path: Union[str, Path], base: Optional[Union[str, Path]] = None, *,
                 l8funcs: Optional[list[L8Func]] = None) -> None:
         """Load strings from Python source and keep data."""
+        if base is not None:
+            base = Path(base)
+        with open(path, encoding=self.encoding, newline='') as f:
+            data = f.read()
+        file = PyInput(path, data, base)
+        self.py_inputs.append(file)
+        self._replace_py(data, file=file, l8funcs=l8funcs)
+
+    def _replace_py(self,
+                    data: str,
+                    *,
+                    file: PyInput | XmlValueInput | None,
+                    l8funcs: Optional[list[L8Func]] = None,
+                    node: NodeValue | None = None,
+                    path: Path | None = None,
+                    ) -> None:
+        """Scan single Python source data."""
+
         def rstr(name='str'):
             pat = '|'.join((
                 fr'"""(?P<{name}1>(?:\\.|[^"]|"(?!""))*)"""',   # """..."""
@@ -525,20 +585,13 @@ class Translate(TranslateBase):
                 if (s := r.start(f'{name}{i+1}')) != -1:
                     return s
 
-        if base is not None:
-            base = Path(base)
-        with open(path, encoding=self.encoding, newline='') as f:
-            data = f.read()
-        file = PyInput(path, data, base)
-        self.py_inputs.append(file)
-
         _R_CM = r'#[^\S\r\n]*(?P<comment>[^\r\n]+)'
         _R_LL = fr'\b(?P<label>LL?)\s*(?P<label_bracket>\()\s*(?:(?P<mid>\d+)\s*,\s*)?{rstr("msg")}\s*(?:,.*?)?\)'
         pat = f'{_R_CM}|{rstr()}|{_R_LL}'
         l8funcs = list(l8funcs or ())
         if self.handle_getLocalizedString:
             l8funcs.append(L8Func('getLocalizedString'))
-        gls_funcs = [f for f in l8funcs if f.type == FuncType.GetLocalizedString and f.is_allowed(path)]
+        gls_funcs = [f for f in l8funcs if f.type == FuncType.GetLocalizedString and (path is not None and f.is_allowed(path))]
         if gls_funcs:
             ff = '|'.join(fr'(?:{f})' for f in gls_funcs)
             pat += fr'|\b(?P<gls_func>{ff})\s*\(\s*(?P<gls>(?:(?P<gls_id>\d+)|{rstr("gls_text")}))\s*[),]'
@@ -588,6 +641,8 @@ class Translate(TranslateBase):
             if label is not None:
                 if tr is not None:
                     label.trans.append(tr)
+                if node is not None:
+                    label.nodes.add(node)
                 self._add_label(label)
 
     def _load_input(self, path: Path, *, l8funcs: Optional[list[L8Func]] = None) -> None:
@@ -685,13 +740,15 @@ class Translate(TranslateBase):
                     self._ids.add(label.id)
         for label in self._by_id.values():
             for node in label.nodes:
-                node.set_label(str(label.id), addon=self.addon_id)
-                self._ids.add(label.id)
+                if not node.python:
+                    node.set_label(str(label.id), addon=self.addon_id)
+                    self._ids.add(label.id)
         trans = sorted(((label, tr) for label in self._by_id.values() for tr in label.trans),
                        key=lambda x: -x[1].start)
         for label, tr in trans:
-            fmt = f'{{before}}{tr.fmt}{{after}}'
-            tr.file.data = fmt.format(before=tr.file.data[:tr.start], after=tr.file.data[tr.end:], label=label)
+            # fmt = f'{{before}}{tr.fmt}{{after}}'
+            # tr.file.data = fmt.format(before=tr.file.data[:tr.start], after=tr.file.data[tr.end:], label=label)
+            tr.replace(label)
             self._ids.add(label.id)
         return GenerateStats(new=new_trans_count, moved=len(collision), obsolete=was_obsolete)
 
@@ -736,8 +793,13 @@ class Translate(TranslateBase):
             if self.dump_output:
                 print((decl.encode(self.encoding) + etree.tostring(input.tree, encoding=self.encoding)).decode(self.encoding))
         else:
+            def entity(m: re.Match) -> str:
+                code = ord(m[0])
+                return f'&#x{code:04x};'
             path = self._write_entry(input.path.resolve(), base=input.base)
-            path.write_bytes(decl.encode(self.encoding) + etree.tostring(input.tree, encoding=self.encoding))
+            data: str = decl + etree.tostring(input.tree, encoding=self.encoding).decode(self.encoding)
+            data = re.sub(r'[\u2000-\u200f]', entity, data)
+            path.write_bytes(data.encode(self.encoding))
             # input.tree.write(str(path), encoding='utf-8', xml_declaration=False)
 
     def _write_py(self, input):
