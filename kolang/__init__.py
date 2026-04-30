@@ -20,19 +20,14 @@ from enum import Enum, auto
 from fnmatch import fnmatch
 import json
 import argparse
-if TYPE_CHECKING:
+try:
     from lxml import etree
+except ImportError:
+    sys.stderr.write('Missing lxml module, try `pip install lxml`\n')
+    sys.exit(1)
+if TYPE_CHECKING:
     from lxml.etree import _ElementTree as ElementTree
     from lxml.etree import _Element as Element
-    # from xml.etree.ElementTree import ElementTree
-    # from xml.etree.Element import Element
-else:
-    try:
-        # faster implementation
-        from lxml import etree
-    except ImportError:
-        # standard implementation
-        from xml.etree import ElementTree as etree
 from . import polib
 from .plural import plural_forms
 
@@ -191,15 +186,12 @@ def debug_print(text: str, *, indent: int = 4) -> None:
 
 def node_error(node: Element, msg: Optional[str] = None) -> None:
     """Log XML node error."""
-    try:
-        lno: int = node.sourceline
-        if msg:
-            msg = f': {msg}'
-        else:
-            msg = ''
-        logger.warning(f'Node {node.tag} (line {lno}) error{msg}')
-    except AttributeError:
-        logger.warning(f'Node {node.tag} error{msg}')
+    lno = getattr(node, 'sourceline', None)
+    suffix = f': {msg}' if msg else ''
+    if lno is None:
+        logger.warning(f'Node {node.tag} error{suffix}')
+    else:
+        logger.warning(f'Node {node.tag} (line {lno}) error{suffix}')
 
 
 #: Source file (.py) translate info / translate in NodeValue
@@ -1059,13 +1051,6 @@ def process(inputs, *, args, langs=None, output=None):
     else:
         logging.basicConfig()
 
-    if not getattr(args, 'enable_xml_etree', None):
-        try:
-            from lxml import etree as _  # noqa: F401
-        except ImportError:
-            logger.fatal(' Missing lxml module, try `pip install lxml` or use --enable-xml-etree')
-            sys.exit(1)
-
     if args.config:
         trans.load_addon_config(args.config)
     langs = {trans.lang_code(L) for L in langs or ()}
@@ -1262,8 +1247,6 @@ def main(argv=None):
     p.add_argument('--debug-cat-output', action='store_true', help='print output file if --dry-run')
     p.add_argument('--debug-cat-translation', metavar='LOCALE', help='print output translation if --dry-run')
     p.add_argument('--test-plural', help='test plural form and exit')
-    # p.add_argument('--enable-xml-etree', action='store_true',
-    #                help='allow use xml.etree, XML comment are NOT supported')
     p.add_argument('--generate-kolang-py', action='store_true',
                    help='generate kolang.py to use its L() in addon/plugin')
     p.add_argument('input', metavar='PATH', nargs='+', type=Path, help='path XML or PY file or addon folder')

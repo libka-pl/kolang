@@ -27,6 +27,7 @@ setup(
     python_requires='>=3.9',
     license='MIT',
     install_requires=[
+        'lxml',
     ],
     entry_points={
         "console_scripts": [
