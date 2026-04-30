@@ -13,11 +13,12 @@ import re
 import string
 from dataclasses import dataclass, field
 from itertools import chain
-from typing import Union, Optional, Any, Literal, overload, TYPE_CHECKING
+from typing import Any, Literal, overload, TYPE_CHECKING
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from fnmatch import fnmatch
+from io import BytesIO
 import json
 import argparse
 try:
@@ -33,7 +34,7 @@ from .plural import plural_forms
 
 import logging
 import logging.config
-logger = logging.Logger('kolang')
+logger = logging.getLogger('kolang')
 
 
 __author__ = 'rysson'
@@ -118,6 +119,7 @@ class XmlInput:
     tree: ElementTree
     base: Path
     declaration: str = None
+    encoding: str = 'utf-8'
 
 
 @dataclass
@@ -184,7 +186,7 @@ def debug_print(text: str, *, indent: int = 4) -> None:
     logger.debug(ind + text.replace('\n', ind))
 
 
-def node_error(node: Element, msg: Optional[str] = None) -> None:
+def node_error(node: Element, msg: str | None = None) -> None:
     """Log XML node error."""
     lno = getattr(node, 'sourceline', None)
     suffix = f': {msg}' if msg else ''
@@ -259,14 +261,14 @@ class NodeValue:
     def __getattr__(self, key):
         return getattr(self.node, key)
 
-    def replace(self, text: str, value: str, *, addon: Optional[str] = None) -> str:
+    def replace(self, text: str, value: str, *, addon: str | None = None) -> str:
         for tr in self.trans or ():
             if tr.fmt is not None:
                 value = tr.fmt.format(value=value, id=value, addon=addon)
             text = f'{text[:tr.start]}{value}{text[tr.end:]}'
         return text
 
-    def set_label(self, value: str, addon: Optional[str] = None) -> None:
+    def set_label(self, value: str, addon: str | None = None) -> None:
         if self.attr is None:
             if self.trans and self.node.text is not None:
                 self.node.text = self.replace(self.node.text, value, addon=addon)
@@ -326,6 +328,13 @@ class Translate(TranslateBase):
     _RE_SKIP_LABEL = re.compile(r'\$(?:LOCALIZE|ADDON)\[')
 
     _RE_XML_DECL: re.Pattern = re.compile(r'''\s*<\?(?:"(?:\.|[^"])*"|'(?:\.|[^'])*'|[^>])*>\s*''')
+    # bytes-version of _RE_XML_DECL — used before we know the file's encoding
+    _RE_XML_DECL_BYTES: re.Pattern = re.compile(rb'''\s*<\?(?:"(?:\.|[^"])*"|'(?:\.|[^'])*'|[^>])*>\s*''')
+    _RE_XML_DECL_ENCODING: re.Pattern = re.compile(rb'''encoding\s*=\s*['"]([^'"]+)['"]''')
+
+    # `$LOCALIZE[...]` inside Python string literal — used by _replace_py.
+    _RE_PY_LOCALIZE = re.compile(r'\$LOCALIZE\[(?:(?P<id>\d+)|(?P<text>(?:[\\%].|\[(?:[\\%].|[^]])*\]|[^]])+))\]')
+    _RE_PY_LOCALIZE_ESC = re.compile(r'[\\%](.)')
 
     def __init__(self, *,
                  dry_run: bool = False,
@@ -335,13 +344,13 @@ class Translate(TranslateBase):
                  id_from: int = 30100,
                  id_policy: Literal['min', 'max'] = 'max',
                  handle_getLocalizedString: bool = True,
-                 addon_id: Optional[str] = None,
+                 addon_id: str | None = None,
                  mark_translated: bool = False,
                  obsolete: ObsoleteAction = ObsoleteAction.KEEP,
-                 backup_pattern: Optional[str] = '{}~',
+                 backup_pattern: str | None = '{}~',
                  po_wrap_width: int = 999999,
                  encoding: str = 'utf8',
-                 reserved_ids: Optional[ranges] = None,
+                 reserved_ids: ranges | None = None,
                  multi_line_msg: bool = False,
                  ) -> None:
         self.xml_inputs: list[XmlInput] = []
@@ -538,21 +547,31 @@ class Translate(TranslateBase):
                 # rx = re.compile('')
                 xml_py(root)
 
-    def load_xml(self, path: Union[str, Path], base: Optional[Union[str, Path]] = None):
+    def load_xml(self, path: str | Path, base: str | Path | None = None):
         """Load XML and keep data."""
         path = Path(path)
         if base is not None:
             base = Path(base)
-        content = path.read_text(encoding=self.encoding)
-        tree = etree.parse(str(path))
+        content_bytes = path.read_bytes()
+        # Detect encoding from XML declaration; fall back to self.encoding
+        # (matters on Windows where the system default isn't UTF-8 and the
+        # file lacks a declaration).
+        decl_bytes_match = self._RE_XML_DECL_BYTES.match(content_bytes)
+        encoding = self.encoding
+        if decl_bytes_match:
+            enc_match = self._RE_XML_DECL_ENCODING.search(decl_bytes_match[0])
+            if enc_match:
+                encoding = enc_match[1].decode('ascii')
+        content = content_bytes.decode(encoding)
+        tree = etree.parse(BytesIO(content_bytes))
         m: re.Match = self._RE_XML_DECL.match(content)
         decl: str = m and m[0]
-        self.xml_inputs.append(XmlInput(path, tree, base, declaration=decl))
+        self.xml_inputs.append(XmlInput(path, tree, base, declaration=decl, encoding=encoding))
         self._scan_xml(tree, path=path)
         return tree
 
-    def load_py(self, path: Union[str, Path], base: Optional[Union[str, Path]] = None, *,
-                l8funcs: Optional[list[L8Func]] = None) -> None:
+    def load_py(self, path: str | Path, base: str | Path | None = None, *,
+                l8funcs: list[L8Func] | None = None) -> None:
         """Load strings from Python source and keep data."""
         path = Path(path)
         if base is not None:
@@ -567,7 +586,7 @@ class Translate(TranslateBase):
                     data: str,
                     *,
                     file: PyInput | XmlValueInput | None,
-                    l8funcs: Optional[list[L8Func]] = None,
+                    l8funcs: list[L8Func] | None = None,
                     node: NodeValue | None = None,
                     path: Path | None = None,
                     ) -> None:
@@ -604,12 +623,10 @@ class Translate(TranslateBase):
             ff = '|'.join(fr'(?:{f})' for f in gls_funcs)
             pat += fr'|\b(?P<gls_func>{ff})\s*\(\s*(?P<gls>(?:(?P<gls_id>\d+)|{rstr("gls_text")}))\s*[),]'
         R = re.compile(pat)
-        RS = re.compile(r'\$LOCALIZE\[(?:(?P<id>\d+)|(?P<text>(?:[\\%].|\[(?:[\\%].|[^]])*\]|[^]])+))\]')
-        RS_ESC = re.compile(r'[\\%](.)')
         for r in R.finditer(data):
             if r['comment'] is not None:  # skip comments
                 continue
-            label: Optional[Label] = None
+            label: Label | None = None
             tr = None
             s, msg = rval(r), rval(r, 'msg')
             sstart = rstart(r)
@@ -625,13 +642,13 @@ class Translate(TranslateBase):
                 label = Label(mid, unescape(msg))
             # " $LOCALIZE[] "
             elif s is not None:
-                for r in RS.finditer(s):
+                for r in self._RE_PY_LOCALIZE.finditer(s):
                     mid = r['id']
                     if mid is not None:
                         mid = int(mid)
                     if r['text'] is not None:
                         tr = Trans(file, start=sstart + r.start('text'), end=sstart + r.end('text'))
-                        text = RS_ESC.sub(r'\1', r['text'])
+                        text = self._RE_PY_LOCALIZE_ESC.sub(r'\1', r['text'])
                         label = Label(mid, unescape(text))
                     elif mid is not None:
                         self._ids.add(mid)  # mark as used
@@ -656,7 +673,7 @@ class Translate(TranslateBase):
                     label.nodes.add(node)
                 self._add_label(label)
 
-    def _load_input(self, path: Path, *, l8funcs: Optional[list[L8Func]] = None) -> None:
+    def _load_input(self, path: Path, *, l8funcs: list[L8Func] | None = None) -> None:
         """Load single file (XML / py) and keep data."""
         logger.info(f'Loading source {path}')
         if path.suffix == '.py':
@@ -664,10 +681,10 @@ class Translate(TranslateBase):
         return self.load_xml(path)
 
     def load_input(self,
-                   path: Union[str, Path],
+                   path: str | Path,
                    *,
                    skip: set[Path] = set(),
-                   l8funcs: Optional[list[L8Func]] = None) -> None:
+                   l8funcs: list[L8Func] | None = None) -> None:
         """Load input file / py-dir (XML / py) and keep data."""
         res = None
         path = Path(path)
@@ -683,11 +700,11 @@ class Translate(TranslateBase):
             res = self._load_input(path, l8funcs=l8funcs)
         return res
 
-    # def load_settings(self, path: Optional[Union[str, Path, None]] = None):
+    # def load_settings(self, path: str | Path | None = None):
     #     path = Path(path or '')
     #     return self.load_input(path / 'resources' / 'settings.xml')
 
-    def load_translate(self, path: Union[str, Path]) -> GenerateStats:
+    def load_translate(self, path: str | Path) -> GenerateStats:
         """Load XML and keep data."""
         pofile = polib.pofile(path)
         was_obsolete = 0
@@ -798,22 +815,24 @@ class Translate(TranslateBase):
 
     def _write_xml(self, input):
         decl = input.declaration or ''
+        encoding = input.encoding
         if self.dry_run:
             logger.debug(f'Write xml: {input.path.resolve()}')
             if (logger.level or logging.root.level) <= logging.DEBUG - 2:
                 # etree.indent(input.tree)
-                debug_print(decl + etree.tostring(input.tree).decode())
+                debug_print(decl + etree.tostring(input.tree, xml_declaration=False).decode())
             if self.dump_output:
-                print((decl.encode(self.encoding) + etree.tostring(input.tree, encoding=self.encoding)).decode(self.encoding))
+                body = etree.tostring(input.tree, encoding=encoding, xml_declaration=False)
+                print((decl.encode(encoding) + body).decode(encoding))
         else:
             def entity(m: re.Match) -> str:
                 code = ord(m[0])
                 return f'&#x{code:04x};'
             path = self._prepare_write_target(input.path.resolve(), base=input.base)
-            data: str = decl + etree.tostring(input.tree, encoding=self.encoding).decode(self.encoding)
+            body = etree.tostring(input.tree, encoding=encoding, xml_declaration=False).decode(encoding)
+            data = decl + body
             data = re.sub(r'[\u2000-\u200f]', entity, data)
-            path.write_bytes(data.encode(self.encoding))
-            # input.tree.write(str(path), encoding='utf-8', xml_declaration=False)
+            path.write_bytes(data.encode(encoding))
 
     def _write_py(self, input):
         if self.dry_run:
@@ -825,7 +844,7 @@ class Translate(TranslateBase):
             with open(path, 'w', encoding=self.encoding, newline='') as f:
                 f.write(input.data)
 
-    def translate(self, lang: str, path: Optional[Union[str, Path, None]] = None, *,
+    def translate(self, lang: str, path: str | Path | None = None, *,
                   stats: GenerateStats | None = None, old_stats: GenerateStats | None) -> None:
         path = Path(path)
         if self.dry_run:
@@ -932,7 +951,7 @@ class Translate(TranslateBase):
         else:
             po.save(path)
 
-    def load_addon_files(self, path: Union[Path, str]) -> AddonConf:
+    def load_addon_files(self, path: Path | str) -> AddonConf:
         path = Path(path or '')
         paths: list[Path] = []
         settings_path = path / 'resources' / 'settings.xml'
@@ -951,7 +970,7 @@ class Translate(TranslateBase):
         return AddonConf(paths=paths)
 
     def load_addon_config(self, path: Path) -> AddonConf:
-        def l8paths(paths: Union[list[str], str, None]) -> set[Path] | None:
+        def l8paths(paths: list[str] | str | None) -> set[Path] | None:
             if not paths:
                 return None
             if isinstance(paths, str):
@@ -1022,7 +1041,7 @@ class Translate(TranslateBase):
         self._config_cache[key] = result
         return result
 
-    def load_addon(self, path, *, skip: set[Path] = set(), l8funcs: Optional[list[L8Func]] = None) -> None:
+    def load_addon(self, path, *, skip: set[Path] = set(), l8funcs: list[L8Func] | None = None) -> None:
         if not (path / 'addon.xml').exists():
             logger.warning(f'Invalid addon folder {path!r}, no addon.xml')
         conf = self.load_addon_config(path)
@@ -1060,8 +1079,6 @@ def process(inputs, *, args, langs=None, output=None):
                       )
     if args.verbose:
         logging.basicConfig(level=args.verbose)
-        if logger.parent is None:
-            logger.parent = logging.root
     else:
         logging.basicConfig()
 
@@ -1229,7 +1246,8 @@ def main(argv=None):
     p.add_argument('-L', '--language', metavar='LANG', action='extend', type=parse_lang_arg,
                    help='new language like "en", "en_US", "pl"')
     p.add_argument('--mark-translated', action='store_true', help='copy original string to all non-translated entries')
-    p.add_argument('--remove', action='store_true', help='remove unsused translations : IGNORED')
+    p.add_argument('--remove', action='store_const', const='remove', dest='obsolete',
+                   help='remove unused translations (alias for --obsolete=remove)')
     p.add_argument('--id-from', metavar='NUM', type=int, default=30100, help='lowest label ID (start from) [30100]')
     p.add_argument('--id-policy', choices=('max', 'min'), default='max', help='new label ID policy [max]')
     p.add_argument('--id-reserve', metavar='ID[-ID]...', type=parse_ranges,
@@ -1252,8 +1270,11 @@ def main(argv=None):
     p.add_argument('--encoding', default='utf8', help='force files encoding [utf8]')
     p.add_argument('--po-wrap-width', metavar='WIDTH', default=999999, type=int, help='.po wrap width [999999]')
     p.add_argument('-c', '--config', type=Path, help='load config [ADDON/.kolang.json]')
-    p.add_argument('--single-line-msg', action='store_false', dest='multi_line_msg', default=False, help='write po messages in single line [default]')
-    p.add_argument('--multi-line-msg', action='store_true', default=False, help='write po messages in many lines if \\n is used')
+    p.add_argument('--single-line-msg', action='store_false', dest='multi_line_msg',
+                   help='write po messages in single line [default]')
+    p.add_argument('--multi-line-msg', action='store_true', dest='multi_line_msg',
+                   help='write po messages in many lines if \\n is used')
+    p.set_defaults(multi_line_msg=False)
     p.add_argument('--verbose', action='store_const', const=logging.INFO, help='be more verbose')
     p.add_argument('--debug', action=ConstIncAction, const=logging.DEBUG, inc=-1, dest='verbose',
                    help='be much more verbose')

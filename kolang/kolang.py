@@ -20,7 +20,7 @@ Home: https://github.com/kodi-pl/
 
 from __future__ import annotations
 from typing import overload, TYPE_CHECKING
-from typing_extensions import Literal
+from typing import Literal
 from pathlib import Path
 import re
 try:
@@ -36,7 +36,7 @@ except ModuleNotFoundError:
             def getLocalizedString(self, v):   # noqa: D102, E301
                 return str(v)
 if TYPE_CHECKING:
-    from typing import Optional, Union, Dict, Sequence, Mapping
+    from collections.abc import Sequence, Mapping
     from ast import stmt
 
 
@@ -74,23 +74,23 @@ def kodi_locale() -> str:
     return locale
 
 
-_label_getters: Dict[Optional[str], LabelGetter] = {}
+_label_getters: dict[str | None, LabelGetter] = {}
 
 
 class LabelGetter:
     """Simple label string getter (like getLocalizedString) for given addon ID."""
 
-    def __init__(self, id: Optional[str] = None) -> None:
+    def __init__(self, id: str | None = None) -> None:
         #: Addon ID.
-        self.id: Optional[str] = id or None
+        self.id: str | None = id or None
         #: Addon instance.
         self.addon: Addon  # set in reset()
         #: Rules for all languages.
-        self._rules: Optional[Mapping[str, Sequence[stmt]]] = None
+        self._rules: Mapping[str, Sequence[stmt]] | None = None
         #: Rule for locale.
-        self._rule: Optional[Sequence[stmt]] = None
+        self._rule: Sequence[stmt] | None = None
         #: Current locale.
-        self._locale: Optional[str] = None
+        self._locale: str | None = None
         self.reset()
 
     def reset(self) -> None:
@@ -116,7 +116,7 @@ class LabelGetter:
         se = SimpleEval()
         return {k: tuple(se.parse(v) for v in vv) for k, vv in data.get('plural', {}).items()}
 
-    def rules(self, *, locale: Optional[str] = None) -> Sequence[stmt]:
+    def rules(self, *, locale: str | None = None) -> Sequence[stmt]:
         if self._rule is None:
             if self._rules is None:
                 self._rules = self.load_rules()
@@ -131,17 +131,17 @@ class LabelGetter:
         return self._rule
 
     @overload
-    def __call__(self, id: int, string: str, /, *, n: Optional[int] = None, **kwargs) -> str: ...
+    def __call__(self, id: int, string: str, /, *, n: int | None = None, **kwargs) -> str: ...
 
     @overload
-    def __call__(self, id: int, /, *, n: Optional[int] = None, **kwargs) -> str: ...
+    def __call__(self, id: int, /, *, n: int | None = None, **kwargs) -> str: ...
 
     @overload
-    def __call__(self, string: str, /, *, n: Optional[int] = None, **kwargs) -> str: ...
+    def __call__(self, string: str, /, *, n: int | None = None, **kwargs) -> str: ...
 
-    def __call__(self, *args, n: Optional[int] = None, **kwargs) -> str:
+    def __call__(self, *args, n: int | None = None, **kwargs) -> str:
         """L(). Get localized string. If there is no ID there string is returned without translation."""
-        sid: Optional[int]
+        sid: int | None
         text: str
         if len(args) == 2:
             sid, text = args
@@ -169,7 +169,7 @@ class LabelGetter:
             else:
                 return forms[-1].format(n=n, **kwargs)
 
-    def get_text(self, string: str, /, *, n: Optional[int] = None, **kwargs) -> str:
+    def get_text(self, string: str, /, *, n: int | None = None, **kwargs) -> str:
         """Get value of already translated label. Useful for number forms."""
         text = string
         if n is None:
@@ -194,11 +194,11 @@ class KodiLabels:
     # kodi strin.po translation parse regex.
     _rx = re.compile(r'\nmsgctxt "#(?P<id>\d+)"\s*\nmsgid\s+"(?P<en>\\.|[^"]*)"\s*\nmsgstr\s+"(?P<loc>\\.|[^"]*)"')
 
-    def __init__(self, locale: Optional[str] = None) -> None:
+    def __init__(self, locale: str | None = None) -> None:
         if locale is None:
             locale = self.ui_locale()
-        self._translations: Optional[Dict[int, str]] = None
-        self._addon: Union[None, Literal[False], Addon] = None
+        self._translations: dict[int, str] | None = None
+        self._addon: Literal[False] | Addon | None = None
         self.locale: str = locale
 
     @classmethod
@@ -206,7 +206,7 @@ class KodiLabels:
         """Get current Kodi UI locale."""
         return kodi_locale()
 
-    def set_locale(self, locale: Optional[str] = None) -> None:
+    def set_locale(self, locale: str | None = None) -> None:
         """Set locale (UI language change)."""
         if locale is None:
             locale = self.ui_locale()
@@ -216,7 +216,7 @@ class KodiLabels:
             self.locale = locale
 
     @property
-    def addon(self) -> Optional[Addon]:
+    def addon(self) -> Addon | None:
         """Get language addon."""
         if self._addon is None:
             try:
@@ -227,7 +227,7 @@ class KodiLabels:
         return self._addon or None
 
     @property
-    def translations(self) -> Dict[int, str]:
+    def translations(self) -> dict[int, str]:
         """Get translations, lazy loading."""
         if self._translations is None:
             if addon := self.addon:
@@ -246,7 +246,7 @@ class KodiLabels:
         """Get localized label."""
         return self.translations.get(id, f'#{id}')
 
-    def get(self, id: int, default: Optional[str] = None) -> Optional[str]:
+    def get(self, id: int, default: str | None = None) -> str | None:
         """Get localized label with default."""
         return self.translations.get(id, default)
 
@@ -257,7 +257,7 @@ class KodiLabels:
     __call__ = label
 
 
-def get_label_getter(id: Optional[str] = None) -> LabelGetter:
+def get_label_getter(id: str | None = None) -> LabelGetter:
     """Return label string getter (like getLocalizedString) for given addon ID."""
     try:
         return _label_getters[id or None]

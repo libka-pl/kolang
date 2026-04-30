@@ -114,7 +114,7 @@ And same examples (`languages`, `sources`).
 		"id-policy": "max",
 		"mark-translated": false,
 		"get-localized-string": true,
-		"obsoleted": "mark",
+		"obsolete": "mark",
 		"backup-pattern": "{}~",
         "po-wrap-width": 999999,
         "encoding": "utf-8"
