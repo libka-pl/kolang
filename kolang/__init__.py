@@ -311,6 +311,10 @@ class TranslateBase:
 class Translate(TranslateBase):
     """Whole translate process handler."""
 
+    #: Default upper bound for newly assigned IDs. Kodi reserves 30000-33999
+    #: for plugins/skins/scripts/common. Override via --id-max / "id-max".
+    ID_MAX_DEFAULT: int = 33999
+
     DEF_PLURAL_FORMS = 'nplurals=2; plural=(n != 1);'
     # see
     # - https://doc.qt.io/archives/qq/qq19-plurals.html
@@ -342,6 +346,8 @@ class Translate(TranslateBase):
                  dump_translations: str | None = None,
                  stats: bool = True,
                  id_from: int = 30100,
+                 id_min: int | None = None,
+                 id_max: int | None = None,
                  id_policy: Literal['min', 'max'] = 'max',
                  handle_getLocalizedString: bool = True,
                  addon_id: str | None = None,
@@ -365,6 +371,10 @@ class Translate(TranslateBase):
         self.handle_getLocalizedString = handle_getLocalizedString
         #: Lowest avaliable ID.
         self.id_from = id_from
+        #: Lower bound for "ID below threshold" warning. None → fall back to id_from.
+        self.id_min: int | None = id_min
+        #: Upper bound for newly assigned IDs (used by nextid()).
+        self.id_max: int = id_max if id_max is not None else self.ID_MAX_DEFAULT
         #: New ID policy:  min – lower avaliavle, max – above last used.
         self.id_policy: Literal['min', 'max'] = id_policy
         #: Addon ID for $ADDON[] XML label.
@@ -395,8 +405,9 @@ class Translate(TranslateBase):
         if label is None:
             return
         if label.id is not None:
-            if label.id < 30000:  # TODO: make option
-                logger.warning(f'Label #{label.id} < #30000')
+            threshold = self.id_min if self.id_min is not None else self.id_from
+            if label.id < threshold:
+                logger.warning(f'Label #{label.id} < #{threshold}')
             L1 = self._by_id.setdefault(label.id, label)
             L1.nodes |= label.nodes  # XXX XXX XXX
         if label.text is not None:
@@ -732,13 +743,13 @@ class Translate(TranslateBase):
         """Generate new lables. Return number of new translations."""
         def nextid():
             nonlocal lidgen
-            for n in range(lidgen, 99999):
+            for n in range(lidgen, self.id_max + 1):
                 # _ids holds numeric references to IDs declared elsewhere
                 # (Kodi core, other addons) — must not be reassigned.
                 if n not in self._by_id and n not in self._ids and n not in self.reserved_ids:
                     lidgen = n
                     return n
-            raise ValueError('No new label ID avaliable')
+            raise ValueError(f'No new label ID avaliable (id_max={self.id_max})')
 
         was_obsolete = len(set(self._by_id) - self._ids)
         if self.id_policy == 'min':
@@ -989,8 +1000,8 @@ class Translate(TranslateBase):
         with open(path, encoding='utf8') as f:
             conf = json.load(f)
         options = conf.get('options', {})
-        for attr in ('id-from', 'id-policy', 'mark-translated', 'backup-pattern',
-                     'addon-id', 'po-wrap-width', 'encoding', 'multi-line-msg'):
+        for attr in ('id-from', 'id-min', 'id-max', 'id-policy', 'mark-translated',
+                     'backup-pattern', 'addon-id', 'po-wrap-width', 'encoding', 'multi-line-msg'):
             if attr in options:
                 setattr(self, attr.replace('-', '_'), options[attr])
         if (val := options.get('mark-obsoleted')) is not None:
@@ -1072,7 +1083,8 @@ def unescape(text: str | None) -> str | None:
 def process(inputs, *, args, langs=None, output=None):
     trans = Translate(dry_run=args.dry_run, dump_output=args.debug_cat_output,
                       dump_translations=args.debug_cat_translation,
-                      id_from=args.id_from, id_policy=args.id_policy, addon_id=args.addon_id,
+                      id_from=args.id_from, id_min=args.id_min, id_max=args.id_max,
+                      id_policy=args.id_policy, addon_id=args.addon_id,
                       handle_getLocalizedString=args.gls, backup_pattern=args.backup_pattern,
                       mark_translated=args.mark_translated, multi_line_msg=args.multi_line_msg,
                       po_wrap_width=args.po_wrap_width, reserved_ids=args.id_reserve,
@@ -1249,6 +1261,10 @@ def main(argv=None):
     p.add_argument('--remove', action='store_const', const='remove', dest='obsolete',
                    help='remove unused translations (alias for --obsolete=remove)')
     p.add_argument('--id-from', metavar='NUM', type=int, default=30100, help='lowest label ID (start from) [30100]')
+    p.add_argument('--id-min', metavar='NUM', type=int, default=None,
+                   help='warn if any label ID is below NUM (default: --id-from)')
+    p.add_argument('--id-max', metavar='NUM', type=int, default=None,
+                   help=f'highest label ID for new entries [{Translate.ID_MAX_DEFAULT}]')
     p.add_argument('--id-policy', choices=('max', 'min'), default='max', help='new label ID policy [max]')
     p.add_argument('--id-reserve', metavar='ID[-ID]...', type=parse_ranges,
                    help='reserve IDs, move another to keep the range empty')

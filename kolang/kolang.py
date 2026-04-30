@@ -153,7 +153,9 @@ class LabelGetter:
         else:
             raise TypeError(f'L{args} – incorrect arguments')
         if sid:
-            text = self.addon.getLocalizedString(sid)
+            translated = self.addon.getLocalizedString(sid)
+            if translated:
+                text = translated
         if n is None:
             return text
         try:
@@ -191,8 +193,19 @@ class LabelGetter:
 class KodiLabels:
     """Main Kodi labels translations."""
 
-    # kodi strin.po translation parse regex.
-    _rx = re.compile(r'\nmsgctxt "#(?P<id>\d+)"\s*\nmsgid\s+"(?P<en>\\.|[^"]*)"\s*\nmsgstr\s+"(?P<loc>\\.|[^"]*)"')
+    # kodi strings.po translation parse regex; supports PO line continuation
+    # (msgid/msgstr split across multiple "..." lines).
+    _rx = re.compile(
+        r'\nmsgctxt\s+"#(?P<id>\d+)"\s*'
+        r'\nmsgid\s+(?P<en>"(?:\\.|[^"])*"(?:\s*"(?:\\.|[^"])*")*)\s*'
+        r'\nmsgstr\s+(?P<loc>"(?:\\.|[^"])*"(?:\s*"(?:\\.|[^"])*")*)'
+    )
+    _rx_po_str = re.compile(r'"((?:\\.|[^"])*)"')
+
+    @classmethod
+    def _join_po_strings(cls, s: str) -> str:
+        """Concatenate consecutive "..." parts of a PO value."""
+        return ''.join(cls._rx_po_str.findall(s))
 
     def __init__(self, locale: str | None = None) -> None:
         if locale is None:
@@ -234,8 +247,10 @@ class KodiLabels:
                 path = Path(addon.getAddonInfo('path')) / 'resources' / 'strings.po'
                 try:
                     with open(path, encoding='utf-8') as f:
-                        self._translations = {int(mch['id']): mch['loc'] or mch['en']
-                                              for mch in self._rx.finditer(f.read())}
+                        self._translations = {
+                            int(mch['id']): self._join_po_strings(mch['loc']) or self._join_po_strings(mch['en'])
+                            for mch in self._rx.finditer(f.read())
+                        }
                 except IOError:
                     self._translations = {}
             else:
