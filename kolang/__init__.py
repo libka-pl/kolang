@@ -689,10 +689,10 @@ class Translate(TranslateBase):
             text = entry.msgid
             if self._RE_LABEL_NUM.fullmatch(text) and '[empty]' in entry.comment:
                 text = None
-            if (r := self._RE_LABEL_NUM.fullmatch(entry.msgctxt)) is None:
-                label = Label(None, entry.msgid)
+            if (r := self._RE_LABEL_NUM.fullmatch(entry.msgctxt or '')) is None:
+                label = Label(None, text)
             else:
-                label = Label(int(r.group(1)), entry.msgid)
+                label = Label(int(r.group(1)), text)
             self._add_label(label, used=False)
             if entry.obsolete:
                 was_obsolete += 1
@@ -850,7 +850,7 @@ class Translate(TranslateBase):
                              '\nAddon id: {addon.id}'
                              '\nAddon Provider: {addon.provider}'),
             }
-        ie = {int(r['id']): e for e in po if (r := self._RE_LABEL_NUM.fullmatch(e.msgctxt)) is not None}
+        ie = {int(r['id']): e for e in po if (r := self._RE_LABEL_NUM.fullmatch(e.msgctxt or '')) is not None}
         for label in self._by_id.values():
             assert label.id is not None
             if label.id not in ie:
@@ -876,26 +876,26 @@ class Translate(TranslateBase):
                     entry.msgstr = entry.msgid
         # remove obsolete flag if ID used again
         for entry in po:
-            if entry.obsolete and (r := self._RE_LABEL_NUM.fullmatch(entry.msgctxt)) is not None:
+            if entry.obsolete and (r := self._RE_LABEL_NUM.fullmatch(entry.msgctxt or '')) is not None:
                 mid = int(r.group('id'))
                 if mid in self._ids:
                     entry.obsolete = False
         # mark obsolete if ID is not used in XML nor PY (but skip if moved)
         if self.obsolete is ObsoleteAction.MARK:
             for entry in po:
-                if (r := self._RE_LABEL_NUM.fullmatch(entry.msgctxt)) is not None:
+                if (r := self._RE_LABEL_NUM.fullmatch(entry.msgctxt or '')) is not None:
                     mid = int(r.group('id'))
                     if mid not in self._ids and mid not in self._moved_ids:
                         entry.obsolete = True
         elif self.obsolete is ObsoleteAction.REMOVE:
             to_remove = [i for i, entry in enumerate(po)
-                         if ((mch := self._RE_LABEL_NUM.fullmatch(entry.msgctxt)) is not None
+                         if ((mch := self._RE_LABEL_NUM.fullmatch(entry.msgctxt or '')) is not None
                              and ((mid := int(mch.group('id'))) in self._moved_ids or mid not in self._ids))]
             for i in reversed(to_remove):
                 del po[i]
         if self._moved_ids:
             to_remove = [i for i, entry in enumerate(po)
-                         if ((mch := self._RE_LABEL_NUM.fullmatch(entry.msgctxt)) is not None
+                         if ((mch := self._RE_LABEL_NUM.fullmatch(entry.msgctxt or '')) is not None
                              and int(mch.group('id')) in self._moved_ids)]
             for i in reversed(to_remove):
                 del po[i]
