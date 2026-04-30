@@ -384,6 +384,8 @@ class Translate(TranslateBase):
         self._moved_ids: set[int] = set()
         #: True if po msg are splited into mulitple lines.
         self.multi_line_msg: bool = multi_line_msg
+        #: Cache of loaded addon configs keyed by resolved config-file path.
+        self._config_cache: dict[Path, AddonConf | None] = {}
 
     def _add_label(self, label: Label, *, used=True):
         """Add label to existing data (by ID and by TEXT)."""
@@ -943,18 +945,22 @@ class Translate(TranslateBase):
         return AddonConf(paths=paths)
 
     def load_addon_config(self, path: Path) -> AddonConf:
-        def l8paths(paths: Union[list[str], str]) -> set[Path]:
+        def l8paths(paths: Union[list[str], str, None]) -> set[Path] | None:
             if not paths:
                 return None
             if isinstance(paths, str):
                 paths = [paths]
-            return {p for pp in paths for p in Path(base.parent).glob(pp)}
+            return {p for pp in paths for p in base.glob(pp)}
 
         # read options for config file
         if path.is_dir():
             path = path / '.kolang.json'
             if not path.exists():
                 return None
+        key = path.resolve()
+        if key in self._config_cache:
+            return self._config_cache[key]
+        logger.debug(f'Reading config {path}')
         with open(path, encoding='utf8') as f:
             conf = json.load(f)
         options = conf.get('options', {})
@@ -976,16 +982,15 @@ class Translate(TranslateBase):
             if (addon := source.get('addon')):
                 ac = self.load_addon_files(base / addon)
                 paths.extend(ac.paths)
-            elif (path := source.get('path')):
-                path = base / Path(path)
-                if path.exists():
-                    paths.append(path)
+            elif (p := source.get('path')):
+                p = base / Path(p)
+                if p.exists():
+                    paths.append(p)
                 else:
-                    logger.warning(f'Source {str(path)!r} does not exist')
-            elif (pat := source.get('glob')):
-                pat = Path(pat)
-                path = base / pat.parent
-                paths.extend(path.glob(pat.name))
+                    logger.warning(f'Source {str(p)!r} does not exist')
+            elif (p := source.get('glob')):
+                p = Path(p)
+                paths.extend((base / p.parent).glob(p.name))
         skip = {p for pp in conf.get('skip', []) for p in base.glob(pp)}
         langs = {self.lang_code(L) for L in conf.get('languages', ())}
         l8funcs = []
@@ -1007,7 +1012,9 @@ class Translate(TranslateBase):
                 aid = aroot.attrib.get('id')
                 if aid:
                     self.addon_id = aid
-        return AddonConf(paths=paths, langs=langs, skip=skip, l8funcs=l8funcs)
+        result = AddonConf(paths=paths, langs=langs, skip=skip, l8funcs=l8funcs)
+        self._config_cache[key] = result
+        return result
 
     def load_addon(self, path, *, skip: set[Path] = set(), l8funcs: Optional[list[L8Func]] = None) -> None:
         if not (path / 'addon.xml').exists():

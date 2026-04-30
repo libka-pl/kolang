@@ -213,6 +213,7 @@ class KodiLabels:
         if locale != self.locale:
             self._translations = None
             self._addon = None
+            self.locale = locale
 
     @property
     def addon(self) -> Optional[Addon]:
