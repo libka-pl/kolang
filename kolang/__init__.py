@@ -390,7 +390,9 @@ class Translate(TranslateBase):
                 logger.warning(f'Label #{label.id} < #30000')
             L1 = self._by_id.setdefault(label.id, label)
             L1.nodes |= label.nodes  # XXX XXX XXX
-        if label.text:
+        if label.text is not None:
+            # explicit empty (`L('')`) is a declaration too, distinct from
+            # a numeric reference where text is unknown — keep it.
             lst = self._by_text.setdefault(label.text, LabelList())
             L2 = lst.add(label)
         if L1 is not None and L2 is not None and L1 is not L2:
@@ -431,16 +433,23 @@ class Translate(TranslateBase):
                   path: Path | None = None):
         """Scan single XML."""
         def add(text: str, node: NodeValue) -> None:
-            if text is None:
-                node_error(node, 'Empty node/attr (string expected)')
+            if not text:
+                # Missing or empty XML attr/text — there's no XML idiom for
+                # an "explicit empty" declaration (unlike Python's L('')),
+                # so skip rather than invent a label.
+                if text is None:
+                    node_error(node, 'Empty node/attr (string expected)')
                 return
             if text.isdigit():
-                label = Label(int(text))
-            else:
-                label = Label(None, text)
-            if label is not None:
-                label.nodes.add(node)
-                self._add_label(label)
+                # Numeric reference (e.g. label="32331") — only mark the ID
+                # as used; the declaration lives elsewhere (Kodi built-ins,
+                # another addon, or the PO). Don't materialise a Label.
+                logger.debug(f'  numeric XML ref #{text}')
+                self._ids.add(int(text))
+                return
+            label = Label(None, text)
+            label.nodes.add(node)
+            self._add_label(label)
 
         def is_enabled(node: Element) -> bool:
             # if node.attrib.get('translate') == 'false':
@@ -632,11 +641,14 @@ class Translate(TranslateBase):
                 func = r['gls_func']
                 text = rval(r, 'gls_text')
                 logger.debug(f'  found func {func!r}, id {mid}, text {text!r}')
-                if mid is None:
-                    tr = Trans(file, start=r.start('gls'), end=r.end('gls'))
-                else:
-                    mid = int(mid)
-                label = Label(mid, unescape(text))
+                if mid is not None:
+                    # Numeric reference (e.g. getLocalizedString(123)) — only
+                    # mark the ID as used; declaration lives elsewhere.
+                    logger.debug(f'  numeric PY ref #{mid}')
+                    self._ids.add(int(mid))
+                    continue
+                tr = Trans(file, start=r.start('gls'), end=r.end('gls'))
+                label = Label(None, unescape(text))
             if label is not None:
                 if tr is not None:
                     label.trans.append(tr)
@@ -704,7 +716,9 @@ class Translate(TranslateBase):
         def nextid():
             nonlocal lidgen
             for n in range(lidgen, 99999):
-                if n not in self._by_id and n not in self.reserved_ids:
+                # _ids holds numeric references to IDs declared elsewhere
+                # (Kodi core, other addons) — must not be reassigned.
+                if n not in self._by_id and n not in self._ids and n not in self.reserved_ids:
                     lidgen = n
                     return n
             raise ValueError('No new label ID avaliable')
@@ -713,7 +727,7 @@ class Translate(TranslateBase):
         if self.id_policy == 'min':
             lidgen = self.id_from
         else:
-            lidgen = max(self._by_id, default=self.id_from)
+            lidgen = max((*self._by_id, *self._ids), default=self.id_from)
 
         new_trans_count = 0
         if collision := set(self.reserved_ids.ids()) & self._by_id.keys():
