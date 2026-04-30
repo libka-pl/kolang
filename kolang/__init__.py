@@ -95,9 +95,11 @@ class L8Func:
     def __str__(self) -> str:
         return self.pattern
 
-    def is_allowed(self, path: Path) -> bool:
+    def is_allowed(self, path: Path | None) -> bool:
         if self.paths is None:
             return True
+        if path is None:
+            return False
         path = path.resolve()
         return any(path.is_relative_to(p) for p in self.paths)
 
@@ -431,7 +433,8 @@ class Translate(TranslateBase):
             self._ids.add(label.id)
         return label
 
-    def _scan_xml(self, tree: ElementTree, xtype: XmlType = XmlType.Auto):
+    def _scan_xml(self, tree: ElementTree, xtype: XmlType = XmlType.Auto, *,
+                  path: Path | None = None):
         """Scan single XML."""
         def add(text: str, node: NodeValue) -> None:
             if text is None:
@@ -523,10 +526,10 @@ class Translate(TranslateBase):
                     if node.text:
                         nd = NodeValue(node, python=True)
                         if node.text is not None:
-                            self._replace_py(node.text, file=XmlValueInput(nd), node=nd)
+                            self._replace_py(node.text, file=XmlValueInput(nd), node=nd, path=path)
                     for attr, value in node.attrib.items():
                         nd = NodeValue(node, attr, python=True)
-                        self._replace_py(value, file=XmlValueInput(nd), node=nd)
+                        self._replace_py(value, file=XmlValueInput(nd), node=nd, path=path)
                     for elem in node:
                         xml_py(elem)
                 # rx = re.compile('')
@@ -542,19 +545,20 @@ class Translate(TranslateBase):
         m: re.Match = self._RE_XML_DECL.match(content)
         decl: str = m and m[0]
         self.xml_inputs.append(XmlInput(path, tree, base, declaration=decl))
-        self._scan_xml(tree)
+        self._scan_xml(tree, path=path)
         return tree
 
     def load_py(self, path: Union[str, Path], base: Optional[Union[str, Path]] = None, *,
                 l8funcs: Optional[list[L8Func]] = None) -> None:
         """Load strings from Python source and keep data."""
+        path = Path(path)
         if base is not None:
             base = Path(base)
         with open(path, encoding=self.encoding, newline='') as f:
             data = f.read()
         file = PyInput(path, data, base)
         self.py_inputs.append(file)
-        self._replace_py(data, file=file, l8funcs=l8funcs)
+        self._replace_py(data, file=file, l8funcs=l8funcs, path=path)
 
     def _replace_py(self,
                     data: str,
@@ -591,7 +595,8 @@ class Translate(TranslateBase):
         l8funcs = list(l8funcs or ())
         if self.handle_getLocalizedString:
             l8funcs.append(L8Func('getLocalizedString'))
-        gls_funcs = [f for f in l8funcs if f.type == FuncType.GetLocalizedString and (path is not None and f.is_allowed(path))]
+        gls_funcs = [f for f in l8funcs
+                     if f.type == FuncType.GetLocalizedString and (path is None or f.is_allowed(path))]
         if gls_funcs:
             ff = '|'.join(fr'(?:{f})' for f in gls_funcs)
             pat += fr'|\b(?P<gls_func>{ff})\s*\(\s*(?P<gls>(?:(?P<gls_id>\d+)|{rstr("gls_text")}))\s*[),]'
