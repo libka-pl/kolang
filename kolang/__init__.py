@@ -21,6 +21,7 @@ from fnmatch import fnmatch
 from io import BytesIO
 import json
 import argparse
+import subprocess
 try:
     from lxml import etree
 except ImportError:
@@ -38,7 +39,7 @@ logger = logging.getLogger('kolang')
 
 
 __author__ = 'rysson'
-__version__ = '0.1.13'
+__version__ = '0.1.14'
 
 
 # Monkey Patching
@@ -150,6 +151,32 @@ class XmlValueInput:
 def local_now():
     tz = timezone(timedelta(seconds=round((datetime.now() - datetime.utcnow()).total_seconds())))
     return datetime.now(tz)
+
+
+def _git_root(path: Path) -> Path | None:
+    """Return git repo root for path, None if path is not in a repo. Hard-exit if git is missing."""
+    cwd = path if path.is_dir() else path.parent
+    try:
+        out = subprocess.run(
+            ['git', 'rev-parse', '--show-toplevel'],
+            cwd=str(cwd), capture_output=True, text=True, check=True,
+        )
+    except FileNotFoundError:
+        logger.error('git binary not found in PATH; install git or disable --git-only')
+        sys.exit(1)
+    except subprocess.CalledProcessError:
+        return None
+    return Path(out.stdout.strip()).resolve()
+
+
+def _git_tracked_files(repo_root: Path) -> set[Path]:
+    """Return absolute paths of files tracked by git (in the index) for given repo."""
+    out = subprocess.run(
+        ['git', 'ls-files', '-z'],
+        cwd=str(repo_root), capture_output=True, check=True,
+    )
+    return {(repo_root / name.decode()).resolve()
+            for name in out.stdout.split(b'\x00') if name}
 
 
 class ranges(tuple[range]):
@@ -358,6 +385,7 @@ class Translate(TranslateBase):
                  encoding: str = 'utf8',
                  reserved_ids: ranges | None = None,
                  multi_line_msg: bool = False,
+                 git_only: bool = False,
                  ) -> None:
         self.xml_inputs: list[XmlInput] = []
         self.py_inputs: list[PyInput] = []
@@ -397,6 +425,10 @@ class Translate(TranslateBase):
         self.multi_line_msg: bool = multi_line_msg
         #: Cache of loaded addon configs keyed by resolved config-file path.
         self._config_cache: dict[Path, AddonConf | None] = {}
+        #: Scan only files tracked by git (in the index).
+        self.git_only: bool = git_only
+        #: Cache of git-tracked file sets, keyed by repo root.
+        self._git_tracked_by_repo: dict[Path, set[Path]] = {}
 
     def _add_label(self, label: Label, *, used=True):
         """Add label to existing data (by ID and by TEXT)."""
@@ -684,6 +716,20 @@ class Translate(TranslateBase):
                     label.nodes.add(node)
                 self._add_label(label)
 
+    def _is_git_tracked(self, path: Path) -> bool:
+        """When --git-only is enabled, return True iff `path` is in the git index.
+        Hard-exits if the path is not in any git repository (--git-only contract)."""
+        if not self.git_only:
+            return True
+        abspath = path.resolve()
+        root = _git_root(abspath)
+        if root is None:
+            logger.error(f'{abspath} is not in a git repository (--git-only requires git tracking)')
+            sys.exit(1)
+        if root not in self._git_tracked_by_repo:
+            self._git_tracked_by_repo[root] = _git_tracked_files(root)
+        return abspath in self._git_tracked_by_repo[root]
+
     def _load_input(self, path: Path, *, l8funcs: list[L8Func] | None = None) -> None:
         """Load single file (XML / py) and keep data."""
         logger.info(f'Loading source {path}')
@@ -705,8 +751,12 @@ class Translate(TranslateBase):
             for p in chain(path.glob('**/*.xml'), path.glob('**/*.py')):
                 if any(p.resolve().is_relative_to(s) for s in skip):
                     pass
+                elif not self._is_git_tracked(p):
+                    logger.debug(f'Skipping non-tracked: {p}')
                 else:
                     res = self._load_input(p, l8funcs=l8funcs)
+        elif not self._is_git_tracked(path):
+            logger.debug(f'Skipping non-tracked: {path}')
         else:
             res = self._load_input(path, l8funcs=l8funcs)
         return res
@@ -1001,7 +1051,8 @@ class Translate(TranslateBase):
             conf = json.load(f)
         options = conf.get('options', {})
         for attr in ('id-from', 'id-min', 'id-max', 'id-policy', 'mark-translated',
-                     'backup-pattern', 'addon-id', 'po-wrap-width', 'encoding', 'multi-line-msg'):
+                     'backup-pattern', 'addon-id', 'po-wrap-width', 'encoding', 'multi-line-msg',
+                     'git-only'):
             if attr in options:
                 setattr(self, attr.replace('-', '_'), options[attr])
         if (val := options.get('mark-obsoleted')) is not None:
@@ -1088,6 +1139,7 @@ def process(inputs, *, args, langs=None, output=None):
                       handle_getLocalizedString=args.gls, backup_pattern=args.backup_pattern,
                       mark_translated=args.mark_translated, multi_line_msg=args.multi_line_msg,
                       po_wrap_width=args.po_wrap_width, reserved_ids=args.id_reserve,
+                      git_only=args.git_only,
                       )
     if args.verbose:
         logging.basicConfig(level=args.verbose)
@@ -1291,6 +1343,8 @@ def main(argv=None):
     p.add_argument('--multi-line-msg', action='store_true', dest='multi_line_msg',
                    help='write po messages in many lines if \\n is used')
     p.set_defaults(multi_line_msg=False)
+    p.add_argument('--git-only', action='store_true', default=False,
+                   help='scan only files tracked by git (in the index)')
     p.add_argument('--verbose', action='store_const', const=logging.INFO, help='be more verbose')
     p.add_argument('--debug', action=ConstIncAction, const=logging.DEBUG, inc=-1, dest='verbose',
                    help='be much more verbose')
