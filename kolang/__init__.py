@@ -834,8 +834,8 @@ class Translate(TranslateBase):
             po.metadata = {
                 'Project-Id-Version': '1.0',
                 'Report-Msgid-Bugs-To': 'dev@kodi-pl.net',
-                'POT-Creation-Date': f'{now:%Y-%m-%d %H:%S%z}',
-                'PO-Revision-Date': f'{now:%Y-%m-%d %H:%S%z}',
+                'POT-Creation-Date': f'{now:%Y-%m-%d %H:%M:%S%z}',
+                'PO-Revision-Date': f'{now:%Y-%m-%d %H:%M:%S%z}',
                 'Last-Translator': 'KodiPL Team <dev@kodi-pl.net>',
                 # 'Language-Team': 'English <yourteam@example.com>',
                 'Language': lang,
