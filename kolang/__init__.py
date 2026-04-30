@@ -763,10 +763,10 @@ class Translate(TranslateBase):
         for input in self.py_inputs:
             self._write_py(input)
 
-    def _write_entry(self, path, *, base):
+    def _prepare_write_target(self, path: Path, *, base: Path | None) -> Path:
         if self.backup_pattern == '+':
             # write as new file
-            return path.with_suffix(input.path.suffix + '.new')
+            return path.with_suffix(path.suffix + '.new')
         # backup and override
         if self.backup_pattern and self.backup_pattern != '{}':
             if base is None:
@@ -774,7 +774,7 @@ class Translate(TranslateBase):
             else:
                 base = base.resolve()
             try:
-                relative = path.relative_to(path)
+                relative = path.relative_to(base)
             except ValueError:
                 relative = Path()
             pat = self.backup_pattern
@@ -801,7 +801,7 @@ class Translate(TranslateBase):
             def entity(m: re.Match) -> str:
                 code = ord(m[0])
                 return f'&#x{code:04x};'
-            path = self._write_entry(input.path.resolve(), base=input.base)
+            path = self._prepare_write_target(input.path.resolve(), base=input.base)
             data: str = decl + etree.tostring(input.tree, encoding=self.encoding).decode(self.encoding)
             data = re.sub(r'[\u2000-\u200f]', entity, data)
             path.write_bytes(data.encode(self.encoding))
@@ -813,7 +813,7 @@ class Translate(TranslateBase):
             if self.dump_output:
                 print(input.data)
         else:
-            path = self._write_entry(input.path.resolve(), base=input.base)
+            path = self._prepare_write_target(input.path.resolve(), base=input.base)
             with open(path, 'w', encoding=self.encoding, newline='') as f:
                 f.write(input.data)
 
