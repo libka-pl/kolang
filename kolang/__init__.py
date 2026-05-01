@@ -180,6 +180,12 @@ _RE_OPT_SPLIT = re.compile(r'\s*:\s*')
 # Matches `translate` (general) or `translate[<target>]` (per-attr/text); target
 # may be empty (text content), an attr name, or `attr#index` for lvalues.
 _RE_TRANSLATE_KEY = re.compile(r'^translate(?:\[([^\]]*)\])?$')
+# Matches `python` (general) or `python[<target>]` (per-attr/text). Values:
+# 'true' (raw scan), 'false' (no scan), 'fstring' (only {…} blocks).
+_RE_PYTHON_KEY = re.compile(r'^python(?:\[([^\]]*)\])?$')
+
+#: Allowed `:python=…:` values.
+_PYTHON_VALUES = frozenset({'true', 'false', 'fstring'})
 
 # L() comment marker — `L(N, 'text')`, `L[attr](N, 'text')`, `L[attr#N](N, 'text')`.
 # Empty `L[]` is rejected (ambiguous with `L(...)`).
@@ -312,6 +318,105 @@ def _translation_enabled(node, target: str | None) -> bool | None:
         target=None        → element-level default only (general)
     """
     general, per_target = _get_translate_overrides(node)
+    if target is None:
+        return general
+    if target in per_target:
+        return per_target[target]
+    if '#' in target:
+        attr_only = target.split('#', 1)[0]
+        if attr_only in per_target:
+            return per_target[attr_only]
+    return general
+
+
+def _parse_python_comment(text: str) -> tuple[str | None, dict[str, str]]:
+    """Parse one comment text for `:python=…:` directives.
+
+    Returns (general, per_target) where values are 'true' | 'false' | 'fstring'
+    (validated; invalid values silently skipped).
+    """
+    general: str | None = None
+    per_target: dict[str, str] = {}
+    for op in _RE_OPT_SPLIT.split(text or ''):
+        if not op:
+            continue
+        key, sep, value = op.partition('=')
+        if not sep:
+            continue
+        m = _RE_PYTHON_KEY.match(key.strip())
+        if not m:
+            continue
+        value = value.strip()
+        if value not in _PYTHON_VALUES:
+            continue
+        target = m.group(1)
+        if target is None:
+            general = value
+        else:
+            per_target[target] = value
+    return general, per_target
+
+
+def _get_python_overrides(node) -> tuple[str | None, dict[str, str]]:
+    """Walk back through preceding comments collecting :python=…: overrides.
+    Closer-to-element comments take precedence (set first, never overwritten).
+    """
+    general: str | None = None
+    per_target: dict[str, str] = {}
+    prev = node.getprevious()
+    while isinstance(prev, etree._Comment):
+        g, p = _parse_python_comment(prev.text or '')
+        for k, v in p.items():
+            per_target.setdefault(k, v)
+        if general is None:
+            general = g
+        prev = prev.getprevious()
+    return general, per_target
+
+
+def _extract_fstring_blocks(text: str) -> list[tuple[int, int, str]]:
+    """Return [(start, end, code), …] for `{…}` expressions in `text`.
+
+    `{{` / `}}` at the top level are literal `{` / `}` (Python f-string convention).
+    Inside an expression, braces are matched normally (depth counter).
+    Indices `start`/`end` are positions in `text` of the inner code (between
+    the outer `{` and `}`); the outer braces are NOT included.
+    """
+    blocks: list[tuple[int, int, str]] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == '{':
+            if i + 1 < n and text[i + 1] == '{':
+                i += 2  # literal `{`
+                continue
+            depth = 1
+            j = i + 1
+            while j < n and depth > 0:
+                cj = text[j]
+                if cj == '{':
+                    depth += 1
+                elif cj == '}':
+                    depth -= 1
+                j += 1
+            if depth == 0:
+                blocks.append((i + 1, j - 1, text[i + 1:j - 1]))
+                i = j
+            else:
+                break  # unmatched `{` — give up
+        elif c == '}' and i + 1 < n and text[i + 1] == '}':
+            i += 2  # literal `}`
+        else:
+            i += 1
+    return blocks
+
+
+def _python_override(node, target: str | None) -> str | None:
+    """Resolve effective :python override for given target. Same hierarchy
+    as `_translation_enabled`. Returns 'true' | 'false' | 'fstring' | None.
+    """
+    general, per_target = _get_python_overrides(node)
     if target is None:
         return general
     if target in per_target:
@@ -498,6 +603,15 @@ class Translate(TranslateBase):
     #: for plugins/skins/scripts/common. Override via --id-max / "id-max".
     ID_MAX_DEFAULT: int = 33999
 
+    #: Default raw-Python tags (cała text+tail to Python source).
+    DEFAULT_PYTHON_TAGS: tuple[str, ...] = ('ff:vars',)
+    #: Default raw-Python attributes (per-tag); each entry is (tag_or_None, attr).
+    DEFAULT_PYTHON_ATTRS: tuple[tuple[str | None, str], ...] = (
+        ('ff:define', 'args'),
+        ('ff:include', 'ff:args'),
+        ('ff:set', 'value'),
+    )
+
     DEF_PLURAL_FORMS = 'nplurals=2; plural=(n != 1);'
     # see
     # - https://doc.qt.io/archives/qq/qq19-plurals.html
@@ -552,6 +666,8 @@ class Translate(TranslateBase):
                  git_only: bool = False,
                  extra_translate_attrs: list[str] | None = None,
                  extra_translate_tags: list[str] | None = None,
+                 python_tags: list[str] | None = None,
+                 python_attrs: list | None = None,
                  cleanup_translate_comments: bool = False,
                  ) -> None:
         self.xml_inputs: list[XmlInput] = []
@@ -600,6 +716,23 @@ class Translate(TranslateBase):
         self.extra_translate_attrs: list[str] = list(extra_translate_attrs or ())
         #: Extra XML element tags to scan as text-content translations.
         self.extra_translate_tags: list[str] = list(extra_translate_tags or ())
+        #: Tags whose text/tail is raw Python (default + config).
+        self.python_tags: set[str] = set(self.DEFAULT_PYTHON_TAGS) | set(python_tags or ())
+        #: Per-tag raw-Python attrs as set of (tag_or_None, attr_name).
+        self.python_attrs: set[tuple[str | None, str]] = set(self.DEFAULT_PYTHON_ATTRS)
+        for entry in python_attrs or ():
+            if isinstance(entry, str):
+                self.python_attrs.add((None, entry))
+            elif isinstance(entry, dict):
+                name = entry.get('name')
+                tags = entry.get('tags')
+                if not name:
+                    continue
+                if not tags:
+                    self.python_attrs.add((None, name))
+                else:
+                    for tag in tags:
+                        self.python_attrs.add((tag, name))
         #: One-time cleanup: drop `:translate=false:` comments the automat would
         #: skip on its own.
         self.cleanup_translate_comments: bool = cleanup_translate_comments
@@ -770,6 +903,100 @@ class Translate(TranslateBase):
         comment.tail = sep
         elem.addprevious(comment)
 
+    @staticmethod
+    def _tag_local(elem) -> str:
+        """Return tag in `prefix:local` form (Clark `{ns}local` → `prefix:local`).
+
+        Assumes `xmlns:prefix="ns"` on the element/ancestor — uses `nsmap` to
+        find the prefix bound to the namespace URI.
+        """
+        tag = elem.tag
+        if not isinstance(tag, str) or not tag.startswith('{'):
+            return tag if isinstance(tag, str) else ''
+        ns_end = tag.index('}')
+        uri = tag[1:ns_end]
+        local = tag[ns_end + 1:]
+        for prefix, p_uri in (elem.nsmap or {}).items():
+            if p_uri == uri and prefix:
+                return f'{prefix}:{local}'
+        return local
+
+    @staticmethod
+    def _attr_local(elem, attr: str) -> str:
+        """Map a Clark-notation attribute name to `prefix:local`."""
+        if not attr.startswith('{'):
+            return attr
+        ns_end = attr.index('}')
+        uri = attr[1:ns_end]
+        local = attr[ns_end + 1:]
+        for prefix, p_uri in (elem.nsmap or {}).items():
+            if p_uri == uri and prefix:
+                return f'{prefix}:{local}'
+        return local
+
+    def _python_apply_value(self, elem, attr_or_tail, value: str, mode: str, path) -> None:
+        """Run python scan on `value` in `mode`. attr_or_tail: None=text, str=attr, 'TAIL'=tail."""
+        if mode == 'false' or not value:
+            return
+        is_tail = attr_or_tail == 'TAIL'
+        attr = None if is_tail or attr_or_tail is None else attr_or_tail
+        nv = NodeValue(elem, attr=attr, tail=is_tail, python=True)
+        file = XmlValueInput(nv)
+        if mode == 'true':
+            self._replace_py(value, file=file, node=nv, path=path)
+        elif mode == 'fstring':
+            for start, _end, code in _extract_fstring_blocks(value):
+                self._replace_py(code, file=file, node=nv, path=path, data_offset=start)
+
+    def _python_scan_pass(self, root, *, is_skin: bool, path) -> None:
+        """Step 1 of XML scan: per `:python` mode, run `_replace_py` on values.
+
+        Iterates all elements; each text/attr/tail gets a mode resolution
+        (granular override → general override → whitelist → context default)
+        and is scanned accordingly. Modifies XML in place via Trans/replace.
+        """
+        def visit(elem):
+            if isinstance(elem.tag, str):
+                # text
+                if elem.text:
+                    mode = self._python_mode(elem, '', is_skin=is_skin)
+                    self._python_apply_value(elem, None, elem.text, mode, path)
+                # attrs
+                for attr_name, attr_val in elem.attrib.items():
+                    if not attr_val:
+                        continue
+                    local = self._attr_local(elem, attr_name)
+                    mode = self._python_mode(elem, local, is_skin=is_skin)
+                    self._python_apply_value(elem, local, attr_val, mode, path)
+                for child in elem:
+                    visit(child)
+                    if child.tail:
+                        if isinstance(child.tag, str):
+                            mode = self._python_mode(child, '', is_skin=is_skin)
+                            self._python_apply_value(child, 'TAIL', child.tail, mode, path)
+        visit(root)
+
+    def _python_mode(self, elem, target: str | None, *, is_skin: bool) -> str:
+        """Resolve effective `:python` mode for given (elem, target).
+
+        Returns one of: 'true' (raw), 'false' (skip), 'fstring'.
+        Hierarchy: granular override → general override → whitelist → context default.
+        """
+        ov = _python_override(elem, target)
+        if ov is not None:
+            return ov
+        tag = self._tag_local(elem)
+        if target is None or target == '':
+            # text content / tail
+            if tag in self.python_tags:
+                return 'true'
+        else:
+            # attribute (target may be 'attr' or 'attr#N')
+            attr_only = target.split('#', 1)[0] if '#' in target else target
+            if (tag, attr_only) in self.python_attrs or (None, attr_only) in self.python_attrs:
+                return 'true'
+        return 'fstring' if is_skin else 'false'
+
     @classmethod
     def _is_translatable(cls, text: str) -> bool:
         """Return True if `text` contains a phrase worth translating.
@@ -848,10 +1075,13 @@ class Translate(TranslateBase):
         def should_translate(node: Element, target: str | None, text: str | None) -> bool:
             """Decide whether to translate `text` for given target on `node`.
 
-            Order of precedence (per spec D):
-              1. comment override (granular wins over general)
-              2. automat (`_is_translatable`) — letter-test after stripping
-                 format tags & runtime placeholders
+            Order of precedence:
+              1. comment override (granular wins over general).
+              2. if `:python=fstring:` is active for this target AND `text`
+                 contains any `{…}` block — return False (template runtime
+                 will compose; cała wartość nie idzie do PO).
+              3. automat (`_is_translatable`) — letter-test after stripping
+                 format tags & runtime placeholders.
             Numeric refs are handled by `add()` separately and don't reach here.
             """
             override = _translation_enabled(node, target)
@@ -859,7 +1089,11 @@ class Translate(TranslateBase):
                 return False
             if override is True:
                 return True
-            return self._is_translatable(text or '')
+            value = text or ''
+            py_mode = self._python_mode(node, target, is_skin=(xtype == XmlType.Window))
+            if py_mode == 'fstring' and _extract_fstring_blocks(value):
+                return False
+            return self._is_translatable(value)
 
         node: Element
         root = tree.getroot()
@@ -877,7 +1111,11 @@ class Translate(TranslateBase):
                 return True
             return should_translate(node, target, text)
 
-        # -- settings.xml
+        # -- step 1: python scan (raw / fstring) — modifies values in place.
+        is_skin = (xtype == XmlType.Window)
+        self._python_scan_pass(root, is_skin=is_skin, path=path)
+
+        # -- step 2: translate scan (settings / window).
         text_tags = ('heading', *self.extra_translate_tags)
         attr_names = ('label', 'help', *self.extra_translate_attrs)
         if xtype == XmlType.Settings:
@@ -955,23 +1193,6 @@ class Translate(TranslateBase):
                     if self.addon_id and not m['addon']:
                         trans.append(Trans(None, start, start, fmt=f'{self.addon_id} '))
                     add(text[start:end], NodeValue(node, None, trans=tuple(trans)))
-            # python templates <ff:vars/> and any in {}
-            # for node in root.xpath('.//*[text()[contains(.,"{") and contains(.,"}")]]'):
-            if 1:  # XXX  to now, just replace on load as a text
-                def xml_py(node: Element):
-                    if node.text:
-                        nd = NodeValue(node, python=True)
-                        self._replace_py(node.text, file=XmlValueInput(nd), node=nd, path=path)
-                    for attr, value in node.attrib.items():
-                        nd = NodeValue(node, attr, python=True)
-                        self._replace_py(value, file=XmlValueInput(nd), node=nd, path=path)
-                    for elem in node:
-                        xml_py(elem)
-                        if elem.tail:
-                            nd = NodeValue(elem, python=True, tail=True)
-                            self._replace_py(elem.tail, file=XmlValueInput(nd), node=nd, path=path)
-                # rx = re.compile('')
-                xml_py(root)
 
     def load_xml(self, path: str | Path, base: str | Path | None = None):
         """Load XML and keep data."""
@@ -1015,8 +1236,15 @@ class Translate(TranslateBase):
                     l8funcs: list[L8Func] | None = None,
                     node: NodeValue | None = None,
                     path: Path | None = None,
+                    data_offset: int = 0,
                     ) -> None:
-        """Scan single Python source data."""
+        """Scan single Python source data.
+
+        `data_offset` shifts every produced `Trans.start/end` by this amount —
+        used when `data` is a fragment of a larger value (e.g. a `{…}` block
+        inside an XML attribute under f-string mode), so replacements land on
+        the correct positions in the surrounding value.
+        """
 
         def rstr(name='str'):
             pat = '|'.join((
@@ -1061,10 +1289,10 @@ class Translate(TranslateBase):
                 mid = r['mid']
                 if mid is None:
                     offset = r.end('label_bracket')
-                    tr = Trans(file, start=offset, end=offset, fmt='{label.id}, ')
+                    tr = Trans(file, start=data_offset + offset, end=data_offset + offset, fmt='{label.id}, ')
                 else:
                     mid = int(mid)
-                    tr = Trans(file, start=r.start('mid'), end=r.end('mid'))
+                    tr = Trans(file, start=data_offset + r.start('mid'), end=data_offset + r.end('mid'))
                 label = Label(mid, unescape(msg))
             # " $LOCALIZE[] "
             elif s is not None:
@@ -1073,7 +1301,7 @@ class Translate(TranslateBase):
                     if mid is not None:
                         mid = int(mid)
                     if r['text'] is not None:
-                        tr = Trans(file, start=sstart + r.start('text'), end=sstart + r.end('text'))
+                        tr = Trans(file, start=data_offset + sstart + r.start('text'), end=data_offset + sstart + r.end('text'))
                         text = self._RE_PY_LOCALIZE_ESC.sub(r'\1', r['text'])
                         label = Label(mid, unescape(text))
                     elif mid is not None:
@@ -1090,7 +1318,7 @@ class Translate(TranslateBase):
                     logger.debug(f'  numeric PY ref #{mid}')
                     self._ids.add(int(mid))
                     continue
-                tr = Trans(file, start=r.start('gls'), end=r.end('gls'))
+                tr = Trans(file, start=data_offset + r.start('gls'), end=data_offset + r.end('gls'))
                 label = Label(None, unescape(text))
             if label is not None:
                 if tr is not None:
@@ -1212,19 +1440,20 @@ class Translate(TranslateBase):
                         best.nodes |= label.nodes
                         best.trans.extend(label.trans)
                     self._ids.add(label.id)
+        # Apply Trans first — they reference offsets in the *original* value.
+        # `set_label` (next loop) overwrites the whole node.text/attr, so it
+        # must run after Trans-based fragment edits.
+        trans = sorted(((label, tr) for label in self._by_id.values() for tr in label.trans),
+                       key=lambda x: -x[1].start)
+        for label, tr in trans:
+            tr.replace(label)
+            self._ids.add(label.id)
         for label in self._by_id.values():
             for node in label.nodes:
                 if not node.python:
                     self._ensure_L_comment(node, label)
                     node.set_label(str(label.id), addon=self.addon_id)
                     self._ids.add(label.id)
-        trans = sorted(((label, tr) for label in self._by_id.values() for tr in label.trans),
-                       key=lambda x: -x[1].start)
-        for label, tr in trans:
-            # fmt = f'{{before}}{tr.fmt}{{after}}'
-            # tr.file.data = fmt.format(before=tr.file.data[:tr.start], after=tr.file.data[tr.end:], label=label)
-            tr.replace(label)
-            self._ids.add(label.id)
         if self.cleanup_translate_comments:
             removed = sum(self._cleanup_translate_comments_in(inp.tree) for inp in self.xml_inputs)
             if removed:
@@ -1469,6 +1698,22 @@ class Translate(TranslateBase):
                      'git-only', 'extra-translate-attrs', 'extra-translate-tags'):
             if attr in options:
                 setattr(self, attr.replace('-', '_'), options[attr])
+        # python-tags/python-attrs additively extend defaults (set semantics).
+        for tag in options.get('python-tags', ()):
+            self.python_tags.add(tag)
+        for entry in options.get('python-attrs', ()):
+            if isinstance(entry, str):
+                self.python_attrs.add((None, entry))
+            elif isinstance(entry, dict):
+                name = entry.get('name')
+                tags = entry.get('tags')
+                if not name:
+                    continue
+                if not tags:
+                    self.python_attrs.add((None, name))
+                else:
+                    for tag in tags:
+                        self.python_attrs.add((tag, name))
         if (val := options.get('mark-obsoleted')) is not None:
             self.obsolete = ObsoleteAction.MARK if val else ObsoleteAction.KEEP
         if val := options.get('obsolete'):
