@@ -669,6 +669,7 @@ class Translate(TranslateBase):
                  python_tags: list[str] | None = None,
                  python_attrs: list | None = None,
                  cleanup_translate_comments: bool = False,
+                 rename: bool = True,
                  ) -> None:
         self.xml_inputs: list[XmlInput] = []
         self.py_inputs: list[PyInput] = []
@@ -704,6 +705,12 @@ class Translate(TranslateBase):
         self.reserved_ids: ranges = reserved_ids or ranges()
         #: Moved IDs  - existings IDs if they were in reserved_ids.
         self._moved_ids: set[int] = set()
+        #: IDs that have a non-empty msgstr in any loaded PO. Used by the
+        #: rename heuristic to refuse silent renames of translated entries.
+        self._translated_ids: set[int] = set()
+        #: Map id → new_text for labels renamed in `generate()`. Used by
+        #: `translate()` to update the matching `msgid` in each PO.
+        self._renamed_ids: dict[int, str] = {}
         #: True if po msg are splited into mulitple lines.
         self.multi_line_msg: bool = multi_line_msg
         #: Cache of loaded addon configs keyed by resolved config-file path.
@@ -736,6 +743,10 @@ class Translate(TranslateBase):
         #: One-time cleanup: drop `:translate=false:` comments the automat would
         #: skip on its own.
         self.cleanup_translate_comments: bool = cleanup_translate_comments
+        #: Rename existing IDs in place when a text edit would otherwise
+        #: produce an obsolete entry that has no translation anywhere
+        #: (or `--obsolete=remove` is set, so the old entry would be dropped).
+        self.rename: bool = rename
 
     def _add_label(self, label: Label, *, used=True):
         """Add label to existing data (by ID and by TEXT)."""
@@ -1408,7 +1419,10 @@ class Translate(TranslateBase):
             if (r := self._RE_LABEL_NUM.fullmatch(entry.msgctxt or '')) is None:
                 label = Label(None, text)
             else:
-                label = Label(int(r.group(1)), text)
+                lid = int(r.group(1))
+                label = Label(lid, text)
+                if entry.msgstr:
+                    self._translated_ids.add(lid)
             self._add_label(label, used=False)
             if entry.obsolete:
                 was_obsolete += 1
@@ -1420,6 +1434,58 @@ class Translate(TranslateBase):
         # 2. scan current inputs (xml)
         # 3. merge id and text labels
         ...  # TODO: do it – for sure? I don't think so.
+
+    def _rename_orphan_ids(self) -> None:
+        """Reuse existing IDs whose old text is no longer referenced.
+
+        For each pending new label (`label.id is None, label.ref is L1`):
+          - if L1's old text has no remaining source references (`L1.nodes`
+            empty),
+          - and the old ID would be discarded anyway (`--obsolete=remove`)
+            or has no translation in any loaded PO,
+          - and the new text isn't already claimed by another concrete ID,
+          then take L1's ID for the new text instead of generating a new one.
+        Renames are recorded in `_renamed_ids` so `translate()` can update
+        the matching `msgid` in each language PO.
+        """
+        for new_text, lst in list(self._by_text.items()):
+            for label in list(lst):
+                if label.id is not None or label.ref is None:
+                    continue
+                L1 = label.ref
+                # Guard: a `ref` is only set in `_add_label` when L1 had a
+                # non-empty text and an id — defensively narrow types here.
+                if L1.id is None or L1.text is None:
+                    continue
+                if L1.nodes:
+                    continue                  # 'old' still referenced
+                if not (self.obsolete is ObsoleteAction.REMOVE
+                        or L1.id not in self._translated_ids):
+                    continue                  # translation worth preserving
+                # Don't rename onto a text that already has its own concrete ID.
+                if any(lb.id is not None and lb is not label for lb in lst):
+                    continue
+                old_text: str = L1.text
+                old_id: int = L1.id
+                # 1. Remove L1 from _by_text[old_text].
+                old_lst = self._by_text.get(old_text)
+                if old_lst is not None and L1 in old_lst:
+                    old_lst.remove(L1)
+                    if not old_lst:
+                        del self._by_text[old_text]
+                # 2. Rename L1 in place — it keeps its id, gets the new text
+                #    and absorbs the pending label's nodes/trans.
+                L1.text = new_text
+                L1.nodes |= label.nodes
+                L1.trans.extend(label.trans)
+                L1.ref = None
+                # 3. Replace the pending label in lst with L1, mark resolved.
+                lst[lst.index(label)] = L1
+                label.id = old_id
+                label.ref = L1
+                self._renamed_ids[old_id] = new_text
+                if self.dry_run:
+                    print(f' rename id: {old_id}: {old_text!r} → {new_text!r}')
 
     def generate(self) -> GenerateStats:
         """Generate new lables. Return number of new translations."""
@@ -1449,6 +1515,8 @@ class Translate(TranslateBase):
                 self._moved_ids.add(mid)
                 if self.dry_run:
                     print(f' move id: {mid} → {label.id}: {label.text!r}')
+        if self.rename:
+            self._rename_orphan_ids()
         for lst in self._by_text.values():
             for label in lst:
                 if label.id is None:
@@ -1467,9 +1535,11 @@ class Translate(TranslateBase):
         trans = sorted(((label, tr) for label in self._by_id.values() for tr in label.trans),
                        key=lambda x: -x[1].start)
         for label, tr in trans:
+            assert label.id is not None
             tr.replace(label)
             self._ids.add(label.id)
         for label in self._by_id.values():
+            assert label.id is not None
             for node in label.nodes:
                 if not node.python:
                     self._ensure_L_comment(node, label)
@@ -1578,6 +1648,14 @@ class Translate(TranslateBase):
                              '\nAddon Provider: {addon.provider}'),
             }
         ie = {int(r['id']): e for e in po if (r := self._RE_LABEL_NUM.fullmatch(e.msgctxt or '')) is not None}
+        # Apply in-place renames: existing entries whose label was reused for
+        # a new text (because old text became unreferenced and untranslated /
+        # `--obsolete=remove`). Update the msgid; msgstr stays — empty by
+        # the rename precondition (or wiped by remove afterwards).
+        for old_id, new_text in self._renamed_ids.items():
+            entry = ie.get(old_id)
+            if entry is not None and entry.msgid != new_text:
+                entry.msgid = new_text
         for label in self._by_id.values():
             assert label.id is not None
             if label.id not in ie:
@@ -1718,7 +1796,7 @@ class Translate(TranslateBase):
         options = conf.get('options', {})
         for attr in ('id-from', 'id-min', 'id-max', 'id-policy', 'mark-translated',
                      'backup-pattern', 'addon-id', 'po-wrap-width', 'encoding', 'multi-line-msg',
-                     'git-only', 'extra-translate-attrs', 'extra-translate-tags'):
+                     'git-only', 'extra-translate-attrs', 'extra-translate-tags', 'rename'):
             if attr in options:
                 setattr(self, attr.replace('-', '_'), options[attr])
         # python-tags/python-attrs additively extend defaults (set semantics).
@@ -1819,6 +1897,7 @@ def process(inputs, *, args, langs=None, output=None):
                       po_wrap_width=args.po_wrap_width, reserved_ids=args.id_reserve,
                       git_only=args.git_only,
                       cleanup_translate_comments=args.cleanup_translate_comments,
+                      rename=args.rename,
                       )
     if args.verbose:
         logging.basicConfig(level=args.verbose)
@@ -2024,6 +2103,9 @@ def main(argv=None):
     p.set_defaults(multi_line_msg=False)
     p.add_argument('--git-only', action='store_true', default=False,
                    help='scan only files tracked by git (in the index)')
+    p.add_argument('--no-rename', dest='rename', action='store_false', default=True,
+                   help='disable in-place ID rename when text edits would otherwise '
+                        'orphan an untranslated entry (default: rename when safe)')
     p.add_argument('--cleanup-translate-comments', action='store_true', default=False,
                    help='one-time cleanup: drop redundant :translate=false: XML comments')
     p.add_argument('--verbose', action='store_const', const=logging.INFO, help='be more verbose')
