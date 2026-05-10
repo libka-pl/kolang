@@ -13,36 +13,35 @@ import re
 import string
 from dataclasses import dataclass, field
 from itertools import chain
-from typing import Union, Optional, Any, Literal, overload, TYPE_CHECKING
+from typing import Any, Literal, overload, TYPE_CHECKING
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from fnmatch import fnmatch
+from io import BytesIO
+from ast import literal_eval
 import json
 import argparse
-if TYPE_CHECKING:
+import subprocess
+try:
     from lxml import etree
+except ImportError:
+    sys.stderr.write('Missing lxml module, try `pip install lxml`\n')
+    sys.exit(1)
+if TYPE_CHECKING:
+    from typing import Sequence
     from lxml.etree import _ElementTree as ElementTree
     from lxml.etree import _Element as Element
-    # from xml.etree.ElementTree import ElementTree
-    # from xml.etree.Element import Element
-else:
-    try:
-        # faster implementation
-        from lxml import etree
-    except ImportError:
-        # standard implementation
-        from xml.etree import ElementTree as etree
 from . import polib
 from .plural import plural_forms
 
 import logging
 import logging.config
-logger = logging.Logger('kolang')
+logger = logging.getLogger('kolang')
 
 
 __author__ = 'rysson'
-__version__ = '0.1.12'
+__version__ = '0.2.1'
 
 
 # Monkey Patching
@@ -87,17 +86,19 @@ class XmlType(Enum):
 class L8Func:
     #: Function regex pattern.
     pattern: str
-    #: Funtion type (LL / getLocalizedString)
+    #: Function type (LL / getLocalizedString)
     type: FuncType = FuncType.GetLocalizedString
     #: Where this function is allowed.
-    paths: set[Path] = None
+    paths: set[Path] | None = None
 
     def __str__(self) -> str:
         return self.pattern
 
-    def is_allowed(self, path: Path) -> bool:
+    def is_allowed(self, path: Path | None) -> bool:
         if self.paths is None:
             return True
+        if path is None:
+            return False
         path = path.resolve()
         return any(path.is_relative_to(p) for p in self.paths)
 
@@ -105,12 +106,14 @@ class L8Func:
 # @name_tuple_field
 @dataclass(frozen=True)
 class AddonConf:
+    #: Addon ID (from addon.xml).
+    id: str
     #: Paths to scan.
     paths: list[Path]
     #: Extra languages.
     langs: set[str] = field(default_factory=set)
     #: Paths to skip.
-    skip: set[str] = field(default_factory=set)
+    skip: set[Path] = field(default_factory=set)
     #: Extra python localzed function/method to detect.
     l8funcs: list[L8Func] = field(default_factory=list)
 
@@ -121,6 +124,7 @@ class XmlInput:
     tree: ElementTree
     base: Path
     declaration: str = None
+    encoding: str = 'utf-8'
 
 
 @dataclass
@@ -129,10 +133,309 @@ class PyInput:
     data: str = field(repr=False)
     base: Path
 
+    def replace(self, fmt: str, label: Label, start: int, end: int) -> None:
+        self.data = fmt.format(before=self.data[:start], after=self.data[end:], label=label)
+
+
+@dataclass
+class XmlValueInput:
+    """Value in XML file, used only in PY in XML."""
+    node: NodeValue
+
+    def replace(self, fmt: str, label: Label, start: int, end: int) -> None:
+        node = self.node.node
+        if self.node.tail:
+            text = node.tail or ''
+            node.tail = fmt.format(before=text[:start], after=text[end:], label=label)
+        elif self.node.attr is None:
+            text = node.text or ''
+            node.text = fmt.format(before=text[:start], after=text[end:], label=label)
+        else:
+            text = node.get(self.node.attr, '')
+            node.set(self.node.attr, fmt.format(before=text[:start], after=text[end:], label=label))
+
 
 def local_now():
     tz = timezone(timedelta(seconds=round((datetime.now() - datetime.utcnow()).total_seconds())))
     return datetime.now(tz)
+
+
+def _git_root(path: Path) -> Path | None:
+    """Return git repo root for path, None if path is not in a repo. Hard-exit if git is missing."""
+    cwd = path if path.is_dir() else path.parent
+    try:
+        out = subprocess.run(
+            ['git', 'rev-parse', '--show-toplevel'],
+            cwd=str(cwd), capture_output=True, text=True, check=True,
+        )
+    except FileNotFoundError:
+        logger.error('git binary not found in PATH; install git or disable --git-only')
+        sys.exit(1)
+    except subprocess.CalledProcessError:
+        return None
+    return Path(out.stdout.strip()).resolve()
+
+
+_RE_OPT_SPLIT = re.compile(r'\s*:\s*')
+# Matches `translate` (general) or `translate[<target>]` (per-attr/text); target
+# may be empty (text content), an attr name, or `attr#index` for lvalues.
+_RE_TRANSLATE_KEY = re.compile(r'^translate(?:\[([^\]]*)\])?$')
+# Matches `python` (general) or `python[<target>]` (per-attr/text). Values:
+# 'true' (raw scan), 'false' (no scan), 'fstring' (only {…} blocks).
+_RE_PYTHON_KEY = re.compile(r'^python(?:\[([^\]]*)\])?$')
+
+#: Allowed `:python=…:` values.
+_PYTHON_VALUES = frozenset({'true', 'false', 'fstring'})
+
+# L() comment marker — `L(N, 'text')`, `L[attr](N, 'text')`, `L[attr#N](N, 'text')`.
+# Empty `L[]` is rejected (ambiguous with `L(...)`).
+_RE_L_COMMENT = re.compile(
+    r'\s*L'
+    r'(?:\[(?P<attr>[A-Za-z_][\w.\-:]*(?:#\d+)?)\])?'
+    r'\s*\(\s*(?P<id>\d+)\s*,\s*'
+    r"(?P<text>'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\")"
+    r'\s*\)\s*'
+)
+
+
+def _parse_L_comment(comment_text: str) -> tuple[str | None, int, str] | None:
+    """Parse an XML comment text as `L(...)` marker. Return (attr, id, text) or None.
+
+    `attr` is None for text content, attribute name otherwise (may be 'name#N'
+    for indexed lvalues). Text is decoded from Python literal (handles `\\u002d`,
+    `\\\\`, `\\'`, etc. natively via ast.literal_eval).
+    """
+    m = _RE_L_COMMENT.fullmatch(comment_text or '')
+    if not m:
+        return None
+    try:
+        text = literal_eval(m.group('text'))
+    except (ValueError, SyntaxError):
+        return None
+    return m.group('attr'), int(m.group('id')), text
+
+
+def _node_value_target(nv) -> str | None:
+    """Map a NodeValue to its translation `target` (None / 'attr' / 'attr#N')."""
+    if nv.attr is None:
+        return None
+    if nv.attr == 'lvalues' and nv.index is not None:
+        return f'lvalues#{nv.index}'
+    return nv.attr
+
+
+def _find_L_marker(node, target: str | None) -> tuple[int, str] | None:
+    """Walk back through XML comments before `node`, find L(...) for `target`.
+
+    Returns (id, text) of the first matching marker (closest to element);
+    None if no marker found. Non-L comments and unrelated L markers are
+    skipped (allowing free-form developer notes interleaved).
+    """
+    prev = node.getprevious()
+    while isinstance(prev, etree._Comment):
+        parsed = _parse_L_comment(prev.text or '')
+        if parsed is not None:
+            attr, lid, text = parsed
+            if attr == target:
+                return lid, text
+        prev = prev.getprevious()
+    return None
+
+
+def _format_L_comment(attr: str | None, label_id: int, text: str) -> str:
+    """Format an L(...) marker as XML comment body (without `<!-- ... -->`).
+
+    Each `--` sequence is escaped to `\\u002d` (per char) so the comment stays
+    XML-valid. ast.literal_eval round-trips the value back when parsing.
+    """
+    body_text = repr(text)
+    body_text = re.sub(r'-{2,}', lambda m: '\\u002d' * len(m[0]), body_text)
+    if attr:
+        return f' L[{attr}]({label_id}, {body_text}) '
+    return f' L({label_id}, {body_text}) '
+
+
+def _parse_translate_comment(text: str) -> tuple[bool | None, dict[str, bool]]:
+    """Parse a single XML comment text. Return (general, per_target).
+
+    `general` is bool (from `:translate=true/false:`) or None if absent.
+    `per_target` maps target → bool, where target is:
+        ''            — text content (`:translate[]=…:`)
+        'attr'        — attribute (`:translate[attr]=…:`)
+        'attr#N'      — lvalues index (`:translate[lvalues#0]=…:`)
+    Unknown directives or invalid values are silently skipped.
+    """
+    general: bool | None = None
+    per_target: dict[str, bool] = {}
+    for op in _RE_OPT_SPLIT.split(text or ''):
+        if not op:
+            continue
+        key, sep, value = op.partition('=')
+        if not sep:
+            continue
+        m = _RE_TRANSLATE_KEY.match(key.strip())
+        if not m:
+            continue
+        value = value.strip()
+        if value not in ('true', 'false'):
+            continue
+        bval = value == 'true'
+        target = m.group(1)
+        if target is None:
+            general = bval
+        else:
+            per_target[target] = bval
+    return general, per_target
+
+
+def _get_translate_overrides(node) -> tuple[bool | None, dict[str, bool]]:
+    """Walk back through preceding XML comments, collecting :translate=…: overrides.
+
+    Closer-to-element comments take precedence (set first, never overwritten).
+    Non-`:translate=…:` comments are skipped (allowing free-form developer notes
+    interleaved with directives). Walk stops at first non-comment sibling.
+    """
+    general: bool | None = None
+    per_target: dict[str, bool] = {}
+    prev = node.getprevious()
+    while isinstance(prev, etree._Comment):
+        g, p = _parse_translate_comment(prev.text or '')
+        for k, v in p.items():
+            per_target.setdefault(k, v)
+        if general is None:
+            general = g
+        prev = prev.getprevious()
+    return general, per_target
+
+
+def _translation_enabled(node, target: str | None) -> bool | None:
+    """Return True/False/None override for a given target on node.
+
+    Hierarchy (most specific wins):
+        target='lvalues#0' → check 'lvalues#0' → 'lvalues' → general
+        target='label'     → check 'label'     → general
+        target=''          → check ''          → general
+        target=None        → element-level default only (general)
+    """
+    general, per_target = _get_translate_overrides(node)
+    if target is None:
+        return general
+    if target in per_target:
+        return per_target[target]
+    if '#' in target:
+        attr_only = target.split('#', 1)[0]
+        if attr_only in per_target:
+            return per_target[attr_only]
+    return general
+
+
+def _parse_python_comment(text: str) -> tuple[str | None, dict[str, str]]:
+    """Parse one comment text for `:python=…:` directives.
+
+    Returns (general, per_target) where values are 'true' | 'false' | 'fstring'
+    (validated; invalid values silently skipped).
+    """
+    general: str | None = None
+    per_target: dict[str, str] = {}
+    for op in _RE_OPT_SPLIT.split(text or ''):
+        if not op:
+            continue
+        key, sep, value = op.partition('=')
+        if not sep:
+            continue
+        m = _RE_PYTHON_KEY.match(key.strip())
+        if not m:
+            continue
+        value = value.strip()
+        if value not in _PYTHON_VALUES:
+            continue
+        target = m.group(1)
+        if target is None:
+            general = value
+        else:
+            per_target[target] = value
+    return general, per_target
+
+
+def _get_python_overrides(node) -> tuple[str | None, dict[str, str]]:
+    """Walk back through preceding comments collecting :python=…: overrides.
+    Closer-to-element comments take precedence (set first, never overwritten).
+    """
+    general: str | None = None
+    per_target: dict[str, str] = {}
+    prev = node.getprevious()
+    while isinstance(prev, etree._Comment):
+        g, p = _parse_python_comment(prev.text or '')
+        for k, v in p.items():
+            per_target.setdefault(k, v)
+        if general is None:
+            general = g
+        prev = prev.getprevious()
+    return general, per_target
+
+
+def _extract_fstring_blocks(text: str) -> list[tuple[int, int, str]]:
+    """Return [(start, end, code), …] for `{…}` expressions in `text`.
+
+    `{{` / `}}` at the top level are literal `{` / `}` (Python f-string convention).
+    Inside an expression, braces are matched normally (depth counter).
+    Indices `start`/`end` are positions in `text` of the inner code (between
+    the outer `{` and `}`); the outer braces are NOT included.
+    """
+    blocks: list[tuple[int, int, str]] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == '{':
+            if i + 1 < n and text[i + 1] == '{':
+                i += 2  # literal `{`
+                continue
+            depth = 1
+            j = i + 1
+            while j < n and depth > 0:
+                cj = text[j]
+                if cj == '{':
+                    depth += 1
+                elif cj == '}':
+                    depth -= 1
+                j += 1
+            if depth == 0:
+                blocks.append((i + 1, j - 1, text[i + 1:j - 1]))
+                i = j
+            else:
+                break  # unmatched `{` — give up
+        elif c == '}' and i + 1 < n and text[i + 1] == '}':
+            i += 2  # literal `}`
+        else:
+            i += 1
+    return blocks
+
+
+def _python_override(node, target: str | None) -> str | None:
+    """Resolve effective :python override for given target. Same hierarchy
+    as `_translation_enabled`. Returns 'true' | 'false' | 'fstring' | None.
+    """
+    general, per_target = _get_python_overrides(node)
+    if target is None:
+        return general
+    if target in per_target:
+        return per_target[target]
+    if '#' in target:
+        attr_only = target.split('#', 1)[0]
+        if attr_only in per_target:
+            return per_target[attr_only]
+    return general
+
+
+def _git_tracked_files(repo_root: Path) -> set[Path]:
+    """Return absolute paths of files tracked by git (in the index) for given repo."""
+    out = subprocess.run(
+        ['git', 'ls-files', '-z'],
+        cwd=str(repo_root), capture_output=True, check=True,
+    )
+    return {(repo_root / name.decode()).resolve()
+            for name in out.stdout.split(b'\x00') if name}
 
 
 class ranges(tuple[range]):
@@ -169,37 +472,40 @@ def debug_print(text: str, *, indent: int = 4) -> None:
     logger.debug(ind + text.replace('\n', ind))
 
 
-def node_error(node: Element, msg: Optional[str] = None) -> None:
+def node_error(node: Element, msg: str | None = None) -> None:
     """Log XML node error."""
-    try:
-        lno: int = node.sourceline
-        if msg:
-            msg = f': {msg}'
-        else:
-            msg = ''
-        logger.warning(f'Node {node.tag} (line {lno}) error{msg}')
-    except AttributeError:
-        logger.warning(f'Node {node.tag} error{msg}')
+    lno = getattr(node, 'sourceline', None)
+    suffix = f': {msg}' if msg else ''
+    if lno is None:
+        logger.warning(f'Node {node.tag} error{suffix}')
+    else:
+        logger.warning(f'Node {node.tag} (line {lno}) error{suffix}')
 
 
 #: Source file (.py) translate info / translate in NodeValue
 @dataclass(frozen=True)
 class Trans:
-    file: PyInput
+    file: PyInput | XmlValueInput | None
     start: int
     end: int
     fmt: str = '{label.id}'
+
+    def replace(self, label: Label, *, fmt: str | None = None) -> None:
+        if fmt is None:
+            fmt = f'{{before}}{self.fmt}{{after}}'
+        if self.file is not None:
+            self.file.replace(fmt, label, start=self.start, end=self.end)
 
 
 @dataclass
 class Label:
     """Single label occurace in xml or py."""
 
-    id: Optional[int]
-    text: Optional[str] = None
-    nodes: set[Element] = field(default_factory=set)
+    id: int | None
+    text: str | None = None
+    nodes: set[NodeValue] = field(default_factory=set)
     trans: list[Trans] = field(default_factory=list)
-    ref: Optional[Label] = None
+    ref: Label | None = None
 
 
 class LabelList(list[Label]):
@@ -234,21 +540,25 @@ class NodeValue:
     #: Index in "lvalues" settings attribute.
     index: int | None = None
     #: Regex match for take substring of the value.
-    trans: list[Trans] | None = None
+    trans: Sequence[Trans] | None = None
+    #: Python source node text ar attribute.
+    python: bool = False
+    #: True when this NodeValue refers to `node.tail` (text after the closing tag).
+    tail: bool = False
 
     def __getattr__(self, key):
         return getattr(self.node, key)
 
-    def replace(self, text: str, value: str, *, addon: Optional[str] = None) -> str:
+    def replace(self, text: str, value: str, *, addon: str | None = None) -> str:
         for tr in self.trans or ():
             if tr.fmt is not None:
                 value = tr.fmt.format(value=value, id=value, addon=addon)
             text = f'{text[:tr.start]}{value}{text[tr.end:]}'
         return text
 
-    def set_label(self, value: str, addon: Optional[str] = None) -> None:
+    def set_label(self, value: str, addon: str | None = None) -> None:
         if self.attr is None:
-            if self.trans:
+            if self.trans and self.node.text is not None:
                 self.node.text = self.replace(self.node.text, value, addon=addon)
             else:
                 self.node.text = value
@@ -289,6 +599,19 @@ class TranslateBase:
 class Translate(TranslateBase):
     """Whole translate process handler."""
 
+    #: Default upper bound for newly assigned IDs. Kodi reserves 30000-33999
+    #: for plugins/skins/scripts/common. Override via --id-max / "id-max".
+    ID_MAX_DEFAULT: int = 33999
+
+    #: Default raw-Python tags (cała text+tail to Python source).
+    DEFAULT_PYTHON_TAGS: tuple[str, ...] = ('ff:vars',)
+    #: Default raw-Python attributes (per-tag); each entry is (tag_or_None, attr).
+    DEFAULT_PYTHON_ATTRS: tuple[tuple[str | None, str], ...] = (
+        ('ff:define', 'args'),
+        ('ff:include', 'ff:args'),
+        ('ff:set', 'value'),
+    )
+
     DEF_PLURAL_FORMS = 'nplurals=2; plural=(n != 1);'
     # see
     # - https://doc.qt.io/archives/qq/qq19-plurals.html
@@ -303,9 +626,24 @@ class Translate(TranslateBase):
     _RE_ADDON = re.compile(r'\$ADDON\[(?:(?P<addon>[A-Za-z]\w*(?:\.\w+)+)\s+)?'
                            r'(?:\s*(?P<id>\d+)\s*|(?P<text>(?:\[[^]*]|"[^"]*"|[^]])*))\]')
     #                        r'(?:\s*(?P<id>\d+)\s*|(?P<text>(?:\[[^]*]|"[^"]*"|(?<!\$ADDON)[^]])*))\]')
-    _RE_SKIP_LABEL = re.compile(r'\$(?:LOCALIZE|ADDON)\[')
-
     _RE_XML_DECL: re.Pattern = re.compile(r'''\s*<\?(?:"(?:\.|[^"])*"|'(?:\.|[^'])*'|[^>])*>\s*''')
+    # bytes-version of _RE_XML_DECL — used before we know the file's encoding
+    _RE_XML_DECL_BYTES: re.Pattern = re.compile(rb'''\s*<\?(?:"(?:\.|[^"])*"|'(?:\.|[^'])*'|[^>])*>\s*''')
+    _RE_XML_DECL_ENCODING: re.Pattern = re.compile(rb'''encoding\s*=\s*['"]([^'"]+)['"]''')
+
+    # `$LOCALIZE[...]` inside Python string literal — used by _replace_py.
+    _RE_PY_LOCALIZE = re.compile(r'\$LOCALIZE\[(?:(?P<id>\d+)|(?P<text>(?:[\\%].|\[(?:[\\%].|[^]])*\]|[^]])+))\]')
+    _RE_PY_LOCALIZE_ESC = re.compile(r'[\\%](.)')
+
+    # Kodi label format tags (CGUITextLayout::ParseText). Stripped before the
+    # `_is_translatable` letter-test, so pure-formatting strings don't qualify.
+    _RE_KODI_FORMAT = re.compile(
+        r'\[/?(?:B|I|LIGHT|UPPERCASE|LOWERCASE|CAPITALIZE|TABS|COLOR|CHARSET)'
+        r'(?:[ =][^\]]*)?\]'
+        r'|\[CR\]'
+    )
+    # Generic Kodi runtime placeholder ($INFO[…], $VAR[…], …).
+    _RE_KODI_PLACEHOLDER_OPEN = re.compile(r'\$\w+\[')
 
     def __init__(self, *,
                  dry_run: bool = False,
@@ -313,16 +651,25 @@ class Translate(TranslateBase):
                  dump_translations: str | None = None,
                  stats: bool = True,
                  id_from: int = 30100,
+                 id_min: int | None = None,
+                 id_max: int | None = None,
                  id_policy: Literal['min', 'max'] = 'max',
                  handle_getLocalizedString: bool = True,
-                 addon_id: Optional[str] = None,
+                 addon_id: str | None = None,
                  mark_translated: bool = False,
                  obsolete: ObsoleteAction = ObsoleteAction.KEEP,
-                 backup_pattern: Optional[str] = '{}~',
+                 backup_pattern: str | None = '{}~',
                  po_wrap_width: int = 999999,
                  encoding: str = 'utf8',
-                 reserved_ids: Optional[ranges] = None,
+                 reserved_ids: ranges | None = None,
                  multi_line_msg: bool = False,
+                 git_only: bool = False,
+                 extra_translate_attrs: list[str] | None = None,
+                 extra_translate_tags: list[str] | None = None,
+                 python_tags: list[str] | None = None,
+                 python_attrs: list | None = None,
+                 cleanup_translate_comments: bool = False,
+                 rename: bool = True,
                  ) -> None:
         self.xml_inputs: list[XmlInput] = []
         self.py_inputs: list[PyInput] = []
@@ -336,6 +683,10 @@ class Translate(TranslateBase):
         self.handle_getLocalizedString = handle_getLocalizedString
         #: Lowest avaliable ID.
         self.id_from = id_from
+        #: Lower bound for "ID below threshold" warning. None → fall back to id_from.
+        self.id_min: int | None = id_min
+        #: Upper bound for newly assigned IDs (used by nextid()).
+        self.id_max: int = id_max if id_max is not None else self.ID_MAX_DEFAULT
         #: New ID policy:  min – lower avaliavle, max – above last used.
         self.id_policy: Literal['min', 'max'] = id_policy
         #: Addon ID for $ADDON[] XML label.
@@ -354,8 +705,52 @@ class Translate(TranslateBase):
         self.reserved_ids: ranges = reserved_ids or ranges()
         #: Moved IDs  - existings IDs if they were in reserved_ids.
         self._moved_ids: set[int] = set()
+        #: IDs that have a non-empty msgstr in any loaded PO. Used by the
+        #: rename heuristic to refuse silent renames of translated entries.
+        self._translated_ids: set[int] = set()
+        #: Cache of compiled `_replace_py` regexes keyed by the tuple of
+        #: GLS function patterns active for the scan (recompiling per file
+        #: dominated profile traces).
+        self._replace_py_re_cache: dict[tuple[str, ...], re.Pattern[str]] = {}
+        #: Map id → new_text for labels renamed in `generate()`. Used by
+        #: `translate()` to update the matching `msgid` in each PO.
+        self._renamed_ids: dict[int, str] = {}
         #: True if po msg are splited into mulitple lines.
         self.multi_line_msg: bool = multi_line_msg
+        #: Cache of loaded addon configs keyed by resolved config-file path.
+        self._config_cache: dict[Path, AddonConf | None] = {}
+        #: Scan only files tracked by git (in the index).
+        self.git_only: bool = git_only
+        #: Cache of git-tracked file sets, keyed by repo root.
+        self._git_tracked_by_repo: dict[Path, set[Path]] = {}
+        #: Extra XML attributes to scan for translation (added to defaults).
+        self.extra_translate_attrs: list[str] = list(extra_translate_attrs or ())
+        #: Extra XML element tags to scan as text-content translations.
+        self.extra_translate_tags: list[str] = list(extra_translate_tags or ())
+        #: Tags whose text/tail is raw Python (default + config).
+        self.python_tags: set[str] = set(self.DEFAULT_PYTHON_TAGS) | set(python_tags or ())
+        #: Per-tag raw-Python attrs as set of (tag_or_None, attr_name).
+        self.python_attrs: set[tuple[str | None, str]] = set(self.DEFAULT_PYTHON_ATTRS)
+        for entry in python_attrs or ():
+            if isinstance(entry, str):
+                self.python_attrs.add((None, entry))
+            elif isinstance(entry, dict):
+                name = entry.get('name')
+                tags = entry.get('tags')
+                if not name:
+                    continue
+                if not tags:
+                    self.python_attrs.add((None, name))
+                else:
+                    for tag in tags:
+                        self.python_attrs.add((tag, name))
+        #: One-time cleanup: drop `:translate=false:` comments the automat would
+        #: skip on its own.
+        self.cleanup_translate_comments: bool = cleanup_translate_comments
+        #: Rename existing IDs in place when a text edit would otherwise
+        #: produce an obsolete entry that has no translation anywhere
+        #: (or `--obsolete=remove` is set, so the old entry would be dropped).
+        self.rename: bool = rename
 
     def _add_label(self, label: Label, *, used=True):
         """Add label to existing data (by ID and by TEXT)."""
@@ -364,16 +759,23 @@ class Translate(TranslateBase):
         if label is None:
             return
         if label.id is not None:
-            if label.id < 30000:  # TODO: make option
-                logger.warning(f'Label #{label.id} < #30000')
+            threshold = self.id_min if self.id_min is not None else self.id_from
+            if label.id < threshold:
+                logger.warning(f'Label #{label.id} < #{threshold}')
             L1 = self._by_id.setdefault(label.id, label)
-            L1.nodes |= label.nodes  # XXX XXX XXX
-        if label.text:
+            # NOTE: don't merge label into L1 here — wait until conflict
+            # resolution, otherwise a mismatched text would still pollute
+            # L1's node set with nodes that belong to a different label.
+        if label.text is not None:
+            # explicit empty (`L('')`) is a declaration too, distinct from
+            # a numeric reference where text is unknown — keep it.
             lst = self._by_text.setdefault(label.text, LabelList())
             L2 = lst.add(label)
         if L1 is not None and L2 is not None and L1 is not L2:
             if L2.id is None:
-                label = Label(L1.id or L2.id, L1.text or L2.text, L1.nodes | L2.nodes, L1.trans + L2.trans)
+                label = Label(L1.id or L2.id, L1.text or L2.text,
+                              L1.nodes | L2.nodes | label.nodes,
+                              L1.trans + L2.trans)
                 assert label.id is not None
                 self._by_id[label.id] = label
                 lst[lst.index(L2)] = label
@@ -398,6 +800,9 @@ class Translate(TranslateBase):
                 assert label.id is not None
                 self._by_id[label.id] = label = L2
         elif L1 is not None:
+            if L1 is not label:
+                L1.nodes |= label.nodes
+                L1.trans.extend(label.trans)
             label = L1
         elif L2 is not None:
             label = L2
@@ -405,33 +810,328 @@ class Translate(TranslateBase):
             self._ids.add(label.id)
         return label
 
-    def _scan_xml(self, tree: ElementTree, xtype: XmlType = XmlType.Auto):
-        """Scan single XML."""
-        def add(text, node):
-            if text is None:
-                node_error(node, 'Empty node/attr (string expected)')
-                return
-            if text.isdigit():
-                label = Label(int(text))
+    @staticmethod
+    def _find_matching_bracket(text: str, open_pos: int) -> int | None:
+        """Return index of `]` matching the `[` at `open_pos`, or None if unmatched."""
+        depth = 1
+        i = open_pos + 1
+        while i < len(text):
+            c = text[i]
+            if c == '[':
+                depth += 1
+            elif c == ']':
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return None
+
+    #: Kodi placeholders whose args may carry translatable text (prefix/suffix).
+    _KODI_PLACEHOLDER_TEXT_ARGS: frozenset[str] = frozenset({'INFO', 'ESCINFO'})
+
+    @staticmethod
+    def _split_placeholder_args(args: str) -> list[str]:
+        """Split `args` on top-level commas (respecting `[…]` nesting)."""
+        parts = []
+        depth = 0
+        start = 0
+        for i, c in enumerate(args):
+            if c == '[':
+                depth += 1
+            elif c == ']':
+                depth -= 1
+            elif c == ',' and depth == 0:
+                parts.append(args[start:i])
+                start = i + 1
+        parts.append(args[start:])
+        return parts
+
+    @classmethod
+    def _strip_placeholders(cls, text: str) -> str:
+        """Strip Kodi runtime placeholders, keeping translatable args (per-command).
+
+        - `$INFO[main, prefix, suffix]`, `$ESCINFO[…]` → drop `main` (dynamic
+          source), keep prefix/suffix as candidates for the letter-test.
+        - `$LOCALIZE[…]`, `$ADDON[…]`, `$NUMBER[…]`, `$LABEL[…]`, `$VAR[…]`,
+          `$EXP[…]`, `$PARAM[…]`, unknown `$XXX[…]` → drop entirely.
+        """
+        while m := cls._RE_KODI_PLACEHOLDER_OPEN.search(text):
+            end = cls._find_matching_bracket(text, m.end() - 1)
+            if end is None:
+                # malformed — give up to avoid infinite loop
+                break
+            cmd = text[m.start() + 1:m.end() - 1]
+            args = text[m.end():end]
+            if cmd in cls._KODI_PLACEHOLDER_TEXT_ARGS:
+                kept = ' '.join(cls._split_placeholder_args(args)[1:])
             else:
+                kept = ''
+            text = text[:m.start()] + kept + text[end + 1:]
+        return text
+
+    def _is_redundant_skip_comment(self, elem) -> bool:
+        """True if a `:translate=false:` on `elem` is redundant (automat would
+        skip text and all attrs anyway). Used by `--cleanup-translate-comments`."""
+        text_val = elem.text or ''
+        if text_val and not text_val.isdigit() and self._is_translatable(text_val):
+            return False
+        for attr_val in elem.attrib.values():
+            if attr_val and not attr_val.isdigit() and self._is_translatable(attr_val):
+                return False
+        return True
+
+    def _cleanup_translate_comments_in(self, tree) -> int:
+        """Remove `:translate=false:` comments that the automat would deliver
+        anyway. Only acts on solo `:translate=false:` (no other directive in
+        same comment). Returns count of removed comments."""
+        to_remove = []
+        for elem in tree.iter():
+            if isinstance(elem, etree._Comment):
+                continue
+            prev = elem.getprevious()
+            while isinstance(prev, etree._Comment):
+                general, per_target = _parse_translate_comment(prev.text or '')
+                if general is False and not per_target and self._is_redundant_skip_comment(elem):
+                    to_remove.append(prev)
+                prev = prev.getprevious()
+        for c in to_remove:
+            parent = c.getparent()
+            if parent is not None:
+                parent.remove(c)
+        return len(to_remove)
+
+    @staticmethod
+    def _ensure_L_comment(node_value, label) -> None:
+        """Ensure an `L(...)` XML comment for `label` precedes the element.
+
+        Three cases for the existing comment matching this target:
+          - identical (id and text) → skip (idempotent),
+          - stale (id or text differs) → update in place (preserves position
+            and tail), so the next run sees the up-to-date marker,
+          - missing → insert a new comment, on its own line, using the
+            indent that precedes the element.
+
+        Skips labels with no text (numeric refs to unknown ids — nothing to
+        document).
+        """
+        if not label.text:
+            return
+        target = _node_value_target(node_value)
+        elem = node_value.node
+        body = _format_L_comment(target, label.id, label.text)
+        # Walk back through preceding comments looking for one targeting us.
+        prev = elem.getprevious()
+        while isinstance(prev, etree._Comment):
+            parsed = _parse_L_comment(prev.text or '')
+            if parsed is not None and parsed[0] == target:
+                if (parsed[1], parsed[2]) == (label.id, label.text):
+                    return  # identical
+                prev.text = body  # stale → update in place
+                return
+            prev = prev.getprevious()
+        # Missing — insert new on its own line.
+        prev = elem.getprevious()
+        parent = elem.getparent()
+        src = prev.tail if prev is not None else (parent.text if parent is not None else '')
+        m = re.search(r'(\n[ \t]*)$', src or '')
+        sep = m.group(1) if m else ''
+        comment = etree.Comment(body)
+        comment.tail = sep
+        elem.addprevious(comment)
+
+    @staticmethod
+    def _tag_local(elem) -> str:
+        """Return tag in `prefix:local` form (Clark `{ns}local` → `prefix:local`).
+
+        Assumes `xmlns:prefix="ns"` on the element/ancestor — uses `nsmap` to
+        find the prefix bound to the namespace URI.
+        """
+        tag = elem.tag
+        if not isinstance(tag, str) or not tag.startswith('{'):
+            return tag if isinstance(tag, str) else ''
+        ns_end = tag.index('}')
+        uri = tag[1:ns_end]
+        local = tag[ns_end + 1:]
+        for prefix, p_uri in (elem.nsmap or {}).items():
+            if p_uri == uri and prefix:
+                return f'{prefix}:{local}'
+        return local
+
+    @staticmethod
+    def _attr_local(elem, attr: str) -> str:
+        """Map a Clark-notation attribute name to `prefix:local`."""
+        if not attr.startswith('{'):
+            return attr
+        ns_end = attr.index('}')
+        uri = attr[1:ns_end]
+        local = attr[ns_end + 1:]
+        for prefix, p_uri in (elem.nsmap or {}).items():
+            if p_uri == uri and prefix:
+                return f'{prefix}:{local}'
+        return local
+
+    def _python_apply_value(self, elem, attr_or_tail, value: str, mode: str, path) -> None:
+        """Run python scan on `value` in `mode`. attr_or_tail: None=text, str=attr, 'TAIL'=tail."""
+        if mode == 'false' or not value:
+            return
+        is_tail = attr_or_tail == 'TAIL'
+        attr = None if is_tail or attr_or_tail is None else attr_or_tail
+        nv = NodeValue(elem, attr=attr, tail=is_tail, python=True)
+        file = XmlValueInput(nv)
+        if mode == 'true':
+            self._replace_py(value, file=file, node=nv, path=path)
+        elif mode == 'fstring':
+            for start, _end, code in _extract_fstring_blocks(value):
+                self._replace_py(code, file=file, node=nv, path=path, data_offset=start)
+
+    def _python_scan_pass(self, root, *, is_skin: bool, path) -> None:
+        """Step 1 of XML scan: per `:python` mode, run `_replace_py` on values.
+
+        Iterates all elements; each text/attr/tail gets a mode resolution
+        (granular override → general override → whitelist → context default)
+        and is scanned accordingly. Modifies XML in place via Trans/replace.
+        """
+        def visit(elem):
+            if isinstance(elem.tag, str):
+                # text
+                if elem.text:
+                    mode = self._python_mode(elem, '', is_skin=is_skin)
+                    self._python_apply_value(elem, None, elem.text, mode, path)
+                # attrs
+                for attr_name, attr_val in elem.attrib.items():
+                    if not attr_val:
+                        continue
+                    local = self._attr_local(elem, attr_name)
+                    mode = self._python_mode(elem, local, is_skin=is_skin)
+                    self._python_apply_value(elem, local, attr_val, mode, path)
+                for child in elem:
+                    visit(child)
+                    if child.tail:
+                        if isinstance(child.tag, str):
+                            mode = self._python_mode(child, '', is_skin=is_skin)
+                            self._python_apply_value(child, 'TAIL', child.tail, mode, path)
+        visit(root)
+
+    def _python_mode(self, elem, target: str | None, *, is_skin: bool) -> str:
+        """Resolve effective `:python` mode for given (elem, target).
+
+        Returns one of: 'true' (raw), 'false' (skip), 'fstring'.
+        Hierarchy: granular override → general override → whitelist → context default.
+        """
+        ov = _python_override(elem, target)
+        if ov is not None:
+            return ov
+        tag = self._tag_local(elem)
+        if target is None or target == '':
+            # text content / tail
+            if tag in self.python_tags:
+                return 'true'
+        else:
+            # attribute (target may be 'attr' or 'attr#N')
+            attr_only = target.split('#', 1)[0] if '#' in target else target
+            if (tag, attr_only) in self.python_attrs or (None, attr_only) in self.python_attrs:
+                return 'true'
+        return 'fstring' if is_skin else 'false'
+
+    @classmethod
+    def _is_translatable(cls, text: str) -> bool:
+        """Return True if `text` contains a phrase worth translating.
+
+        Heuristic: strip Kodi format tags ([B], [COLOR …], [CR], …) and runtime
+        placeholders ($INFO[…], $VAR[…], …), then look for at least one Unicode
+        letter. Pure punctuation, digits and whitespace don't qualify.
+        Adjust this heuristic in one place if it proves too permissive/strict.
+        """
+        text = cls._RE_KODI_FORMAT.sub('', text)
+        text = cls._strip_placeholders(text)
+        return any(c.isalpha() for c in text)
+
+    def _scan_xml(self, tree: ElementTree, xtype: XmlType = XmlType.Auto, *,
+                  path: Path | None = None):
+        """Scan single XML."""
+        def add(text: str, node: NodeValue) -> None:
+            if not text:
+                # Missing or empty XML attr/text — there's no XML idiom for
+                # an "explicit empty" declaration (unlike Python's L('')),
+                # so skip rather than invent a label.
+                if text is None:
+                    node_error(node, 'Empty node/attr (string expected)')
+                return
+            target = _node_value_target(node)
+            marker = _find_L_marker(node.node, target)
+            is_numeric = text.isdigit()
+            if marker is None:
+                # No L() comment — current default behavior.
+                if is_numeric:
+                    nid = int(text)
+                    logger.debug(f'  numeric XML ref #{nid}')
+                    self._ids.add(nid)
+                    # Migration: if this ID is known from PO with a text,
+                    # attach the node so write-side can inject L() comment.
+                    existing = self._by_id.get(nid)
+                    if existing is not None and existing.text:
+                        existing.nodes.add(node)
+                    return
                 label = Label(None, text)
-            if label is not None:
                 label.nodes.add(node)
                 self._add_label(label)
+                return
+            # L() comment present — comment is authoritative (matrix G).
+            cm_id, cm_text = marker
+            if is_numeric:
+                xml_id = int(text)
+                if xml_id != cm_id:
+                    logger.warning(
+                        f'L() comment ID mismatch on {target!r}: '
+                        f'XML=#{xml_id}, comment=#{cm_id} — using comment.'
+                    )
+                label = Label(cm_id, cm_text)
+            else:
+                if text == cm_text:
+                    logger.warning(
+                        f'L() comment duplicates XML text on {target!r} — '
+                        f'replacing XML with #{cm_id}.'
+                    )
+                    label = Label(cm_id, cm_text)
+                else:
+                    logger.error(
+                        f'L() comment text mismatch on {target!r}: '
+                        f'XML={text!r}, comment={cm_text!r} — '
+                        f'refusing to discard either; pick one source of truth.'
+                    )
+                    sys.exit(1)
+            label.nodes.add(node)
+            self._add_label(label)
 
         def is_enabled(node: Element) -> bool:
-            # if node.attrib.get('translate') == 'false':
-            #     return False
-            prev = node.getprevious()
-            if not isinstance(prev, etree._Comment):
-                return True
-            opt = {k.strip(): v.strip()
-                   for op in rx_opt_split.split(prev.text) if op
-                   for k, sep, v in (op.partition('='),) if sep}
-            return opt.get('translate') != 'false'
+            """Element-level enable check: True unless `:translate=false:` was set."""
+            general, _ = _get_translate_overrides(node)
+            return general is not False
 
-        rx_opt_split = re.compile(r'\s*:\s*')
-        # rx_opt_split = re.compile(r'\s*:\s*')
+        def should_translate(node: Element, target: str | None, text: str | None) -> bool:
+            """Decide whether to translate `text` for given target on `node`.
+
+            Order of precedence:
+              1. comment override (granular wins over general).
+              2. if `:python=fstring:` is active for this target AND `text`
+                 contains any `{…}` block — return False (template runtime
+                 will compose; cała wartość nie idzie do PO).
+              3. automat (`_is_translatable`) — letter-test after stripping
+                 format tags & runtime placeholders.
+            Numeric refs are handled by `add()` separately and don't reach here.
+            """
+            override = _translation_enabled(node, target)
+            if override is False:
+                return False
+            if override is True:
+                return True
+            value = text or ''
+            py_mode = self._python_mode(node, target, is_skin=(xtype == XmlType.Window))
+            if py_mode == 'fstring' and _extract_fstring_blocks(value):
+                return False
+            return self._is_translatable(value)
+
+        node: Element
         root = tree.getroot()
         if xtype == XmlType.Auto:
             if root.tag == 'settings':
@@ -439,40 +1139,80 @@ class Translate(TranslateBase):
             elif root.tag == 'window':
                 xtype = XmlType.Window
 
-        # -- settings.xml
+        def gate(node: Element, target: str | None, text: str | None) -> bool:
+            """Pre-`add()` filter: numeric refs always pass (so `_ids` learns
+            them); empty texts always pass (handled by `add()`); text values
+            go through override + automat."""
+            if not text or text.isdigit():
+                return True
+            return should_translate(node, target, text)
+
+        # -- step 1: python scan (raw / fstring) — modifies values in place.
+        is_skin = (xtype == XmlType.Window)
+        self._python_scan_pass(root, is_skin=is_skin, path=path)
+
+        # -- step 2: translate scan (settings / window).
+        text_tags = ('heading', *self.extra_translate_tags)
+        attr_names = ('label', 'help', *self.extra_translate_attrs)
         if xtype == XmlType.Settings:
-            for node in root.iterfind('.//heading'):
-                logger.debug(f'  found set.XML heading, value {node.text!r}')
-                add(node.text, NodeValue(node, None))
-            for attr in ('label', 'help'):
+            for tag in text_tags:
+                for node in root.iterfind(f'.//{tag}'):
+                    logger.debug(f'  found set.XML <{tag}>, value {node.text!r}')
+                    if gate(node, '', node.text):
+                        add(node.text, NodeValue(node, None))
+            for attr in attr_names:
                 for node in root.iterfind(f'.//*[@{attr}]'):
                     text = node.get(attr)
                     if text:
                         logger.debug(f'  found set.XML node {node.tag} attr {attr}, value {text!r}')
-                    add(text, NodeValue(node, attr))
+                    if gate(node, attr, text):
+                        add(text, NodeValue(node, attr))
             for node in root.iterfind('.//*[@lvalues]'):
                 for i, text in enumerate(node.get('lvalues').split('|')):
                     logger.debug(f'  found set.XML lvalue {text!r}')
-                    add(text, NodeValue(node, 'lvalues', index=i))
+                    if gate(node, f'lvalues#{i}', text):
+                        add(text, NodeValue(node, 'lvalues', index=i))
         # -- skin/window.xml
         elif xtype == XmlType.Window:
             # <label>TEXT</label>, w/o `$LOCALIZE[`
             if self.addon_id:
-                for node in root.xpath('.//label|.//hinttext'):
-                    if is_enabled(node) and not self._RE_SKIP_LABEL.search(node.text):
-                        logger.debug(f'  found win.XML label, value {node.text!r}')
-                        add(node.text, NodeValue(node, None, trans=(Trans(None, start=0, end=len(node.text),
-                                                                          fmt='$ADDON[{addon} {id}]'),)))
-            # <any>$LOCALIZE[...]</any>
-            if False:  # skins, not supported yet. skipping..
-                for node in root.xpath('.//*[text()[contains(.,"$LOCALIZE[")]]'):
-                    if is_enabled(node):
-                        text = node.text
-                        mm = list(self._RE_LOCALIZE.finditer(text))
-                        for m in reversed(mm):  # from the end to avoid span move on text replace
-                            logger.debug(f'  found win.XML $LOCALIZE[], value {m[0]!r}')
-                            start, end = m.span('id') if m['id'] else m.span('text')
-                            add(text[start:end], NodeValue(node, None, trans=(Trans(None, start, end, fmt=None),)))
+                skin_tags = ('label', 'hinttext', *self.extra_translate_tags)
+                xpath_skin = '|'.join(f'.//{t}' for t in skin_tags)
+                for node in root.xpath(xpath_skin):
+                    text = node.text
+                    if not text:
+                        continue
+                    if not gate(node, '', text):
+                        continue
+                    logger.debug(f'  found win.XML <{node.tag}>, value {text!r}')
+                    add(text, NodeValue(node, None, trans=(Trans(None, start=0, end=len(text),
+                                                                 fmt='$ADDON[{addon} {id}]'),)))
+                # extra attributes (e.g. tooltip)
+                for attr in self.extra_translate_attrs:
+                    for node in root.iterfind(f'.//*[@{attr}]'):
+                        text = node.get(attr)
+                        if not text:
+                            continue
+                        if not gate(node, attr, text):
+                            continue
+                        logger.debug(f'  found win.XML node {node.tag} attr {attr}, value {text!r}')
+                        add(text, NodeValue(node, attr, trans=(Trans(None, start=0, end=len(text),
+                                                                     fmt='$ADDON[{addon} {id}]'),)))
+            # $LOCALIZE[N] — runtime substitution to Kodi string by ID. Mark the
+            # ID as used so the generator doesn't reassign it to a new label.
+            for node in root.xpath('.//*[text()[contains(.,"$LOCALIZE[")]]'):
+                for m in self._RE_LOCALIZE.finditer(node.text or ''):
+                    if m['id']:
+                        nid = int(m['id'])
+                        logger.debug(f'  win.XML $LOCALIZE[#{nid}] reference')
+                        self._ids.add(nid)
+            for node in root.xpath('.//@*[contains(.,"$LOCALIZE[")]/..'):
+                for attr_name, attr_val in node.attrib.items():
+                    for m in self._RE_LOCALIZE.finditer(attr_val):
+                        if m['id']:
+                            nid = int(m['id'])
+                            logger.debug(f'  win.XML attr {attr_name} $LOCALIZE[#{nid}] reference')
+                            self._ids.add(nid)
 
             # $ADDON[ID TEXT]
             for node in root.xpath('.//*[text()[contains(.,"$ADDON[")]]'):
@@ -490,22 +1230,58 @@ class Translate(TranslateBase):
                         trans.append(Trans(None, start, start, fmt=f'{self.addon_id} '))
                     add(text[start:end], NodeValue(node, None, trans=tuple(trans)))
 
-    def load_xml(self, path: Union[str, Path], base: Optional[Union[str, Path]] = None):
+    def load_xml(self, path: str | Path, base: str | Path | None = None):
         """Load XML and keep data."""
         path = Path(path)
         if base is not None:
             base = Path(base)
-        content = path.read_text(encoding=self.encoding)
-        tree = etree.parse(str(path))
+        content_bytes = path.read_bytes()
+        # Detect encoding from XML declaration; fall back to self.encoding
+        # (matters on Windows where the system default isn't UTF-8 and the
+        # file lacks a declaration).
+        decl_bytes_match = self._RE_XML_DECL_BYTES.match(content_bytes)
+        encoding = self.encoding
+        if decl_bytes_match:
+            enc_match = self._RE_XML_DECL_ENCODING.search(decl_bytes_match[0])
+            if enc_match:
+                encoding = enc_match[1].decode('ascii')
+        content = content_bytes.decode(encoding)
+        tree = etree.parse(BytesIO(content_bytes))
         m: re.Match = self._RE_XML_DECL.match(content)
         decl: str = m and m[0]
-        self.xml_inputs.append(XmlInput(path, tree, base, declaration=decl))
-        self._scan_xml(tree)
+        self.xml_inputs.append(XmlInput(path, tree, base, declaration=decl, encoding=encoding))
+        self._scan_xml(tree, path=path)
         return tree
 
-    def load_py(self, path: Union[str, Path], base: Optional[Union[str, Path]] = None, *,
-                l8funcs: Optional[list[L8Func]] = None) -> None:
+    def load_py(self, path: str | Path, base: str | Path | None = None, *,
+                l8funcs: list[L8Func] | None = None) -> None:
         """Load strings from Python source and keep data."""
+        path = Path(path)
+        if base is not None:
+            base = Path(base)
+        with open(path, encoding=self.encoding, newline='') as f:
+            data = f.read()
+        file = PyInput(path, data, base)
+        self.py_inputs.append(file)
+        self._replace_py(data, file=file, l8funcs=l8funcs, path=path)
+
+    def _replace_py(self,
+                    data: str,
+                    *,
+                    file: PyInput | XmlValueInput | None,
+                    l8funcs: list[L8Func] | None = None,
+                    node: NodeValue | None = None,
+                    path: Path | None = None,
+                    data_offset: int = 0,
+                    ) -> None:
+        """Scan single Python source data.
+
+        `data_offset` shifts every produced `Trans.start/end` by this amount —
+        used when `data` is a fragment of a larger value (e.g. a `{…}` block
+        inside an XML attribute under f-string mode), so replacements land on
+        the correct positions in the surrounding value.
+        """
+
         def rstr(name='str'):
             pat = '|'.join((
                 fr'"""(?P<{name}1>(?:\\.|[^"]|"(?!""))*)"""',   # """..."""
@@ -515,22 +1291,23 @@ class Translate(TranslateBase):
             ))
             return f'(?:{pat})'
 
-        def rval(r, name='str'):
-            for i in range(4):
-                if (s := r[f'{name}{i+1}']) is not None:
+        # Pre-computed group name tuples — avoids 4× f-string formatting
+        # per call in the hot finditer loop.
+        _str_grp = ('str1', 'str2', 'str3', 'str4')
+        _msg_grp = ('msg1', 'msg2', 'msg3', 'msg4')
+        _gls_grp = ('gls_text1', 'gls_text2', 'gls_text3', 'gls_text4')
+
+        def rval(r, groups=_str_grp):
+            for g in groups:
+                s = r[g]
+                if s is not None:
                     return s
 
-        def rstart(r, name='str'):
-            for i in range(4):
-                if (s := r.start(f'{name}{i+1}')) != -1:
+        def rstart(r, groups=_str_grp):
+            for g in groups:
+                s = r.start(g)
+                if s != -1:
                     return s
-
-        if base is not None:
-            base = Path(base)
-        with open(path, encoding=self.encoding, newline='') as f:
-            data = f.read()
-        file = PyInput(path, data, base)
-        self.py_inputs.append(file)
 
         _R_CM = r'#[^\S\r\n]*(?P<comment>[^\r\n]+)'
         _R_LL = fr'\b(?P<label>LL?)\s*(?P<label_bracket>\()\s*(?:(?P<mid>\d+)\s*,\s*)?{rstr("msg")}\s*(?:,.*?)?\)'
@@ -538,39 +1315,42 @@ class Translate(TranslateBase):
         l8funcs = list(l8funcs or ())
         if self.handle_getLocalizedString:
             l8funcs.append(L8Func('getLocalizedString'))
-        gls_funcs = [f for f in l8funcs if f.type == FuncType.GetLocalizedString and f.is_allowed(path)]
+        gls_funcs = [f for f in l8funcs
+                     if f.type == FuncType.GetLocalizedString and (path is None or f.is_allowed(path))]
         if gls_funcs:
             ff = '|'.join(fr'(?:{f})' for f in gls_funcs)
             pat += fr'|\b(?P<gls_func>{ff})\s*\(\s*(?P<gls>(?:(?P<gls_id>\d+)|{rstr("gls_text")}))\s*[),]'
-        R = re.compile(pat)
-        RS = re.compile(r'\$LOCALIZE\[(?:(?P<id>\d+)|(?P<text>(?:[\\%].|\[(?:[\\%].|[^]])*\]|[^]])+))\]')
-        RS_ESC = re.compile(r'[\\%](.)')
+        cache_key = tuple(f.pattern for f in gls_funcs)
+        R = self._replace_py_re_cache.get(cache_key)
+        if R is None:
+            R = re.compile(pat)
+            self._replace_py_re_cache[cache_key] = R
         for r in R.finditer(data):
             if r['comment'] is not None:  # skip comments
                 continue
-            label: Optional[Label] = None
+            label: Label | None = None
             tr = None
-            s, msg = rval(r), rval(r, 'msg')
+            s, msg = rval(r), rval(r, _msg_grp)
             sstart = rstart(r)
             # L()
             if msg is not None:
                 mid = r['mid']
                 if mid is None:
                     offset = r.end('label_bracket')
-                    tr = Trans(file, start=offset, end=offset, fmt='{label.id}, ')
+                    tr = Trans(file, start=data_offset + offset, end=data_offset + offset, fmt='{label.id}, ')
                 else:
                     mid = int(mid)
-                    tr = Trans(file, start=r.start('mid'), end=r.end('mid'))
+                    tr = Trans(file, start=data_offset + r.start('mid'), end=data_offset + r.end('mid'))
                 label = Label(mid, unescape(msg))
             # " $LOCALIZE[] "
             elif s is not None:
-                for r in RS.finditer(s):
+                for r in self._RE_PY_LOCALIZE.finditer(s):
                     mid = r['id']
                     if mid is not None:
                         mid = int(mid)
                     if r['text'] is not None:
-                        tr = Trans(file, start=sstart + r.start('text'), end=sstart + r.end('text'))
-                        text = RS_ESC.sub(r'\1', r['text'])
+                        tr = Trans(file, start=data_offset + sstart + r.start('text'), end=data_offset + sstart + r.end('text'))
+                        text = self._RE_PY_LOCALIZE_ESC.sub(r'\1', r['text'])
                         label = Label(mid, unescape(text))
                     elif mid is not None:
                         self._ids.add(mid)  # mark as used
@@ -578,19 +1358,38 @@ class Translate(TranslateBase):
             elif r['gls'] is not None:
                 mid = r['gls_id']
                 func = r['gls_func']
-                text = rval(r, 'gls_text')
+                text = rval(r, _gls_grp)
                 logger.debug(f'  found func {func!r}, id {mid}, text {text!r}')
-                if mid is None:
-                    tr = Trans(file, start=r.start('gls'), end=r.end('gls'))
-                else:
-                    mid = int(mid)
-                label = Label(mid, unescape(text))
+                if mid is not None:
+                    # Numeric reference (e.g. getLocalizedString(123)) — only
+                    # mark the ID as used; declaration lives elsewhere.
+                    logger.debug(f'  numeric PY ref #{mid}')
+                    self._ids.add(int(mid))
+                    continue
+                tr = Trans(file, start=data_offset + r.start('gls'), end=data_offset + r.end('gls'))
+                label = Label(None, unescape(text))
             if label is not None:
                 if tr is not None:
                     label.trans.append(tr)
+                if node is not None:
+                    label.nodes.add(node)
                 self._add_label(label)
 
-    def _load_input(self, path: Path, *, l8funcs: Optional[list[L8Func]] = None) -> None:
+    def _is_git_tracked(self, path: Path) -> bool:
+        """When --git-only is enabled, return True iff `path` is in the git index.
+        Hard-exits if the path is not in any git repository (--git-only contract)."""
+        if not self.git_only:
+            return True
+        abspath = path.resolve()
+        root = _git_root(abspath)
+        if root is None:
+            logger.error(f'{abspath} is not in a git repository (--git-only requires git tracking)')
+            sys.exit(1)
+        if root not in self._git_tracked_by_repo:
+            self._git_tracked_by_repo[root] = _git_tracked_files(root)
+        return abspath in self._git_tracked_by_repo[root]
+
+    def _load_input(self, path: Path, *, l8funcs: list[L8Func] | None = None) -> None:
         """Load single file (XML / py) and keep data."""
         logger.info(f'Loading source {path}')
         if path.suffix == '.py':
@@ -598,30 +1397,39 @@ class Translate(TranslateBase):
         return self.load_xml(path)
 
     def load_input(self,
-                   path: Union[str, Path],
+                   path: str | Path,
                    *,
                    skip: set[Path] = set(),
-                   l8funcs: Optional[list[L8Func]] = None) -> None:
+                   l8funcs: list[L8Func] | None = None) -> None:
         """Load input file / py-dir (XML / py) and keep data."""
         res = None
         path = Path(path)
         if not path.exists():
             logger.warning('Path does not exist: {!r}, skipping.'.format(str(path)))
         elif path.is_dir():
+            # `path.glob` returns absolute paths starting with `path`, and
+            # `skip` was resolved to absolute paths in `load_addon` — so a
+            # lexical `is_relative_to` is enough; avoid `resolve()` per file
+            # (each `resolve()` does lstat per path component, and this loop
+            # easily sees thousands of files).
             for p in chain(path.glob('**/*.xml'), path.glob('**/*.py')):
-                if any(p.resolve().is_relative_to(s) for s in skip):
+                if skip and any(p.is_relative_to(s) for s in skip):
                     pass
+                elif not self._is_git_tracked(p):
+                    logger.debug(f'Skipping non-tracked: {p}')
                 else:
                     res = self._load_input(p, l8funcs=l8funcs)
+        elif not self._is_git_tracked(path):
+            logger.debug(f'Skipping non-tracked: {path}')
         else:
             res = self._load_input(path, l8funcs=l8funcs)
         return res
 
-    # def load_settings(self, path: Optional[Union[str, Path, None]] = None):
+    # def load_settings(self, path: str | Path | None = None):
     #     path = Path(path or '')
     #     return self.load_input(path / 'resources' / 'settings.xml')
 
-    def load_translate(self, path: Union[str, Path]) -> GenerateStats:
+    def load_translate(self, path: str | Path) -> GenerateStats:
         """Load XML and keep data."""
         pofile = polib.pofile(path)
         was_obsolete = 0
@@ -629,10 +1437,13 @@ class Translate(TranslateBase):
             text = entry.msgid
             if self._RE_LABEL_NUM.fullmatch(text) and '[empty]' in entry.comment:
                 text = None
-            if (r := self._RE_LABEL_NUM.fullmatch(entry.msgctxt)) is None:
-                label = Label(None, entry.msgid)
+            if (r := self._RE_LABEL_NUM.fullmatch(entry.msgctxt or '')) is None:
+                label = Label(None, text)
             else:
-                label = Label(int(r.group(1)), entry.msgid)
+                lid = int(r.group(1))
+                label = Label(lid, text)
+                if entry.msgstr:
+                    self._translated_ids.add(lid)
             self._add_label(label, used=False)
             if entry.obsolete:
                 was_obsolete += 1
@@ -645,21 +1456,75 @@ class Translate(TranslateBase):
         # 3. merge id and text labels
         ...  # TODO: do it – for sure? I don't think so.
 
+    def _rename_orphan_ids(self) -> None:
+        """Reuse existing IDs whose old text is no longer referenced.
+
+        For each pending new label (`label.id is None, label.ref is L1`):
+          - if L1's old text has no remaining source references (`L1.nodes`
+            empty),
+          - and the old ID would be discarded anyway (`--obsolete=remove`)
+            or has no translation in any loaded PO,
+          - and the new text isn't already claimed by another concrete ID,
+          then take L1's ID for the new text instead of generating a new one.
+        Renames are recorded in `_renamed_ids` so `translate()` can update
+        the matching `msgid` in each language PO.
+        """
+        for new_text, lst in list(self._by_text.items()):
+            for label in list(lst):
+                if label.id is not None or label.ref is None:
+                    continue
+                L1 = label.ref
+                # Guard: a `ref` is only set in `_add_label` when L1 had a
+                # non-empty text and an id — defensively narrow types here.
+                if L1.id is None or L1.text is None:
+                    continue
+                if L1.nodes:
+                    continue                  # 'old' still referenced
+                if not (self.obsolete is ObsoleteAction.REMOVE
+                        or L1.id not in self._translated_ids):
+                    continue                  # translation worth preserving
+                # Don't rename onto a text that already has its own concrete ID.
+                if any(lb.id is not None and lb is not label for lb in lst):
+                    continue
+                old_text: str = L1.text
+                old_id: int = L1.id
+                # 1. Remove L1 from _by_text[old_text].
+                old_lst = self._by_text.get(old_text)
+                if old_lst is not None and L1 in old_lst:
+                    old_lst.remove(L1)
+                    if not old_lst:
+                        del self._by_text[old_text]
+                # 2. Rename L1 in place — it keeps its id, gets the new text
+                #    and absorbs the pending label's nodes/trans.
+                L1.text = new_text
+                L1.nodes |= label.nodes
+                L1.trans.extend(label.trans)
+                L1.ref = None
+                # 3. Replace the pending label in lst with L1, mark resolved.
+                lst[lst.index(label)] = L1
+                label.id = old_id
+                label.ref = L1
+                self._renamed_ids[old_id] = new_text
+                if self.dry_run:
+                    print(f' rename id: {old_id}: {old_text!r} → {new_text!r}')
+
     def generate(self) -> GenerateStats:
         """Generate new lables. Return number of new translations."""
         def nextid():
             nonlocal lidgen
-            for n in range(lidgen, 99999):
-                if n not in self._by_id and n not in self.reserved_ids:
+            for n in range(lidgen, self.id_max + 1):
+                # _ids holds numeric references to IDs declared elsewhere
+                # (Kodi core, other addons) — must not be reassigned.
+                if n not in self._by_id and n not in self._ids and n not in self.reserved_ids:
                     lidgen = n
                     return n
-            raise ValueError('No new label ID avaliable')
+            raise ValueError(f'No new label ID avaliable (id_max={self.id_max})')
 
         was_obsolete = len(set(self._by_id) - self._ids)
         if self.id_policy == 'min':
             lidgen = self.id_from
         else:
-            lidgen = max(self._by_id, default=self.id_from)
+            lidgen = max((*self._by_id, *self._ids), default=self.id_from)
 
         new_trans_count = 0
         if collision := set(self.reserved_ids.ids()) & self._by_id.keys():
@@ -671,6 +1536,8 @@ class Translate(TranslateBase):
                 self._moved_ids.add(mid)
                 if self.dry_run:
                     print(f' move id: {mid} → {label.id}: {label.text!r}')
+        if self.rename:
+            self._rename_orphan_ids()
         for lst in self._by_text.values():
             for label in lst:
                 if label.id is None:
@@ -683,16 +1550,26 @@ class Translate(TranslateBase):
                         best.nodes |= label.nodes
                         best.trans.extend(label.trans)
                     self._ids.add(label.id)
-        for label in self._by_id.values():
-            for node in label.nodes:
-                node.set_label(str(label.id), addon=self.addon_id)
-                self._ids.add(label.id)
+        # Apply Trans first — they reference offsets in the *original* value.
+        # `set_label` (next loop) overwrites the whole node.text/attr, so it
+        # must run after Trans-based fragment edits.
         trans = sorted(((label, tr) for label in self._by_id.values() for tr in label.trans),
                        key=lambda x: -x[1].start)
         for label, tr in trans:
-            fmt = f'{{before}}{tr.fmt}{{after}}'
-            tr.file.data = fmt.format(before=tr.file.data[:tr.start], after=tr.file.data[tr.end:], label=label)
+            assert label.id is not None
+            tr.replace(label)
             self._ids.add(label.id)
+        for label in self._by_id.values():
+            assert label.id is not None
+            for node in label.nodes:
+                if not node.python:
+                    self._ensure_L_comment(node, label)
+                    node.set_label(str(label.id), addon=self.addon_id)
+                    self._ids.add(label.id)
+        if self.cleanup_translate_comments:
+            removed = sum(self._cleanup_translate_comments_in(inp.tree) for inp in self.xml_inputs)
+            if removed:
+                logger.info(f'Cleaned up {removed} redundant :translate=false: comment(s)')
         return GenerateStats(new=new_trans_count, moved=len(collision), obsolete=was_obsolete)
 
     def write(self):
@@ -701,10 +1578,10 @@ class Translate(TranslateBase):
         for input in self.py_inputs:
             self._write_py(input)
 
-    def _write_entry(self, path, *, base):
+    def _prepare_write_target(self, path: Path, *, base: Path | None) -> Path:
         if self.backup_pattern == '+':
             # write as new file
-            return path.with_suffix(input.path.suffix + '.new')
+            return path.with_suffix(path.suffix + '.new')
         # backup and override
         if self.backup_pattern and self.backup_pattern != '{}':
             if base is None:
@@ -712,7 +1589,7 @@ class Translate(TranslateBase):
             else:
                 base = base.resolve()
             try:
-                relative = path.relative_to(path)
+                relative = path.relative_to(base)
             except ValueError:
                 relative = Path()
             pat = self.backup_pattern
@@ -728,17 +1605,24 @@ class Translate(TranslateBase):
 
     def _write_xml(self, input):
         decl = input.declaration or ''
+        encoding = input.encoding
         if self.dry_run:
             logger.debug(f'Write xml: {input.path.resolve()}')
             if (logger.level or logging.root.level) <= logging.DEBUG - 2:
                 # etree.indent(input.tree)
-                debug_print(decl + etree.tostring(input.tree).decode())
+                debug_print(decl + etree.tostring(input.tree, xml_declaration=False).decode())
             if self.dump_output:
-                print((decl.encode(self.encoding) + etree.tostring(input.tree, encoding=self.encoding)).decode(self.encoding))
+                body = etree.tostring(input.tree, encoding=encoding, xml_declaration=False)
+                print((decl.encode(encoding) + body).decode(encoding))
         else:
-            path = self._write_entry(input.path.resolve(), base=input.base)
-            path.write_bytes(decl.encode(self.encoding) + etree.tostring(input.tree, encoding=self.encoding))
-            # input.tree.write(str(path), encoding='utf-8', xml_declaration=False)
+            def entity(m: re.Match) -> str:
+                code = ord(m[0])
+                return f'&#x{code:04x};'
+            path = self._prepare_write_target(input.path.resolve(), base=input.base)
+            body = etree.tostring(input.tree, encoding=encoding, xml_declaration=False).decode(encoding)
+            data = decl + body
+            data = re.sub(r'[\u2000-\u200f]', entity, data)
+            path.write_bytes(data.encode(encoding))
 
     def _write_py(self, input):
         if self.dry_run:
@@ -746,12 +1630,13 @@ class Translate(TranslateBase):
             if self.dump_output:
                 print(input.data)
         else:
-            path = self._write_entry(input.path.resolve(), base=input.base)
+            path = self._prepare_write_target(input.path.resolve(), base=input.base)
             with open(path, 'w', encoding=self.encoding, newline='') as f:
                 f.write(input.data)
 
-    def translate(self, lang: str, path: Optional[Union[str, Path, None]] = None, *,
+    def translate(self, lang: str, path: str | Path, *,
                   stats: GenerateStats | None = None, old_stats: GenerateStats | None) -> None:
+        """Translate to `lang` and write to `path` (or `strings.po` in current dir if None)."""
         path = Path(path)
         if self.dry_run:
             if not path.parent.exists():
@@ -767,8 +1652,8 @@ class Translate(TranslateBase):
             po.metadata = {
                 'Project-Id-Version': '1.0',
                 'Report-Msgid-Bugs-To': 'dev@kodi-pl.net',
-                'POT-Creation-Date': f'{now:%Y-%m-%d %H:%S%z}',
-                'PO-Revision-Date': f'{now:%Y-%m-%d %H:%S%z}',
+                'POT-Creation-Date': f'{now:%Y-%m-%d %H:%M:%S%z}',
+                'PO-Revision-Date': f'{now:%Y-%m-%d %H:%M:%S%z}',
                 'Last-Translator': 'KodiPL Team <dev@kodi-pl.net>',
                 # 'Language-Team': 'English <yourteam@example.com>',
                 'Language': lang,
@@ -783,7 +1668,15 @@ class Translate(TranslateBase):
                              '\nAddon id: {addon.id}'
                              '\nAddon Provider: {addon.provider}'),
             }
-        ie = {int(r['id']): e for e in po if (r := self._RE_LABEL_NUM.fullmatch(e.msgctxt)) is not None}
+        ie = {int(r['id']): e for e in po if (r := self._RE_LABEL_NUM.fullmatch(e.msgctxt or '')) is not None}
+        # Apply in-place renames: existing entries whose label was reused for
+        # a new text (because old text became unreferenced and untranslated /
+        # `--obsolete=remove`). Update the msgid; msgstr stays — empty by
+        # the rename precondition (or wiped by remove afterwards).
+        for old_id, new_text in self._renamed_ids.items():
+            entry = ie.get(old_id)
+            if entry is not None and entry.msgid != new_text:
+                entry.msgid = new_text
         for label in self._by_id.values():
             assert label.id is not None
             if label.id not in ie:
@@ -809,26 +1702,26 @@ class Translate(TranslateBase):
                     entry.msgstr = entry.msgid
         # remove obsolete flag if ID used again
         for entry in po:
-            if entry.obsolete and (r := self._RE_LABEL_NUM.fullmatch(entry.msgctxt)) is not None:
+            if entry.obsolete and (r := self._RE_LABEL_NUM.fullmatch(entry.msgctxt or '')) is not None:
                 mid = int(r.group('id'))
                 if mid in self._ids:
                     entry.obsolete = False
         # mark obsolete if ID is not used in XML nor PY (but skip if moved)
         if self.obsolete is ObsoleteAction.MARK:
             for entry in po:
-                if (r := self._RE_LABEL_NUM.fullmatch(entry.msgctxt)) is not None:
+                if (r := self._RE_LABEL_NUM.fullmatch(entry.msgctxt or '')) is not None:
                     mid = int(r.group('id'))
                     if mid not in self._ids and mid not in self._moved_ids:
                         entry.obsolete = True
         elif self.obsolete is ObsoleteAction.REMOVE:
             to_remove = [i for i, entry in enumerate(po)
-                         if ((mch := self._RE_LABEL_NUM.fullmatch(entry.msgctxt)) is not None
+                         if ((mch := self._RE_LABEL_NUM.fullmatch(entry.msgctxt or '')) is not None
                              and ((mid := int(mch.group('id'))) in self._moved_ids or mid not in self._ids))]
             for i in reversed(to_remove):
                 del po[i]
         if self._moved_ids:
             to_remove = [i for i, entry in enumerate(po)
-                         if ((mch := self._RE_LABEL_NUM.fullmatch(entry.msgctxt)) is not None
+                         if ((mch := self._RE_LABEL_NUM.fullmatch(entry.msgctxt or '')) is not None
                              and int(mch.group('id')) in self._moved_ids)]
             for i in reversed(to_remove):
                 del po[i]
@@ -847,7 +1740,9 @@ class Translate(TranslateBase):
             if lang == 'en_GB':  # base language (no translation needed)
                 print(f'Language {lang}: translated: ---- ({tr}/{N}), obsolete: {ob}{nw}{mv}')
             else:
-                print(f'Language {lang}: translated: {100 * tr / (N or 1):3.0f}% ({tr}/{N}), obsolete: {ob}{nw}{mv}')
+                percent = 100 * tr / (N or 1)
+                percent = 0.0 if tr == 0 else 100.0 if tr == N else max(1.0, min(99.0, percent))
+                print(f'Language {lang}: translated: {percent:3.0f}% ({tr}/{N}), obsolete: {ob}{nw}{mv}')
         if self.dry_run:
             logger.debug(f'Write po:  {path}')
             if (logger.level or logging.root.level) < logging.DEBUG:
@@ -857,7 +1752,16 @@ class Translate(TranslateBase):
         else:
             po.save(path)
 
-    def load_addon_files(self, path: Union[Path, str]) -> AddonConf:
+    def _load_addon_id(self, path: Path) -> str | None:
+        """Try to read addon ID from `path` (addon folder with addon.xml). Return ID if found, else None."""
+        if (path / 'addon.xml').exists():
+            atree = etree.parse(str(path / 'addon.xml'))
+            aroot = atree.getroot()
+            if aroot.tag == 'addon':
+                return aroot.get('id')
+        return None
+
+    def load_addon_files(self, path: Path | str, *, addon_id: str | None = None) -> AddonConf:
         path = Path(path or '')
         paths: list[Path] = []
         settings_path = path / 'resources' / 'settings.xml'
@@ -873,52 +1777,87 @@ class Translate(TranslateBase):
         ):
             if p.exists():
                 paths.append(p)
-        return AddonConf(paths=paths)
+        if addon_id is None:
+            addon_id = self._load_addon_id(path)
+        return AddonConf(id=addon_id or '', paths=paths)
 
-    def load_addon_config(self, path: Path) -> AddonConf:
-        def l8paths(paths: Union[list[str], str]) -> set[Path]:
+    def load_addon_config(self, path: Path) -> AddonConf | None:
+        """
+        Load addon config from `path` (either addon folder or .kolang.json or path to kolang config) and return it.
+        Return None if no config found (e.g. no .kolang.json in folder).
+        """
+        def l8paths(paths: list[str] | str | None) -> set[Path] | None:
             if not paths:
                 return None
             if isinstance(paths, str):
                 paths = [paths]
-            return {p for pp in paths for p in Path(base.parent).glob(pp)}
+            return {p for pp in paths for p in base.glob(pp)}
 
-        # read options for config file
+        # cache config by resolved path to avoid re-reading for multiple sources in the same addon
+        key = path.resolve()
+        addon_id: str = ''
+        if key in self._config_cache:
+            return self._config_cache[key]
+        # read default addon id from addon.xml
         if path.is_dir():
+            base = path
             path = path / '.kolang.json'
-            if not path.exists():
-                return None
+        else:
+            base = path.parent
+        if (base / 'addon.xml').exists():
+            addon_id = self._load_addon_id(base) or ''
+            if self.addon_id is None:
+                self.addon_id = addon_id
+        # read options for config file
+        if not path.exists():
+            return None
+        logger.debug(f'Reading config {path}')
         with open(path, encoding='utf8') as f:
             conf = json.load(f)
         options = conf.get('options', {})
-        for attr in ('id-from', 'id-policy', 'mark-translated', 'backup-pattern',
-                     'addon-id', 'po-wrap-width', 'encoding', 'multi-line-msg'):
+        for attr in ('id-from', 'id-min', 'id-max', 'id-policy', 'mark-translated',
+                     'backup-pattern', 'addon-id', 'po-wrap-width', 'encoding', 'multi-line-msg',
+                     'git-only', 'extra-translate-attrs', 'extra-translate-tags', 'rename'):
             if attr in options:
                 setattr(self, attr.replace('-', '_'), options[attr])
+        # python-tags/python-attrs additively extend defaults (set semantics).
+        for tag in options.get('python-tags', ()):
+            self.python_tags.add(tag)
+        for entry in options.get('python-attrs', ()):
+            if isinstance(entry, str):
+                self.python_attrs.add((None, entry))
+            elif isinstance(entry, dict):
+                name = entry.get('name')
+                tags = entry.get('tags')
+                if not name:
+                    continue
+                if not tags:
+                    self.python_attrs.add((None, name))
+                else:
+                    for tag in tags:
+                        self.python_attrs.add((tag, name))
         if (val := options.get('mark-obsoleted')) is not None:
             self.obsolete = ObsoleteAction.MARK if val else ObsoleteAction.KEEP
         if val := options.get('obsolete'):
             self.obsolete = ObsoleteAction(val)
         if 'get-localized-string' in options:
             self.handle_getLocalizedString = options['get-localized-string']
-        base = path.parent
         paths = []
         for source in conf.get('sources', []):
             if isinstance(source, str):
                 source = {'path': source}
             if (addon := source.get('addon')):
-                ac = self.load_addon_files(base / addon)
+                ac = self.load_addon_files(base / addon, addon_id=addon_id)
                 paths.extend(ac.paths)
-            elif (path := source.get('path')):
-                path = base / Path(path)
-                if path.exists():
-                    paths.append(path)
+            elif (p := source.get('path')):
+                p = base / Path(p)
+                if p.exists():
+                    paths.append(p)
                 else:
-                    logger.warning(f'Source {str(path)!r} does not exist')
-            elif (pat := source.get('glob')):
-                pat = Path(pat)
-                path = base / pat.parent
-                paths.extend(path.glob(pat.name))
+                    logger.warning(f'Source {str(p)!r} does not exist')
+            elif (p := source.get('glob')):
+                p = Path(p)
+                paths.extend((base / p.parent).glob(p.name))
         skip = {p for pp in conf.get('skip', []) for p in base.glob(pp)}
         langs = {self.lang_code(L) for L in conf.get('languages', ())}
         l8funcs = []
@@ -932,23 +1871,22 @@ class Translate(TranslateBase):
                 l8funcs.append(L8Func(pat, paths=l8paths(fitem.get('path'))))
             elif (name := fitem.get('name')):
                 l8funcs.append(L8Func(re.escape(name), paths=l8paths(fitem.get('path'))))
-        # read default addon id from addon.xml
-        if self.addon_id is None and (base / 'addon.xml').exists():
-            atree = etree.parse(str(base / 'addon.xml'))
-            aroot = atree.getroot()
-            if aroot.tag == 'addon':
-                aid = aroot.attrib.get('id')
-                if aid:
-                    self.addon_id = aid
-        return AddonConf(paths=paths, langs=langs, skip=skip, l8funcs=l8funcs)
+        result = AddonConf(id=addon_id, paths=paths, langs=langs, skip=skip, l8funcs=l8funcs)
+        self._config_cache[key] = result
+        return result
 
-    def load_addon(self, path, *, skip: set[Path] = set(), l8funcs: Optional[list[L8Func]] = None) -> None:
+    def load_addon(self, path, *, skip: set[Path] = set(), l8funcs: list[L8Func] | None = None) -> None:
+        """Load addon from `path` and keep data. `path` can be either addon folder (with addon.xml) or config file (.kolang.json)."""
         if not (path / 'addon.xml').exists():
             logger.warning(f'Invalid addon folder {path!r}, no addon.xml')
         conf = self.load_addon_config(path)
         if conf is None:
             conf = self.load_addon_files(path)
         if conf is not None:
+            # `load_addon_config` already sets self.addon_id from addon.xml; cover
+            # the no-config path here so skin label scan stays enabled.
+            if self.addon_id is None and conf.id:
+                self.addon_id = conf.id
             skip = set(Path(s) for s in skip or ()) | conf.skip
             skip = {s.resolve() for s in skip}
             for p in conf.paths:
@@ -973,24 +1911,19 @@ def unescape(text: str | None) -> str | None:
 def process(inputs, *, args, langs=None, output=None):
     trans = Translate(dry_run=args.dry_run, dump_output=args.debug_cat_output,
                       dump_translations=args.debug_cat_translation,
-                      id_from=args.id_from, id_policy=args.id_policy, addon_id=args.addon_id,
+                      id_from=args.id_from, id_min=args.id_min, id_max=args.id_max,
+                      id_policy=args.id_policy, addon_id=args.addon_id,
                       handle_getLocalizedString=args.gls, backup_pattern=args.backup_pattern,
                       mark_translated=args.mark_translated, multi_line_msg=args.multi_line_msg,
                       po_wrap_width=args.po_wrap_width, reserved_ids=args.id_reserve,
+                      git_only=args.git_only,
+                      cleanup_translate_comments=args.cleanup_translate_comments,
+                      rename=args.rename,
                       )
     if args.verbose:
         logging.basicConfig(level=args.verbose)
-        if logger.parent is None:
-            logger.parent = logging.root
     else:
         logging.basicConfig()
-
-    if not getattr(args, 'enable_xml_etree', None):
-        try:
-            from lxml import etree as _  # noqa: F401
-        except ImportError:
-            logger.fatal(' Missing lxml module, try `pip install lxml` or use --enable-xml-etree')
-            sys.exit(1)
 
     if args.config:
         trans.load_addon_config(args.config)
@@ -1156,8 +2089,13 @@ def main(argv=None):
     p.add_argument('-L', '--language', metavar='LANG', action='extend', type=parse_lang_arg,
                    help='new language like "en", "en_US", "pl"')
     p.add_argument('--mark-translated', action='store_true', help='copy original string to all non-translated entries')
-    p.add_argument('--remove', action='store_true', help='remove unsused translations : IGNORED')
+    p.add_argument('--remove', action='store_const', const='remove', dest='obsolete',
+                   help='remove unused translations (alias for --obsolete=remove)')
     p.add_argument('--id-from', metavar='NUM', type=int, default=30100, help='lowest label ID (start from) [30100]')
+    p.add_argument('--id-min', metavar='NUM', type=int, default=None,
+                   help='warn if any label ID is below NUM (default: --id-from)')
+    p.add_argument('--id-max', metavar='NUM', type=int, default=None,
+                   help=f'highest label ID for new entries [{Translate.ID_MAX_DEFAULT}]')
     p.add_argument('--id-policy', choices=('max', 'min'), default='max', help='new label ID policy [max]')
     p.add_argument('--id-reserve', metavar='ID[-ID]...', type=parse_ranges,
                    help='reserve IDs, move another to keep the range empty')
@@ -1179,8 +2117,18 @@ def main(argv=None):
     p.add_argument('--encoding', default='utf8', help='force files encoding [utf8]')
     p.add_argument('--po-wrap-width', metavar='WIDTH', default=999999, type=int, help='.po wrap width [999999]')
     p.add_argument('-c', '--config', type=Path, help='load config [ADDON/.kolang.json]')
-    p.add_argument('--single-line-msg', action='store_false', dest='multi_line_msg', default=False, help='write po messages in single line [default]')
-    p.add_argument('--multi-line-msg', action='store_true', default=False, help='write po messages in many lines if \\n is used')
+    p.add_argument('--single-line-msg', action='store_false', dest='multi_line_msg',
+                   help='write po messages in single line [default]')
+    p.add_argument('--multi-line-msg', action='store_true', dest='multi_line_msg',
+                   help='write po messages in many lines if \\n is used')
+    p.set_defaults(multi_line_msg=False)
+    p.add_argument('--git-only', action='store_true', default=False,
+                   help='scan only files tracked by git (in the index)')
+    p.add_argument('--no-rename', dest='rename', action='store_false', default=True,
+                   help='disable in-place ID rename when text edits would otherwise '
+                        'orphan an untranslated entry (default: rename when safe)')
+    p.add_argument('--cleanup-translate-comments', action='store_true', default=False,
+                   help='one-time cleanup: drop redundant :translate=false: XML comments')
     p.add_argument('--verbose', action='store_const', const=logging.INFO, help='be more verbose')
     p.add_argument('--debug', action=ConstIncAction, const=logging.DEBUG, inc=-1, dest='verbose',
                    help='be much more verbose')
@@ -1188,8 +2136,6 @@ def main(argv=None):
     p.add_argument('--debug-cat-output', action='store_true', help='print output file if --dry-run')
     p.add_argument('--debug-cat-translation', metavar='LOCALE', help='print output translation if --dry-run')
     p.add_argument('--test-plural', help='test plural form and exit')
-    # p.add_argument('--enable-xml-etree', action='store_true',
-    #                help='allow use xml.etree, XML comment are NOT supported')
     p.add_argument('--generate-kolang-py', action='store_true',
                    help='generate kolang.py to use its L() in addon/plugin')
     p.add_argument('input', metavar='PATH', nargs='+', type=Path, help='path XML or PY file or addon folder')

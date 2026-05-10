@@ -1,12 +1,14 @@
+from __future__ import annotations
 
 import re
 from pathlib import Path
 from zipfile import ZipFile, ZIP_DEFLATED
 from argparse import ArgumentParser
-from typing import Optional
+
+import polib as _polib
 
 
-def main(argv: Optional[list[str]] = None) -> None:
+def main(argv: list[str] | None = None) -> None:
     p = ArgumentParser()
     p.add_argument('-f', '--force', action='store_true', help='force overwrite output pyz')
     args = p.parse_args(argv)
@@ -21,8 +23,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         for p in path.glob('*.py'):
             z.write(p, f'kolang/{p.name}')
         z.write(path / '__main__.py', '__main__.py')
-        p = next(path.glob('../.venv/lib/python3.*/site-packages/polib-*-py3.*.egg/polib.py'))
-        z.write(p, 'polib.py')
+        z.write(_polib.__file__, 'polib.py')
 
 
 if __name__ == '__main__':

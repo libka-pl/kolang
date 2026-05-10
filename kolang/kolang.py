@@ -16,11 +16,11 @@ Example
 Author: rysson <robert.kalinowski@sharkbits.com>
 License: MIT
 Home: https://github.com/kodi-pl/
+Python version: 3.8+
 """
 
 from __future__ import annotations
-from typing import overload, TYPE_CHECKING
-from typing_extensions import Literal
+from typing import Literal, overload, TYPE_CHECKING
 from pathlib import Path
 import re
 try:
@@ -36,7 +36,7 @@ except ModuleNotFoundError:
             def getLocalizedString(self, v):   # noqa: D102, E301
                 return str(v)
 if TYPE_CHECKING:
-    from typing import Optional, Union, Dict, Sequence, Mapping
+    from typing import Sequence, Mapping, ClassVar, Self
     from ast import stmt
 
 
@@ -74,30 +74,31 @@ def kodi_locale() -> str:
     return locale
 
 
-_label_getters: Dict[Optional[str], LabelGetter] = {}
+_label_getters: dict[str | None, LabelGetter] = {}
 
 
 class LabelGetter:
     """Simple label string getter (like getLocalizedString) for given addon ID."""
 
-    def __init__(self, id: Optional[str] = None) -> None:
+    def __init__(self, id: str | None = None) -> None:
         #: Addon ID.
-        self.id: Optional[str] = id or None
+        self.id: str | None = id or None
         #: Addon instance.
         self.addon: Addon  # set in reset()
         #: Rules for all languages.
-        self._rules: Optional[Mapping[str, Sequence[stmt]]] = None
+        self._rules: Mapping[str, Sequence[stmt]] | None = None
         #: Rule for locale.
-        self._rule: Optional[Sequence[stmt]] = None
+        self._rule: Sequence[stmt] | None = None
         #: Current locale.
-        self._locale: Optional[str] = None
+        self._locale: str | None = None
         self.reset()
 
     def reset(self) -> None:
         """Recreate addon."""
         self.addon = Addon() if self.id is None else Addon(self.id)
-        self._rule = None
-        self._locale = None
+        if self._locale is None or (kodi_locale() != self._locale):
+            self._rule = None
+            self._locale = None
 
     def load_rules(self):
         import json
@@ -108,15 +109,15 @@ class LabelGetter:
             return {}
         path = Path(__file__).parent.parent / 'resources' / 'language' / 'rules.json'
         try:
-            with open(path) as f:
+            with open(path, encoding='utf-8') as f:
                 data = json.load(f)
         except OSError:
-            _log(f'Missing laguage rules {path}')
+            _log(f'Missing language rules {path}')
             return {}
         se = SimpleEval()
         return {k: tuple(se.parse(v) for v in vv) for k, vv in data.get('plural', {}).items()}
 
-    def rules(self, *, locale: Optional[str] = None) -> Sequence[stmt]:
+    def rules(self, *, locale: str | None = None) -> Sequence[stmt]:
         if self._rule is None:
             if self._rules is None:
                 self._rules = self.load_rules()
@@ -131,91 +132,102 @@ class LabelGetter:
         return self._rule
 
     @overload
-    def __call__(self, id: int, string: str, /, *, n: Optional[int] = None, **kwargs) -> str: ...
+    def __call__(self, id: int, string: str, /, *, n: int | None = None, **kwargs) -> str: ...
 
     @overload
-    def __call__(self, id: int, /, *, n: Optional[int] = None, **kwargs) -> str: ...
+    def __call__(self, id: int, /, *, n: int | None = None, **kwargs) -> str: ...
 
     @overload
-    def __call__(self, string: str, /, *, n: Optional[int] = None, **kwargs) -> str: ...
+    def __call__(self, string: str, /, *, n: int | None = None, **kwargs) -> str: ...
 
-    def __call__(self, *args, n: Optional[int] = None, **kwargs) -> str:
+    def __call__(self, *args, n: int | None = None, **kwargs) -> str:
         """L(). Get localized string. If there is no ID there string is returned without translation."""
-        sid: Optional[int]
+        sid: int | None
         text: str
         if len(args) == 2:
             sid, text = args
         elif len(args) == 1:
             if isinstance(args[0], int):
-                sid, text = args[0], ''
+                sid, text = args[0], f'#{args[0]}'
             else:
                 sid, text = None, args[0]
         else:
             raise TypeError(f'L{args} – incorrect arguments')
         if sid:
-            text = self.addon.getLocalizedString(sid)
-        if n is None:
-            return text
-        try:
-            from simpleeval import SimpleEval
-        except ModuleNotFoundError:
-            return text
-        else:
-            se = SimpleEval(names={'n': abs(n)})
-            forms = text.split('|||')
-            for rule, frm in zip(self.rules(), forms):
-                if se.eval('', previously_parsed=rule):
-                    return frm.format(n=n, **kwargs)
-            else:
-                return forms[-1].format(n=n, **kwargs)
+            if translated := self.addon.getLocalizedString(sid):
+                text = translated
+        return self._apply_plural(text, n, **kwargs)
 
-    def get_text(self, string: str, /, *, n: Optional[int] = None, **kwargs) -> str:
+    def get_text(self, string: str, /, *, n: int | None = None, **kwargs) -> str:
         """Get value of already translated label. Useful for number forms."""
-        text = string
+        return self._apply_plural(string, n, **kwargs)
+
+    def _apply_plural(self, text: str, n: int | None, **kwargs) -> str:
+        """Apply locale's plural rule and format with `n` + kwargs."""
         if n is None:
             return text
         try:
             from simpleeval import SimpleEval
         except ModuleNotFoundError:
             return text
-        else:
-            se = SimpleEval(names={'n': abs(n)})
-            forms = text.split('|||')
-            for rule, frm in zip(self.rules(), forms):
-                if se.eval('', previously_parsed=rule):
-                    return frm.format(n=n, **kwargs)
-            else:
-                return forms[-1].format(n=n, **kwargs)
+        se = SimpleEval(names={'n': abs(n)})
+        forms = text.split('|||')
+        for rule, frm in zip(self.rules(), forms):
+            if se.eval('', previously_parsed=rule):
+                return frm.format(n=n, **kwargs)
+        return forms[-1].format(n=n, **kwargs)
 
 
 class KodiLabels:
     """Main Kodi labels translations."""
 
-    # kodi strin.po translation parse regex.
-    _rx = re.compile(r'\nmsgctxt "#(?P<id>\d+)"\s*\nmsgid\s+"(?P<en>\\.|[^"]*)"\s*\nmsgstr\s+"(?P<loc>\\.|[^"]*)"')
+    #: kodi strings.po translation parse regex; supports PO line continuation
+    #: (msgid/msgstr split across multiple "..." lines).
+    _rx: ClassVar[re.Pattern[str]] = re.compile(
+        r'\nmsgctxt\s+"#(?P<id>\d+)"\s*'
+        r'\nmsgid\s+(?P<en>"(?:\\.|[^"])*"(?:\s*"(?:\\.|[^"])*")*)\s*'
+        r'\nmsgstr\s+(?P<loc>"(?:\\.|[^"])*"(?:\s*"(?:\\.|[^"])*")*)'
+    )
+    #: regex to extract and concatenate "..." parts of a PO value.
+    _rx_po_str: ClassVar[re.Pattern[str]] = re.compile(r'"((?:\\.|[^"])*)"')
+    #: instances, only one per locale
+    _instances: ClassVar[dict[str, KodiLabels]] = {}
 
-    def __init__(self, locale: Optional[str] = None) -> None:
+    # -- object attributes --
+    # all translations [id] = (en, loc)
+    _translations: dict[int, tuple[str, str]] | None
+    _en_to_locale: dict[str, str] | None
+    _addon: Literal[False] | Addon | None
+    locale: str
+
+    def __new__(cls, locale: str | None = None) -> KodiLabels:
+        """Only one instance per locale, if exists just return, if not - create."""
         if locale is None:
-            locale = self.ui_locale()
-        self._translations: Optional[Dict[int, str]] = None
-        self._addon: Union[None, Literal[False], Addon] = None
-        self.locale: str = locale
+            locale = cls.ui_locale()
+        if obj := cls._instances.get(locale):
+            return obj
+        obj = super().__new__(cls)
+        # initialize object
+        obj._translations = None
+        obj._en_to_locale = None
+        obj._addon = None
+        obj.locale = locale
+        # register as singleton for given locale
+        KodiLabels._instances[locale] = obj
+        return obj
+
+    @classmethod
+    def _join_po_strings(cls, s: str) -> str:
+        """Concatenate consecutive "..." parts of a PO value."""
+        return ''.join(cls._rx_po_str.findall(s))
 
     @classmethod
     def ui_locale(cls) -> str:
         """Get current Kodi UI locale."""
         return kodi_locale()
 
-    def set_locale(self, locale: Optional[str] = None) -> None:
-        """Set locale (UI language change)."""
-        if locale is None:
-            locale = self.ui_locale()
-        if locale != self.locale:
-            self._translations = None
-            self._addon = None
-
     @property
-    def addon(self) -> Optional[Addon]:
+    def addon(self) -> Addon | None:
         """Get language addon."""
         if self._addon is None:
             try:
@@ -226,37 +238,65 @@ class KodiLabels:
         return self._addon or None
 
     @property
-    def translations(self) -> Dict[int, str]:
-        """Get translations, lazy loading."""
+    def raw_translations(self) -> dict[int, tuple[str, str]]:
+        """Get raw translations [id] = (en, loc), lazy loading."""
         if self._translations is None:
             if addon := self.addon:
                 path = Path(addon.getAddonInfo('path')) / 'resources' / 'strings.po'
                 try:
                     with open(path, encoding='utf-8') as f:
-                        self._translations = {int(mch['id']): mch['loc'] or mch['en']
-                                              for mch in self._rx.finditer(f.read())}
+                        self._translations = {
+                            int(mch['id']): (self._join_po_strings(mch['en']),
+                                             self._join_po_strings(mch['loc']))
+                            for mch in self._rx.finditer(f.read())
+                        }
                 except IOError:
                     self._translations = {}
             else:
                 self._translations = {}
         return self._translations
 
+    @property
+    def en_to_locale_translations(self) -> dict[str, str]:
+        """English to localized dict."""
+        if self._en_to_locale is None:
+            self._en_to_locale = {en: loc or en for en, loc in self.raw_translations.values()}
+        return self._en_to_locale
+
+    @property
+    def translations(self) -> dict[int, str]:
+        """Get translations [id] = loc or en, lazy loading."""
+        return {num: loc or en for num, (en, loc) in self.raw_translations.items()}
+
+    def __call__(self, id: int | str) -> str:
+        """Get localized label."""
+        default = f'#{id}'
+        if isinstance(id, str):
+            return self.en_to_locale_translations.get(id, default)
+        en, loc = self.raw_translations.get(id, (default, default))
+        return loc or en
+
     def label(self, id: int) -> str:
         """Get localized label."""
-        return self.translations.get(id, f'#{id}')
+        en, loc = self.raw_translations.get(id, ('', f'#{id}'))
+        return loc or en
 
-    def get(self, id: int, default: Optional[str] = None) -> Optional[str]:
+    def get(self, id: int | str, default: str | None = None) -> str | None:
         """Get localized label with default."""
-        return self.translations.get(id, default)
+        if isinstance(id, str):
+            return self.en_to_locale_translations.get(id, default)
+        en, loc = self.raw_translations.get(id, (default, default))
+        return loc or en
 
-    def __getitem__(self, key: int) -> str:
-        """Get localized label, dict-like access: KodiLabels('pl-PL')[123]."""
-        return self.translations[key]
+    def __getitem__(self, key: int | str) -> str:
+        """Get localized label, dict-like access: KodiLabels('pl-PL')[123] or KodiLabels('pl-PL')['Movies']."""
+        if isinstance(key, str):
+            return self.en_to_locale_translations[key]
+        en, loc = self.raw_translations[key]
+        return loc or en
 
-    __call__ = label
 
-
-def get_label_getter(id: Optional[str] = None) -> LabelGetter:
+def get_label_getter(id: str | None = None) -> LabelGetter:
     """Return label string getter (like getLocalizedString) for given addon ID."""
     try:
         return _label_getters[id or None]
