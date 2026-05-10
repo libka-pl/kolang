@@ -1620,7 +1620,9 @@ class Translate(TranslateBase):
             if lang == 'en_GB':  # base language (no translation needed)
                 print(f'Language {lang}: translated: ---- ({tr}/{N}), obsolete: {ob}{nw}{mv}')
             else:
-                print(f'Language {lang}: translated: {100 * tr / (N or 1):3.0f}% ({tr}/{N}), obsolete: {ob}{nw}{mv}')
+                percent = 100 * tr / (N or 1)
+                percent = 0.0 if tr == 0 else 100.0 if tr == N else max(1.0, min(99.0, percent))
+                print(f'Language {lang}: translated: {percent:3.0f}% ({tr}/{N}), obsolete: {ob}{nw}{mv}')
         if self.dry_run:
             logger.debug(f'Write po:  {path}')
             if (logger.level or logging.root.level) < logging.DEBUG:
