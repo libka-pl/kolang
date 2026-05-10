@@ -748,7 +748,9 @@ class Translate(TranslateBase):
             if label.id < threshold:
                 logger.warning(f'Label #{label.id} < #{threshold}')
             L1 = self._by_id.setdefault(label.id, label)
-            L1.nodes |= label.nodes  # XXX XXX XXX
+            # NOTE: don't merge label into L1 here — wait until conflict
+            # resolution, otherwise a mismatched text would still pollute
+            # L1's node set with nodes that belong to a different label.
         if label.text is not None:
             # explicit empty (`L('')`) is a declaration too, distinct from
             # a numeric reference where text is unknown — keep it.
@@ -756,7 +758,9 @@ class Translate(TranslateBase):
             L2 = lst.add(label)
         if L1 is not None and L2 is not None and L1 is not L2:
             if L2.id is None:
-                label = Label(L1.id or L2.id, L1.text or L2.text, L1.nodes | L2.nodes, L1.trans + L2.trans)
+                label = Label(L1.id or L2.id, L1.text or L2.text,
+                              L1.nodes | L2.nodes | label.nodes,
+                              L1.trans + L2.trans)
                 assert label.id is not None
                 self._by_id[label.id] = label
                 lst[lst.index(L2)] = label
@@ -781,6 +785,9 @@ class Translate(TranslateBase):
                 assert label.id is not None
                 self._by_id[label.id] = label = L2
         elif L1 is not None:
+            if L1 is not label:
+                L1.nodes |= label.nodes
+                L1.trans.extend(label.trans)
             label = L1
         elif L2 is not None:
             label = L2
@@ -880,20 +887,34 @@ class Translate(TranslateBase):
 
     @staticmethod
     def _ensure_L_comment(node_value, label) -> None:
-        """Insert an `L(...)` XML comment before the element if not already present.
+        """Ensure an `L(...)` XML comment for `label` precedes the element.
 
-        Idempotent — does nothing when matching marker already exists. Skips
-        labels with no text (numeric refs to unknown ids — nothing to document).
-        Lays the comment on its own line by reusing the indent that precedes
-        the element (taken from prev sibling's `tail` or parent's `text`).
+        Three cases for the existing comment matching this target:
+          - identical (id and text) → skip (idempotent),
+          - stale (id or text differs) → update in place (preserves position
+            and tail), so the next run sees the up-to-date marker,
+          - missing → insert a new comment, on its own line, using the
+            indent that precedes the element.
+
+        Skips labels with no text (numeric refs to unknown ids — nothing to
+        document).
         """
         if not label.text:
             return
         target = _node_value_target(node_value)
         elem = node_value.node
-        if _find_L_marker(elem, target) is not None:
-            return
         body = _format_L_comment(target, label.id, label.text)
+        # Walk back through preceding comments looking for one targeting us.
+        prev = elem.getprevious()
+        while isinstance(prev, etree._Comment):
+            parsed = _parse_L_comment(prev.text or '')
+            if parsed is not None and parsed[0] == target:
+                if (parsed[1], parsed[2]) == (label.id, label.text):
+                    return  # identical
+                prev.text = body  # stale → update in place
+                return
+            prev = prev.getprevious()
+        # Missing — insert new on its own line.
         prev = elem.getprevious()
         parent = elem.getparent()
         src = prev.tail if prev is not None else (parent.text if parent is not None else '')
