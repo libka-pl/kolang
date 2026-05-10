@@ -708,6 +708,10 @@ class Translate(TranslateBase):
         #: IDs that have a non-empty msgstr in any loaded PO. Used by the
         #: rename heuristic to refuse silent renames of translated entries.
         self._translated_ids: set[int] = set()
+        #: Cache of compiled `_replace_py` regexes keyed by the tuple of
+        #: GLS function patterns active for the scan (recompiling per file
+        #: dominated profile traces).
+        self._replace_py_re_cache: dict[tuple[str, ...], re.Pattern[str]] = {}
         #: Map id → new_text for labels renamed in `generate()`. Used by
         #: `translate()` to update the matching `msgid` in each PO.
         self._renamed_ids: dict[int, str] = {}
@@ -1287,14 +1291,22 @@ class Translate(TranslateBase):
             ))
             return f'(?:{pat})'
 
-        def rval(r, name='str'):
-            for i in range(4):
-                if (s := r[f'{name}{i+1}']) is not None:
+        # Pre-computed group name tuples — avoids 4× f-string formatting
+        # per call in the hot finditer loop.
+        _str_grp = ('str1', 'str2', 'str3', 'str4')
+        _msg_grp = ('msg1', 'msg2', 'msg3', 'msg4')
+        _gls_grp = ('gls_text1', 'gls_text2', 'gls_text3', 'gls_text4')
+
+        def rval(r, groups=_str_grp):
+            for g in groups:
+                s = r[g]
+                if s is not None:
                     return s
 
-        def rstart(r, name='str'):
-            for i in range(4):
-                if (s := r.start(f'{name}{i+1}')) != -1:
+        def rstart(r, groups=_str_grp):
+            for g in groups:
+                s = r.start(g)
+                if s != -1:
                     return s
 
         _R_CM = r'#[^\S\r\n]*(?P<comment>[^\r\n]+)'
@@ -1308,13 +1320,17 @@ class Translate(TranslateBase):
         if gls_funcs:
             ff = '|'.join(fr'(?:{f})' for f in gls_funcs)
             pat += fr'|\b(?P<gls_func>{ff})\s*\(\s*(?P<gls>(?:(?P<gls_id>\d+)|{rstr("gls_text")}))\s*[),]'
-        R = re.compile(pat)
+        cache_key = tuple(f.pattern for f in gls_funcs)
+        R = self._replace_py_re_cache.get(cache_key)
+        if R is None:
+            R = re.compile(pat)
+            self._replace_py_re_cache[cache_key] = R
         for r in R.finditer(data):
             if r['comment'] is not None:  # skip comments
                 continue
             label: Label | None = None
             tr = None
-            s, msg = rval(r), rval(r, 'msg')
+            s, msg = rval(r), rval(r, _msg_grp)
             sstart = rstart(r)
             # L()
             if msg is not None:
@@ -1342,7 +1358,7 @@ class Translate(TranslateBase):
             elif r['gls'] is not None:
                 mid = r['gls_id']
                 func = r['gls_func']
-                text = rval(r, 'gls_text')
+                text = rval(r, _gls_grp)
                 logger.debug(f'  found func {func!r}, id {mid}, text {text!r}')
                 if mid is not None:
                     # Numeric reference (e.g. getLocalizedString(123)) — only
@@ -1391,8 +1407,13 @@ class Translate(TranslateBase):
         if not path.exists():
             logger.warning('Path does not exist: {!r}, skipping.'.format(str(path)))
         elif path.is_dir():
+            # `path.glob` returns absolute paths starting with `path`, and
+            # `skip` was resolved to absolute paths in `load_addon` — so a
+            # lexical `is_relative_to` is enough; avoid `resolve()` per file
+            # (each `resolve()` does lstat per path component, and this loop
+            # easily sees thousands of files).
             for p in chain(path.glob('**/*.xml'), path.glob('**/*.py')):
-                if any(p.resolve().is_relative_to(s) for s in skip):
+                if skip and any(p.is_relative_to(s) for s in skip):
                     pass
                 elif not self._is_git_tracked(p):
                     logger.debug(f'Skipping non-tracked: {p}')
