@@ -41,7 +41,7 @@ logger = logging.getLogger('kolang')
 
 
 __author__ = 'rysson'
-__version__ = '0.2.1'
+__version__ = '0.2.2'
 
 
 # Monkey Patching
@@ -1814,16 +1814,16 @@ class Translate(TranslateBase):
         logger.debug(f'Reading config {path}')
         with open(path, encoding='utf8') as f:
             conf = json.load(f)
-        options = conf.get('options', {})
+        options = dict(conf.get('options', {}))
         for attr in ('id-from', 'id-min', 'id-max', 'id-policy', 'mark-translated',
                      'backup-pattern', 'addon-id', 'po-wrap-width', 'encoding', 'multi-line-msg',
                      'git-only', 'extra-translate-attrs', 'extra-translate-tags', 'rename'):
-            if attr in options:
-                setattr(self, attr.replace('-', '_'), options[attr])
+            if (val := options.pop(attr, None)) is not None:
+                setattr(self, attr.replace('-', '_'), val)
         # python-tags/python-attrs additively extend defaults (set semantics).
-        for tag in options.get('python-tags', ()):
+        for tag in options.pop('python-tags', ()):
             self.python_tags.add(tag)
-        for entry in options.get('python-attrs', ()):
+        for entry in options.pop('python-attrs', ()):
             if isinstance(entry, str):
                 self.python_attrs.add((None, entry))
             elif isinstance(entry, dict):
@@ -1836,12 +1836,13 @@ class Translate(TranslateBase):
                 else:
                     for tag in tags:
                         self.python_attrs.add((tag, name))
-        if (val := options.get('mark-obsoleted')) is not None:
+        if (val := options.pop('mark-obsoleted', None)) is not None:
+            logger.warning('Option "mark-obsoleted" is deprecated, use "obsolete" instead')
             self.obsolete = ObsoleteAction.MARK if val else ObsoleteAction.KEEP
-        if val := options.get('obsolete'):
+        if val := options.pop('obsolete', None):
             self.obsolete = ObsoleteAction(val)
-        if 'get-localized-string' in options:
-            self.handle_getLocalizedString = options['get-localized-string']
+        if (val := options.pop('get-localized-string', None)) is not None:
+            self.handle_getLocalizedString = bool(val)
         paths = []
         for source in conf.get('sources', []):
             if isinstance(source, str):
@@ -1873,6 +1874,8 @@ class Translate(TranslateBase):
                 l8funcs.append(L8Func(re.escape(name), paths=l8paths(fitem.get('path'))))
         result = AddonConf(id=addon_id, paths=paths, langs=langs, skip=skip, l8funcs=l8funcs)
         self._config_cache[key] = result
+        if options:
+            logger.warning(f'Unknown config options in {path}: {", ".join(sorted(options.keys()))}')
         return result
 
     def load_addon(self, path, *, skip: set[Path] = set(), l8funcs: list[L8Func] | None = None) -> None:
