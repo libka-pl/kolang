@@ -165,7 +165,7 @@ class LabelGetter:
     def _apply_plural(self, text: str, n: int | None, **kwargs) -> str:
         """Apply locale's plural rule and format with `n` + kwargs."""
         if n is None:
-            return text
+            return text.format(**kwargs) if kwargs else text
         try:
             from simpleeval import SimpleEval
         except ModuleNotFoundError:
