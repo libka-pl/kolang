@@ -507,6 +507,11 @@ class Label:
     trans: list[Trans] = field(default_factory=list)
     ref: Label | None = None
 
+    @property
+    def referenced(self) -> bool:
+        """True if any source uses the label (XML node or python L() occurrence)."""
+        return bool(self.nodes or self.trans)
+
 
 class LabelList(list[Label]):
     """Just list with smart label add."""
@@ -1478,8 +1483,8 @@ class Translate(TranslateBase):
                 # non-empty text and an id — defensively narrow types here.
                 if L1.id is None or L1.text is None:
                     continue
-                if L1.nodes:
-                    continue                  # 'old' still referenced
+                if L1.referenced:
+                    continue                  # 'old' still referenced, it's a collision, not an edit
                 if not (self.obsolete is ObsoleteAction.REMOVE
                         or L1.id not in self._translated_ids):
                     continue                  # translation worth preserving
@@ -1684,7 +1689,7 @@ class Translate(TranslateBase):
                 if not label.text:
                     comment.append('[empty]')
                 msgstr = ''
-                if label.ref is not None and label.ref.id in ie:
+                if label.ref is not None and not label.ref.referenced and label.ref.id in ie:  # edited text, not a collision
                     msgstr = ie[label.ref.id].msgstr
                 entry = polib.POEntry(
                     msgctxt=f'#{label.id}',
