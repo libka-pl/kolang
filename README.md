@@ -51,6 +51,10 @@ Translations are checked on each run (warning only): number of `|||` forms
 must match `nplurals` of the language (`Plural-Forms` header), placeholders
 `{name}` must be the same as in `msgid`. Entries with placeholders get the
 `#, python-brace-format` flag, so `msgfmt -c` and PO editors check them too.
+Plural entries get a `#. 3 plural forms separated by |||` comment with the
+form count of the language. New and existing PO files get the header comment
+like Kodi addons have (`# Kodi Media Center language file`, addon name, id,
+provider) if it is missing.
 Review list without gettext tools: `kolang --dry-run --list fuzzy --list untranslated .`
 
 Edited text keeps its ID. An existing translation is kept but marked

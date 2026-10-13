@@ -67,7 +67,7 @@ def test_python_brace_format_flag(pl: Path, kolang_run) -> None:
     text = pl.read_text(encoding='utf-8')
     assert '#, python-brace-format\nmsgctxt "#30101"\nmsgid "Error: {e}"' in text
     assert '#, python-brace-format\nmsgctxt "#30102"\nmsgid "one|||{n} items"' in text
-    assert '\n\nmsgctxt "#30100"\nmsgid "file|||files"' in text
+    assert 'python-brace-format\nmsgctxt "#30100"' not in text
     en = pl.parent.parent / 'resource.language.en_gb' / 'strings.po'
     assert '#, python-brace-format\nmsgctxt "#30101"' in en.read_text(encoding='utf-8')
 
@@ -94,3 +94,16 @@ def test_list_fuzzy_and_untranslated(addon: Path, pl: Path, kolang_run) -> None:
     assert 'en_GB untranslated' not in out
     assert "'file|||files'" not in out
     assert 'Error: {e}' in pl.read_text(encoding='utf-8')   # dry run: nothing written
+
+
+def test_plural_form_count_comment(pl: Path, kolang_run) -> None:
+    """Plural entries get `#.` comment with the language's form count, others don't; idempotent."""
+    assert kolang_run()[0] == 0
+    text = pl.read_text(encoding='utf-8')
+    assert '#. 3 plural forms separated by |||\nmsgctxt "#30100"\nmsgid "file|||files"' in text
+    assert '#. 3 plural forms separated by |||\n#, python-brace-format\nmsgctxt "#30102"' in text
+    assert text.count('plural forms') == 2
+    en = pl.parent.parent / 'resource.language.en_gb' / 'strings.po'
+    assert '#. 2 plural forms separated by |||\nmsgctxt "#30100"' in en.read_text(encoding='utf-8')
+    assert kolang_run()[0] == 0
+    assert pl.read_text(encoding='utf-8') == text

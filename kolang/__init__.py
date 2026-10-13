@@ -652,6 +652,7 @@ class Translate(TranslateBase):
     LANG_NAMES = {TranslateBase.lang_code(p.code): re.sub(r'\s*\[.*?\]', '', p.name) for p in plural_forms}
 
     _RE_LABEL_NUM = re.compile(r'#(?P<id>\d+)')
+    _RE_PLURAL_NOTE = re.compile(r'\d+ plural forms? separated by \|\|\|')
     _RE_READ_PO = re.compile(r'(?:^|\n)(?P<var>(?:msgctxt|msgid|msgstr))[ \t]*'
                              r'(?:[ \t]*[\n]"(?P<val>(?:\\.|[^"])*))+"')
     _RE_PO_VAL = re.compile(r'\s*"((?:\\.|[^"])*)"')
@@ -719,6 +720,10 @@ class Translate(TranslateBase):
         self.po_header: dict[str, str] = {}
         #: PO header fields from addon.xml (provider, email).
         self._addon_header: dict[str, str] = {}
+        #: PO header comment (like Kodi addons have), addon info from addon.xml.
+        self._header_comment: str = 'Kodi Media Center language file'
+        #: addon.xml read for the PO header (once, the first addon).
+        self._addon_header_loaded: bool = False
         self.stats = stats
         self.handle_getLocalizedString = handle_getLocalizedString
         #: Lowest avaliable ID.
@@ -1709,10 +1714,14 @@ class Translate(TranslateBase):
         """Return placeholder names of `str.format()` in `text`, raise ValueError on broken format."""
         return {re.split(r'[.\[]', name)[0] for _, name, _, _ in string.Formatter().parse(text) if name is not None}
 
+    def _nplurals(self, lang: str, po: polib.POFile) -> int:
+        """Return number of plural forms of the language (PO header, kolang table), 0 if unknown."""
+        rule = po.metadata.get('Plural-Forms') or self.PLURAL_FORMS.get(lang, self.DEF_PLURAL_FORMS)
+        return int(mch[1]) if (mch := re.search(r'nplurals\s*=\s*(\d+)', rule)) else 0
+
     def _check_translations(self, lang: str, path: Path, po: polib.POFile) -> None:
         """Warn on translations broken at runtime: wrong number of `|||` forms, placeholders other than in msgid."""
-        rule = po.metadata.get('Plural-Forms') or self.PLURAL_FORMS.get(lang, self.DEF_PLURAL_FORMS)
-        nplurals = int(mch[1]) if (mch := re.search(r'nplurals\s*=\s*(\d+)', rule)) else 0
+        nplurals = self._nplurals(lang, po)
         for entry in po:
             if entry.obsolete or not entry.msgstr:
                 continue
@@ -1751,12 +1760,8 @@ class Translate(TranslateBase):
             po = polib.pofile(path, wrapwidth=self.po_wrap_width)
         else:
             po = polib.POFile(wrapwidth=self.po_wrap_width)
-            po.metadata_args = {
-                'tcomment': ('Kodi Media Center language file'
-                             '\nAddon Name: {addon.name}'
-                             '\nAddon id: {addon.id}'
-                             '\nAddon Provider: {addon.provider}'),
-            }
+        if not po.header.strip():
+            po.header = self._header_comment
         # Missing header fields (also in existing files, Kodi ignores the header, msgfmt and PO editors need it):
         # .kolang.json `po-header`, addon.xml, defaults.
         header = {
@@ -1857,6 +1862,14 @@ class Translate(TranslateBase):
                 entry.flags.append('python-brace-format')
             elif not has_fields and 'python-brace-format' in entry.flags:
                 entry.flags.remove('python-brace-format')
+        # `#.` comment for translators on plural entries (kolang line is replaced, the rest of the comment kept)
+        nplurals = self._nplurals(lang, po)
+        plural_note = f'{nplurals} plural form{"s" if nplurals != 1 else ""} separated by |||'
+        for entry in po:
+            lines = [ln for ln in entry.comment.split('\n') if ln and not self._RE_PLURAL_NOTE.fullmatch(ln)]
+            if nplurals and '|||' in entry.msgid and not entry.obsolete:
+                lines.append(plural_note)
+            entry.comment = '\n'.join(lines)
         self._check_translations(lang, path, po)
         for entry in po:
             if entry.obsolete or not entry.msgctxt:
@@ -1902,7 +1915,10 @@ class Translate(TranslateBase):
             atree = etree.parse(str(path / 'addon.xml'))
             aroot = atree.getroot()
             if aroot.tag == 'addon':
-                if not self._addon_header:
+                if not self._addon_header_loaded:
+                    self._addon_header_loaded = True
+                    info = {'Addon Name': aroot.get('name'), 'Addon id': aroot.get('id'), 'Addon Provider': aroot.get('provider-name')}
+                    self._header_comment += ''.join(f'\n{k}: {v}' for k, v in info.items() if v)
                     meta = './/extension[@point="xbmc.addon.metadata"]/'
                     provider, email = aroot.get('provider-name'), aroot.findtext(f'{meta}email')
                     if provider:

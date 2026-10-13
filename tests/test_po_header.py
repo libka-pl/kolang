@@ -63,3 +63,22 @@ def test_header_from_addon_xml_and_config(addon: Path, pl: Path, kolang_run) -> 
     assert h['Last-Translator'] == 't <dev@t.org>'
     assert h['Report-Msgid-Bugs-To'] == 'dev@t.org'
     assert h['Language-Team'] == 'Team Polish'
+
+
+def test_header_comment(addon: Path, pl: Path, kolang_run) -> None:
+    """Header comment like Kodi addons have, added if missing, existing one kept."""
+    assert kolang_run()[0] == 0
+    assert pl.read_text(encoding='utf-8').startswith(
+        '# Kodi Media Center language file\n# Addon Name: t\n# Addon id: t.test\n# Addon Provider: t\nmsgid ""\n')
+    pl.write_text(pl.read_text(encoding='utf-8').replace('# Addon Name: t\n', ''), encoding='utf-8')
+    assert kolang_run()[0] == 0
+    assert pl.read_text(encoding='utf-8').startswith('# Kodi Media Center language file\n# Addon id: t.test\n')
+
+
+def test_header_comment_no_provider(addon: Path, pl: Path, kolang_run) -> None:
+    """Addon without provider-name: no provider line."""
+    xml = addon / 'addon.xml'
+    xml.write_text(xml.read_text(encoding='utf-8').replace(' provider-name="t"', ''), encoding='utf-8')
+    rc, out = kolang_run()
+    assert rc == 0, out
+    assert pl.read_text(encoding='utf-8').startswith('# Kodi Media Center language file\n# Addon Name: t\n# Addon id: t.test\nmsgid ""\n')
