@@ -1695,6 +1695,38 @@ class Translate(TranslateBase):
         entry.previous_msgid = previous_msgid or old_msgid
         entry.fuzzy = True
 
+    @staticmethod
+    def _format_fields(text: str) -> set[str]:
+        """Return placeholder names of `str.format()` in `text`, raise ValueError on broken format."""
+        return {re.split(r'[.\[]', name)[0] for _, name, _, _ in string.Formatter().parse(text) if name is not None}
+
+    def _check_translations(self, lang: str, path: Path, po: polib.POFile) -> None:
+        """Warn on translations broken at runtime: wrong number of `|||` forms, placeholders other than in msgid."""
+        rule = po.metadata.get('Plural-Forms') or self.PLURAL_FORMS.get(lang, self.DEF_PLURAL_FORMS)
+        nplurals = int(mch[1]) if (mch := re.search(r'nplurals\s*=\s*(\d+)', rule)) else 0
+        for entry in po:
+            if entry.obsolete or not entry.msgstr:
+                continue
+            where = f'{path}: {entry.msgctxt} {entry.msgid!r}'
+            if nplurals and '|||' in entry.msgid and (count := entry.msgstr.count('|||') + 1) != nplurals:
+                logger.warning(f'{where}: {count} plural forms, {lang} needs {nplurals}')
+            try:
+                fields = self._format_fields(entry.msgstr)
+            except ValueError as exc:
+                logger.warning(f'{where}: invalid format in {entry.msgstr!r}: {exc}')
+                continue
+            try:
+                expected = self._format_fields(entry.msgid)
+            except ValueError:
+                continue  # source text is not a format string
+            problems = []
+            if extra := fields - expected:
+                problems.append(f'{" ".join(f"{{{f}}}" for f in sorted(extra))} not in msgid')
+            if missing := expected - fields:
+                problems.append(f'{" ".join(f"{{{f}}}" for f in sorted(missing))} missing')
+            if problems:
+                logger.warning(f'{where}: placeholders {", ".join(problems)}')
+
     def translate(self, lang: str, path: str | Path, *,
                   stats: GenerateStats | None = None, old_stats: GenerateStats | None) -> None:
         """Translate to `lang` and write to `path` (or `strings.po` in current dir if None)."""
@@ -1799,6 +1831,7 @@ class Translate(TranslateBase):
                              and int(mch.group('id')) in self._moved_ids)]
             for i in reversed(to_remove):
                 del po[i]
+        self._check_translations(lang, path, po)
         if self.stats:
             N = len(po)
             ob = len(set(self._by_id) - self._ids)
