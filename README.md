@@ -458,6 +458,13 @@ Notes:
   scanning (in addition to the built-ins listed above). Each `python-attrs`
   entry is either a bare string (global, any tag) or
   `{"name": "...", "tags": [...]}` (limited to the listed tags).
+* `options.po-header` — PO header fields, e.g.
+  `{"Last-Translator": "Me <me@x.org>", "Language-Team": "{language} team"}`
+  (`{language}` is the language name). Missing header fields are added to
+  new and existing PO files (existing values are kept) from: this option,
+  `addon.xml` (`provider-name`, `<email>`, `<source>`), defaults
+  (`Language-Team` is the language name). Kodi ignores the header, it's for
+  `msgfmt` and PO editors.
 
 ---
 

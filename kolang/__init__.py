@@ -648,6 +648,8 @@ class Translate(TranslateBase):
     # - https://doc.qt.io/archives/qq/qq19-plurals.html
     # - http://docs.translatehouse.org/projects/localization-guide/en/latest/l10n/pluralforms.html
     PLURAL_FORMS = {TranslateBase.lang_code(p.code): p.forms for p in plural_forms}
+    #: Language names (for `Language-Team`), without notes like "[1]".
+    LANG_NAMES = {TranslateBase.lang_code(p.code): re.sub(r'\s*\[.*?\]', '', p.name) for p in plural_forms}
 
     _RE_LABEL_NUM = re.compile(r'#(?P<id>\d+)')
     _RE_READ_PO = re.compile(r'(?:^|\n)(?P<var>(?:msgctxt|msgid|msgstr))[ \t]*'
@@ -713,6 +715,10 @@ class Translate(TranslateBase):
         self.dump_translations = dump_translations
         #: Entries to list per language: 'fuzzy', 'untranslated'.
         self.list_entries: set[str] = set(list_entries)
+        #: PO header fields from config (`po-header`), `{language}` is replaced by the language name.
+        self.po_header: dict[str, str] = {}
+        #: PO header fields from addon.xml (provider, email).
+        self._addon_header: dict[str, str] = {}
         self.stats = stats
         self.handle_getLocalizedString = handle_getLocalizedString
         #: Lowest avaliable ID.
@@ -1745,25 +1751,32 @@ class Translate(TranslateBase):
             po = polib.pofile(path, wrapwidth=self.po_wrap_width)
         else:
             po = polib.POFile(wrapwidth=self.po_wrap_width)
-            po.metadata = {
-                'Project-Id-Version': '1.0',
-                'Report-Msgid-Bugs-To': 'dev@kodi-pl.net',
-                'POT-Creation-Date': f'{now:%Y-%m-%d %H:%M:%S%z}',
-                'PO-Revision-Date': f'{now:%Y-%m-%d %H:%M:%S%z}',
-                'Last-Translator': 'KodiPL Team <dev@kodi-pl.net>',
-                # 'Language-Team': 'English <yourteam@example.com>',
-                'Language': lang,
-                'MIME-Version': '1.0',
-                'Content-Type': 'text/plain; charset=utf-8',
-                'Content-Transfer-Encoding': '8bit',
-                'Plural-Forms': self.PLURAL_FORMS.get(lang, self.DEF_PLURAL_FORMS),
-            }
             po.metadata_args = {
                 'tcomment': ('Kodi Media Center language file'
                              '\nAddon Name: {addon.name}'
                              '\nAddon id: {addon.id}'
                              '\nAddon Provider: {addon.provider}'),
             }
+        # Missing header fields (also in existing files, Kodi ignores the header, msgfmt and PO editors need it):
+        # .kolang.json `po-header`, addon.xml, defaults.
+        header = {
+            'Project-Id-Version': '1.0',
+            'Report-Msgid-Bugs-To': 'dev@kodi-pl.net',
+            'POT-Creation-Date': f'{now:%Y-%m-%d %H:%M:%S%z}',
+            'PO-Revision-Date': f'{now:%Y-%m-%d %H:%M:%S%z}',
+            'Last-Translator': 'KodiPL Team <dev@kodi-pl.net>',
+            'Language-Team': '{language}',
+            'Language': lang,
+            'MIME-Version': '1.0',
+            'Content-Type': 'text/plain; charset=utf-8',
+            'Content-Transfer-Encoding': '8bit',
+            'Plural-Forms': self.PLURAL_FORMS.get(lang, self.DEF_PLURAL_FORMS),
+            **self._addon_header,
+            **self.po_header,
+        }
+        for key, value in header.items():
+            if not po.metadata.get(key):
+                po.metadata[key] = str(value).replace('{language}', self.LANG_NAMES.get(lang, lang))
         ie = {int(r['id']): e for e in po if (r := self._RE_LABEL_NUM.fullmatch(e.msgctxt or '')) is not None}
         # Apply in-place renames: existing entries whose label was reused for
         # a new text (because old text became unreferenced).
@@ -1889,6 +1902,13 @@ class Translate(TranslateBase):
             atree = etree.parse(str(path / 'addon.xml'))
             aroot = atree.getroot()
             if aroot.tag == 'addon':
+                if not self._addon_header:
+                    meta = './/extension[@point="xbmc.addon.metadata"]/'
+                    provider, email = aroot.get('provider-name'), aroot.findtext(f'{meta}email')
+                    if provider:
+                        self._addon_header['Last-Translator'] = f'{provider} <{email}>' if email else provider
+                    if bugs := email or aroot.findtext(f'{meta}source'):
+                        self._addon_header['Report-Msgid-Bugs-To'] = bugs
                 return aroot.get('id')
         return None
 
@@ -1948,7 +1968,7 @@ class Translate(TranslateBase):
         options = dict(conf.get('options', {}))
         for attr in ('id-from', 'id-min', 'id-max', 'id-policy', 'mark-translated',
                      'backup-pattern', 'addon-id', 'po-wrap-width', 'encoding', 'multi-line-msg',
-                     'git-only', 'extra-translate-attrs', 'extra-translate-tags', 'rename'):
+                     'git-only', 'extra-translate-attrs', 'extra-translate-tags', 'rename', 'po-header'):
             if (val := options.pop(attr, None)) is not None:
                 setattr(self, attr.replace('-', '_'), val)
         # python-tags/python-attrs additively extend defaults (set semantics).
