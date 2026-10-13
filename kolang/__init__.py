@@ -45,23 +45,6 @@ __author__ = 'rysson'
 __version__ = '0.2.2'
 
 
-# Monkey Patching
-
-def _BaseFile_metadata_as_entry(self):
-    entry = _real_BaseFile_metadata_as_entry(self)
-    try:
-        comment = self.metadata_comment
-    except AttributeError:
-        pass
-    else:
-        entry.comment = comment
-    return entry
-
-
-_real_BaseFile_metadata_as_entry = polib._BaseFile.metadata_as_entry
-polib._BaseFile.metadata_as_entry = _BaseFile_metadata_as_entry
-
-
 @dataclass(frozen=True)
 class GenerateStats:
     new: int
