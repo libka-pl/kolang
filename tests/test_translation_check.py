@@ -80,3 +80,17 @@ def test_python_brace_format_follows_text(addon: Path, pl: Path, kolang_run) -> 
     assert kolang_run()[0] == 0
     text = pl.read_text(encoding='utf-8')
     assert '#, fuzzy\n#| msgid "Error: {e}"\nmsgctxt "#30101"\nmsgid "Error"' in text, text
+
+
+def test_list_fuzzy_and_untranslated(addon: Path, pl: Path, kolang_run) -> None:
+    """`--list fuzzy --list untranslated` prints entries per language (base language has no untranslated list)."""
+    translate(pl, **{'file|||files': 'plik|||pliki|||plików', 'Error: {e}': 'Błąd: {e}'})
+    py = addon / 'resources' / 'lib' / 'main.py'
+    py.write_text(py.read_text(encoding='utf-8').replace("'Error: {e}'", "'Failure: {e}'"), encoding='utf-8')
+    rc, out = kolang_run('--dry-run', '--list', 'fuzzy', '--list', 'untranslated')
+    assert rc == 0, out
+    assert "pl_PL fuzzy #30101 'Failure: {e}' (was 'Error: {e}'): 'Błąd: {e}'" in out, out
+    assert "pl_PL untranslated #30102 'one|||{n} items'" in out, out
+    assert 'en_GB untranslated' not in out
+    assert "'file|||files'" not in out
+    assert 'Error: {e}' in pl.read_text(encoding='utf-8')   # dry run: nothing written

@@ -681,6 +681,7 @@ class Translate(TranslateBase):
                  dump_output: bool = False,
                  dump_translations: str | None = None,
                  stats: bool = True,
+                 list_entries: Sequence[str] = (),
                  id_from: int = 30100,
                  id_min: int | None = None,
                  id_max: int | None = None,
@@ -710,6 +711,8 @@ class Translate(TranslateBase):
         self.dry_run = dry_run
         self.dump_output = dump_output
         self.dump_translations = dump_translations
+        #: Entries to list per language: 'fuzzy', 'untranslated'.
+        self.list_entries: set[str] = set(list_entries)
         self.stats = stats
         self.handle_getLocalizedString = handle_getLocalizedString
         #: Lowest avaliable ID.
@@ -1842,6 +1845,14 @@ class Translate(TranslateBase):
             elif not has_fields and 'python-brace-format' in entry.flags:
                 entry.flags.remove('python-brace-format')
         self._check_translations(lang, path, po)
+        for entry in po:
+            if entry.obsolete or not entry.msgctxt:
+                continue
+            if 'fuzzy' in self.list_entries and entry.msgstr and entry.fuzzy:
+                was = f' (was {entry.previous_msgid!r})' if entry.previous_msgid else ''
+                print(f'{lang} fuzzy {entry.msgctxt} {entry.msgid!r}{was}: {entry.msgstr!r}')
+            elif 'untranslated' in self.list_entries and not entry.msgstr and lang != BASE_LANG:
+                print(f'{lang} untranslated {entry.msgctxt} {entry.msgid!r}')
         if self.stats:
             N = len(po)
             ob = len(set(self._by_id) - self._ids)
@@ -2033,7 +2044,7 @@ def unescape(text: str | None) -> str | None:
 
 def process(inputs, *, args, langs=None, output=None):
     trans = Translate(dry_run=args.dry_run, dump_output=args.debug_cat_output,
-                      dump_translations=args.debug_cat_translation,
+                      dump_translations=args.debug_cat_translation, list_entries=args.list or (),
                       id_from=args.id_from, id_min=args.id_min, id_max=args.id_max,
                       id_policy=args.id_policy, addon_id=args.addon_id,
                       handle_getLocalizedString=args.gls, backup_pattern=args.backup_pattern,
@@ -2314,6 +2325,8 @@ def main(argv=None):
     p.add_argument('--dry-run', action='store_true', help='do not modify anything')
     p.add_argument('--debug-cat-output', action='store_true', help='print output file if --dry-run')
     p.add_argument('--debug-cat-translation', metavar='LOCALE', help='print output translation if --dry-run')
+    p.add_argument('--list', action='append', choices=('fuzzy', 'untranslated'),
+                   help='list fuzzy or untranslated entries per language (repeatable), with --dry-run nothing is written')
     p.add_argument('--test-plural', help='test plural form and exit')
     p.add_argument('--generate-kolang-py', action='store_true',
                    help='generate kolang.py to use its L() in addon/plugin')

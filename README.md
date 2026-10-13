@@ -51,6 +51,7 @@ Translations are checked on each run (warning only): number of `|||` forms
 must match `nplurals` of the language (`Plural-Forms` header), placeholders
 `{name}` must be the same as in `msgid`. Entries with placeholders get the
 `#, python-brace-format` flag, so `msgfmt -c` and PO editors check them too.
+Review list without gettext tools: `kolang --dry-run --list fuzzy --list untranslated .`
 
 Edited text keeps its ID. An existing translation is kept but marked
 `#, fuzzy` with the previous text in `#| msgid "…"`; Kodi ignores the flag
@@ -373,6 +374,7 @@ Most-used options:
 | `-f FUNC`, `--localized-function FUNC` | extra L-like function name (CLI shortcut) |
 | `--get-localized-string` / `--no-get-localized-string` | toggle scanning `getLocalizedString()` |
 | `--dry-run` | do not modify anything |
+| `--list WHAT` | list `fuzzy` or `untranslated` entries per language (repeatable); with `--dry-run` it's a read-only report |
 | `--verbose` / `--debug` | more output |
 | `--generate-kolang-py` | drop `kolang.py` (the runtime `L()` helper) into the addon |
 
