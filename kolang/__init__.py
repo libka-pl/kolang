@@ -23,6 +23,7 @@ from ast import literal_eval
 import json
 import argparse
 import subprocess
+import shutil
 try:
     from lxml import etree
 except ImportError:
@@ -125,6 +126,8 @@ class XmlInput:
     base: Path
     declaration: str = None
     encoding: str = 'utf-8'
+    #: Original file content, unchanged file is not written.
+    original: bytes = field(default=b'', repr=False)
 
 
 @dataclass
@@ -132,6 +135,12 @@ class PyInput:
     path: Path
     data: str = field(repr=False)
     base: Path
+    #: Original file content, unchanged file is not written.
+    original: str = field(default='', repr=False)
+
+    def __post_init__(self) -> None:
+        """Remember original content."""
+        self.original = self.original or self.data
 
     def replace(self, fmt: str, label: Label, start: int, end: int) -> None:
         self.data = fmt.format(before=self.data[:start], after=self.data[end:], label=label)
@@ -445,6 +454,16 @@ def _git_tracked_files(repo_root: Path) -> set[Path]:
             for name in out.stdout.split(b'\x00') if name}
 
 
+def _git_clean_files(repo_root: Path) -> set[Path]:
+    """Return absolute paths of tracked files without changes against HEAD (git can restore them)."""
+    try:
+        out = subprocess.run(['git', 'diff', '--name-only', '-z', 'HEAD'], cwd=str(repo_root), capture_output=True, check=True)
+    except subprocess.CalledProcessError:  # no commit yet
+        return set()
+    changed = {(repo_root / name.decode()).resolve() for name in out.stdout.split(b'\x00') if name}
+    return _git_tracked_files(repo_root) - changed
+
+
 class ranges(tuple[range]):
 
     def __contains__(self, o: Any) -> bool:
@@ -732,6 +751,10 @@ class Translate(TranslateBase):
         self.git_only: bool = git_only
         #: Cache of git-tracked file sets, keyed by repo root.
         self._git_tracked_by_repo: dict[Path, set[Path]] = {}
+        #: Per-repo tracked files without local changes (no backup needed, git restores them).
+        self._git_clean_by_repo: dict[Path, set[Path]] = {}
+        #: Backup files were checked against .gitignore (warn once).
+        self._backup_ignore_checked: bool = False
         #: Extra XML attributes to scan for translation (added to defaults).
         self.extra_translate_attrs: list[str] = list(extra_translate_attrs or ())
         #: Extra XML element tags to scan as text-content translations.
@@ -1267,7 +1290,7 @@ class Translate(TranslateBase):
         tree = etree.parse(BytesIO(content_bytes))
         m: re.Match = self._RE_XML_DECL.match(content)
         decl: str = m and m[0]
-        self.xml_inputs.append(XmlInput(path, tree, base, declaration=decl, encoding=encoding))
+        self.xml_inputs.append(XmlInput(path, tree, base, declaration=decl, encoding=encoding, original=content_bytes))
         self._scan_xml(tree, path=path)
         return tree
 
@@ -1611,7 +1634,17 @@ class Translate(TranslateBase):
                                   base=base, addon=base, relative=relative))
             # if not bak.is_relative_to(path.parent):
             #     ValueError('Backup path {bak} is outsiede of source {path}')
+            root = _git_root(path) if shutil.which('git') else None
+            if root is not None:
+                if root not in self._git_clean_by_repo:
+                    self._git_clean_by_repo[root] = _git_clean_files(root)
+                if path in self._git_clean_by_repo[root]:
+                    return path  # git restores it, no backup
             path.rename(bak)
+            if root is not None and not self._backup_ignore_checked:
+                self._backup_ignore_checked = True
+                if subprocess.run(['git', 'check-ignore', '-q', str(bak)], cwd=str(root)).returncode == 1:
+                    logger.warning(f'Backup {bak} is not ignored by git, add its pattern to .gitignore (e.g. "*~")')
         return path
 
     def _write_xml(self, input):
@@ -1629,18 +1662,20 @@ class Translate(TranslateBase):
             def entity(m: re.Match) -> str:
                 code = ord(m[0])
                 return f'&#x{code:04x};'
-            path = self._prepare_write_target(input.path.resolve(), base=input.base)
             body = etree.tostring(input.tree, encoding=encoding, xml_declaration=False).decode(encoding)
             data = decl + body
-            data = re.sub(r'[\u2000-\u200f]', entity, data)
-            path.write_bytes(data.encode(encoding))
+            data = re.sub(r'[\u2000-\u200f]', entity, data).encode(encoding)
+            if data == input.original:
+                return
+            path = self._prepare_write_target(input.path.resolve(), base=input.base)
+            path.write_bytes(data)
 
     def _write_py(self, input):
         if self.dry_run:
             logger.debug(f'Write py:  {input.path.resolve()}')
             if self.dump_output:
                 print(input.data)
-        else:
+        elif input.data != input.original:
             path = self._prepare_write_target(input.path.resolve(), base=input.base)
             with open(path, 'w', encoding=self.encoding, newline='') as f:
                 f.write(input.data)

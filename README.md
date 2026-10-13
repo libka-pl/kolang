@@ -42,7 +42,10 @@ What kolang does on each run:
 4. Adds documentation comments next to IDs in XML (so the source text stays
    visible in the markup).
 
-Idempotent: re-running on unchanged sources changes nothing.
+Idempotent: re-running on unchanged sources changes nothing. Only changed
+files are written. A changed file gets a backup (`{}~` by default) unless it
+is tracked by git without local changes (git can restore it); a warning is
+printed if the backup is not ignored by git.
 
 Edited text keeps its ID. An existing translation is kept but marked
 `#, fuzzy` with the previous text in `#| msgid "…"`; Kodi ignores the flag
