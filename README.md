@@ -49,7 +49,8 @@ printed if the backup is not ignored by git.
 
 Translations are checked on each run (warning only): number of `|||` forms
 must match `nplurals` of the language (`Plural-Forms` header), placeholders
-`{name}` must be the same as in `msgid`.
+`{name}` must be the same as in `msgid`. Entries with placeholders get the
+`#, python-brace-format` flag, so `msgfmt -c` and PO editors check them too.
 
 Edited text keeps its ID. An existing translation is kept but marked
 `#, fuzzy` with the previous text in `#| msgid "…"`; Kodi ignores the flag

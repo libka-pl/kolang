@@ -58,3 +58,25 @@ def test_broken_format(pl: Path, kolang_run) -> None:
     rc, out = kolang_run()
     assert rc == 0, out
     assert "'Error: {e}': invalid format" in out, out
+
+
+def test_python_brace_format_flag(pl: Path, kolang_run) -> None:
+    """Entries with placeholders get `python-brace-format` (msgfmt -c and PO editors check them), others don't."""
+    translate(pl, **{'file|||files': 'plik|||pliki|||plików'})
+    assert kolang_run()[0] == 0
+    text = pl.read_text(encoding='utf-8')
+    assert '#, python-brace-format\nmsgctxt "#30101"\nmsgid "Error: {e}"' in text
+    assert '#, python-brace-format\nmsgctxt "#30102"\nmsgid "one|||{n} items"' in text
+    assert '\n\nmsgctxt "#30100"\nmsgid "file|||files"' in text
+    en = pl.parent.parent / 'resource.language.en_gb' / 'strings.po'
+    assert '#, python-brace-format\nmsgctxt "#30101"' in en.read_text(encoding='utf-8')
+
+
+def test_python_brace_format_follows_text(addon: Path, pl: Path, kolang_run) -> None:
+    """Flag is removed when edited text has no placeholders anymore, fuzzy stays."""
+    translate(pl, **{'Error: {e}': 'Błąd: {e}'})
+    py = addon / 'resources' / 'lib' / 'main.py'
+    py.write_text(py.read_text(encoding='utf-8').replace("'Error: {e}', e=1", "'Error'"), encoding='utf-8')
+    assert kolang_run()[0] == 0
+    text = pl.read_text(encoding='utf-8')
+    assert '#, fuzzy\n#| msgid "Error: {e}"\nmsgctxt "#30101"\nmsgid "Error"' in text, text

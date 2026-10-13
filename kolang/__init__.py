@@ -1831,6 +1831,16 @@ class Translate(TranslateBase):
                              and int(mch.group('id')) in self._moved_ids)]
             for i in reversed(to_remove):
                 del po[i]
+        for entry in po:
+            # placeholders in msgid → msgfmt -c and PO editors check them in translations
+            try:
+                has_fields = bool(self._format_fields(entry.msgid))
+            except ValueError:
+                has_fields = False
+            if has_fields and 'python-brace-format' not in entry.flags:
+                entry.flags.append('python-brace-format')
+            elif not has_fields and 'python-brace-format' in entry.flags:
+                entry.flags.remove('python-brace-format')
         self._check_translations(lang, path, po)
         if self.stats:
             N = len(po)
