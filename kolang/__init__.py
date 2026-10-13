@@ -792,8 +792,13 @@ class Translate(TranslateBase):
                         # text mismatch in the same ID, force to generate new ID (or find another existing)
                         for lb in lst:
                             if lb.id is not None and lb.id != L2.id:
-                                L2.id = lb.id
-                                break
+                                # text has its own ID already, move occurrences there (not the colliding text ones)
+                                lb.nodes |= L2.nodes
+                                lb.trans.extend(L2.trans)
+                                lst.remove(L2)
+                                if used:
+                                    self._ids.add(lb.id)
+                                return lb
                         else:
                             L2.id = None  # need to generate new ID
                             L2.ref = L1
@@ -2082,6 +2087,58 @@ class ConstIncAction(argparse.Action):
             setattr(namespace, self.dest, val + self.inc)
 
 
+def merge_po(base: Path, ours: Path, theirs: Path) -> int:
+    """Merge `theirs` PO into `ours` (git merge driver: %O %A %B), return number of translation conflicts.
+
+    Entries are matched by ID (`msgctxt "#ID"`). Same ID with a different text on both sides (both branches
+    took the next free ID) is a collision: theirs entry goes to the ID its text already has in ours or gets
+    a new free ID. Run kolang after the merge, it moves the colliding source labels to that ID (by text).
+    Translations are merged 3-way against `base`; changed on both sides → ours is kept and it is a conflict.
+    """
+    def entries(po: polib.POFile) -> dict[int, polib.POEntry]:
+        """Return entries with ID."""
+        return {int(r['id']): e for e in po if (r := Translate._RE_LABEL_NUM.fullmatch(e.msgctxt or '')) is not None}
+
+    def merge_msgstr(e: polib.POEntry, t: polib.POEntry, b: polib.POEntry | None) -> int:
+        """Merge theirs msgstr into ours entry (same text), return 1 on conflict."""
+        old = b.msgstr if b is not None and b.msgid == e.msgid else ''
+        if t.msgstr in (e.msgstr, '', old):
+            return 0
+        if e.msgstr in ('', old):
+            e.msgstr = t.msgstr
+            return 0
+        print(f'{ours}: {e.msgctxt} {e.msgid!r}: translation conflict, ours {e.msgstr!r} kept, theirs {t.msgstr!r}',
+              file=sys.stderr)
+        return 1
+
+    polib._BaseEntry.SPLIT_LINES = False
+    po_base, po_ours, po_theirs = (polib.pofile(str(p), wrapwidth=999999) for p in (base, ours, theirs))
+    b_ids, o_ids, t_ids = entries(po_base), entries(po_ours), entries(po_theirs)
+    o_text = {e.msgid: e for e in o_ids.values()}
+    # ponytail: new IDs are max+1, same in every language as long as all PO files have the same IDs (kolang writes them so)
+    free = max(o_ids.keys() | t_ids.keys(), default=0) + 1
+    conflicts = 0
+    for mid, t in sorted(t_ids.items()):
+        e, b = o_ids.get(mid), b_ids.get(mid)
+        if e is None:
+            po_ours.append(t)
+        elif e.msgid == t.msgid:
+            conflicts += merge_msgstr(e, t, b)
+        elif b is not None and b.msgid == e.msgid:  # text edited in theirs only
+            e.msgid, e.msgstr = t.msgid, t.msgstr
+        elif b is not None and b.msgid == t.msgid:  # text edited in ours only
+            pass
+        elif (e := o_text.get(t.msgid)) is not None:  # collision, text has an ID in ours
+            conflicts += merge_msgstr(e, t, None)
+        else:  # collision, new ID for theirs text
+            t.msgctxt = f'#{free}'
+            free += 1
+            po_ours.append(t)
+            o_text[t.msgid] = t
+    po_ours.save(str(ours))
+    return conflicts
+
+
 def plural_expr(code: str) -> None:
     from simpleeval import simple_eval
     info = next(iter(p for p in plural_forms if p.code == code))
@@ -2146,8 +2203,14 @@ def main(argv=None):
     p.add_argument('--test-plural', help='test plural form and exit')
     p.add_argument('--generate-kolang-py', action='store_true',
                    help='generate kolang.py to use its L() in addon/plugin')
-    p.add_argument('input', metavar='PATH', nargs='+', type=Path, help='path XML or PY file or addon folder')
+    p.add_argument('--merge-po', nargs=3, metavar=('BASE', 'OURS', 'THEIRS'), type=Path,
+                   help='merge PO files into OURS and exit, git merge driver: "kolang --merge-po %%O %%A %%B"')
+    p.add_argument('input', metavar='PATH', nargs='*', type=Path, help='path XML or PY file or addon folder')
     args = p.parse_args(argv)
+    if args.merge_po:
+        sys.exit(1 if merge_po(*args.merge_po) else 0)
+    if not args.input:
+        p.error('the following arguments are required: PATH')
     if args.obsolete is not None:
         args.obsolete = ObsoleteAction(args.obsolete)
     # print(args); exit()

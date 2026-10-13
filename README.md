@@ -445,6 +445,30 @@ Notes:
 
 ---
 
+### Git: merging branches
+
+Every branch takes the next free ID, so two branches give the same ID to
+different texts and `strings.po` always conflicts. Register kolang as the
+merge driver for PO files (once per clone; `.gitattributes` is committed):
+
+```bash
+echo 'strings.po merge=kolang' >> .gitattributes
+git config merge.kolang.driver 'python /path/to/kolang.pyz --merge-po %O %A %B'
+```
+
+The driver merges PO by ID:
+- new entries from both sides are kept,
+- same ID with different texts (collision): theirs text goes to the ID it
+  already has, or gets a new free ID, translations are kept,
+- translations are merged 3-way; changed on both sides → ours is kept,
+  the conflict is printed and the file is left conflicted.
+
+Then resolve source conflicts (if any; usually take both sides) and run
+kolang. It moves the colliding labels in sources (`L()`, XML `L[]` comments
+and numeric attributes) to the IDs of their texts.
+
+---
+
 ### Examples
 
 #### Bare addon, first run

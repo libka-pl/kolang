@@ -80,3 +80,21 @@ def test_py_edit_still_renames(addon: Path, kolang_run, po_path: Path) -> None:
     po = po_path.read_text(encoding='utf-8')
     assert 'msgid "From main, edited"' in po
     assert 'msgid "From main"\n' not in po
+
+
+@pytest.mark.parametrize('order', ['before', 'after'])
+def test_collision_reuses_existing_id(addon: Path, kolang_run, po_path: Path, order: str) -> None:
+    """Colliding text that already has an ID in PO gets that ID, the other text keeps its own."""
+    py = addon / 'resources' / 'lib' / 'main.py'
+    py.parent.mkdir(parents=True)
+    py.write_text("from kolang import L\nm = L('From main')\no = L('X')\ns = L('Setting A')\n", encoding='utf-8')
+    assert kolang_run()[0] == 0   # 30100 From main, 30101 X, 30102 Setting A
+    lines = ["m = L(30100, 'From main')\n", "s = L(30100, 'Setting A')\n"]
+    if order == 'before':
+        lines.reverse()
+    py.write_text('from kolang import L\n' + ''.join(lines) + "o = L(30101, 'X')\n", encoding='utf-8')
+    rc, out = kolang_run()
+    assert rc == 0, out
+    src = py.read_text(encoding='utf-8')
+    assert "L(30100, 'From main')" in src, src
+    assert "L(30102, 'Setting A')" in src, src
