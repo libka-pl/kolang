@@ -1711,7 +1711,8 @@ class Translate(TranslateBase):
                     comment=' '.join(comment),
                     # occurrences=[('welcome.py', '12'), ('anotherfile.py', '34')]
                 )
-                if label.ref is not None and not label.ref.referenced and label.ref.id in ie:  # edited text, not a collision
+                # edited text, not a collision: old text is unreferenced or renamed by another edit (`#|` keeps it)
+                if label.ref is not None and (not label.ref.referenced or label.ref.id in self._renamed_ids) and label.ref.id in ie:
                     old = ie[label.ref.id]
                     self._carry_translation(entry, old.msgid, old.msgstr, old.previous_msgid)
                 po.append(entry)

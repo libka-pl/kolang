@@ -98,3 +98,23 @@ def test_collision_reuses_existing_id(addon: Path, kolang_run, po_path: Path, or
     src = py.read_text(encoding='utf-8')
     assert "L(30100, 'From main')" in src, src
     assert "L(30102, 'Setting A')" in src, src
+
+
+@pytest.mark.parametrize('msgstr', ['Zapisz', ''])
+def test_two_edits_of_one_text(addon: Path, kolang_run, po_path: Path, msgstr: str) -> None:
+    """One text edited in two places differently (neither matches PO): both are edits, both carry the translation."""
+    py = write_py(addon, "a = L('Save')\n")
+    assert kolang_run()[0] == 0
+    po_path.write_text(po_path.read_text(encoding='utf-8').replace('msgid "Save"\nmsgstr ""', f'msgid "Save"\nmsgstr "{msgstr}"'),
+                       encoding='utf-8')
+    write_py(addon, "a = L(30100, 'Save as')\nb = L(30100, 'Save file')\n")
+    rc, out = kolang_run()
+    assert rc == 0, out
+    src = py.read_text(encoding='utf-8')
+    assert "L(30100, 'Save as')" in src and "L(30101, 'Save file')" in src, src
+    po = po_path.read_text(encoding='utf-8')
+    for mid, text in ((30100, 'Save as'), (30101, 'Save file')):
+        if msgstr:
+            assert f'#, fuzzy\n#| msgid "Save"\nmsgctxt "#{mid}"\nmsgid "{text}"\nmsgstr "Zapisz"' in po, po
+        else:
+            assert f'msgctxt "#{mid}"\nmsgid "{text}"\nmsgstr ""' in po, po
