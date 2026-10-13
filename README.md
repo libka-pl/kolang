@@ -44,6 +44,12 @@ What kolang does on each run:
 
 Idempotent: re-running on unchanged sources changes nothing.
 
+Edited text keeps its ID. An existing translation is kept but marked
+`#, fuzzy` with the previous text in `#| msgid "…"`; Kodi ignores the flag
+(shows the translation), kolang counts fuzzy entries separately. Remove the
+flag and `#|` line after review. Same ID with two different texts in sources
+is a collision (not an edit): the other text gets a new ID.
+
 ---
 
 ### How translatable strings are spotted
@@ -460,8 +466,9 @@ The driver merges PO by ID:
 - new entries from both sides are kept,
 - same ID with different texts (collision): theirs text goes to the ID it
   already has, or gets a new free ID, translations are kept,
-- translations are merged 3-way; changed on both sides → ours is kept,
-  the conflict is printed and the file is left conflicted.
+- translations are merged 3-way; changed on both sides → ours is kept as
+  fuzzy with theirs in a `# theirs: …` comment, the conflict is printed but
+  the merge doesn't stop (kolang reports the fuzzy count).
 
 Then resolve source conflicts (if any; usually take both sides) and run
 kolang. It moves the colliding labels in sources (`L()`, XML `L[]` comments

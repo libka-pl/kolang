@@ -35,7 +35,7 @@ def test_edit_comment_text_renames_in_place_when_untranslated(addon, kolang_run,
     # PO has the new msgid under the same ID, no orphan.
     po = po_path.read_text(encoding='utf-8')
     assert 'msgid "blada-X"' in po
-    assert 'msgid "blada"' not in po
+    assert '\nmsgid "blada"\n' not in po
 
     # Idempotent.
     snap = xml
@@ -44,30 +44,54 @@ def test_edit_comment_text_renames_in_place_when_untranslated(addon, kolang_run,
     assert (addon / 'resources' / 'settings.xml').read_text(encoding='utf-8') == snap
 
 
-def test_edit_translated_text_assigns_new_id(addon, kolang_run, po_path):
-    """If old text has a translation, rename is refused — new ID generated."""
+def edit_translated(addon, kolang_run, po_path, msgstr, *args):
+    """Create 30100 'blada' with `msgstr`, edit text to 'blada-X', return (xml, po)."""
     write_settings(addon, '  <setting label="blada"/>')
-    rc, _ = kolang_run()
+    rc, _ = kolang_run(*args)
     assert rc == 0
-    # Translator filled msgstr.
     po = po_path.read_text(encoding='utf-8')
     po = po.replace('msgctxt "#30100"\nmsgid "blada"\nmsgstr ""',
-                    'msgctxt "#30100"\nmsgid "blada"\nmsgstr "translated"')
+                    f'msgctxt "#30100"\nmsgid "blada"\nmsgstr "{msgstr}"')
     po_path.write_text(po, encoding='utf-8')
-
     xml = (addon / 'resources' / 'settings.xml').read_text(encoding='utf-8')
     xml = xml.replace("'blada'", "'blada-X'", 1)
     (addon / 'resources' / 'settings.xml').write_text(xml, encoding='utf-8')
+    rc, out = kolang_run(*args)
+    assert rc == 0
+    assert 'fuzzy: 1' in out or msgstr == 'blada'
+    return (addon / 'resources' / 'settings.xml').read_text(encoding='utf-8'), po_path.read_text(encoding='utf-8')
 
+
+def test_edit_translated_text_keeps_id_fuzzy(addon, kolang_run, po_path):
+    """Edited translated text keeps its ID, translation becomes fuzzy with the previous msgid."""
+    xml, po = edit_translated(addon, kolang_run, po_path, 'translated')
+    assert "L[label](30100, 'blada-X')" in xml
+    assert '<setting label="30100"/>' in xml
+    assert '#, fuzzy\n#| msgid "blada"\nmsgctxt "#30100"\nmsgid "blada-X"\nmsgstr "translated"' in po
+    assert '\nmsgid "blada"\n' not in po
+
+
+def test_edit_twice_keeps_reviewed_previous_msgid(addon, kolang_run, po_path):
+    """Second edit before review keeps `#| msgid` of the text the translation was made for."""
+    xml, _ = edit_translated(addon, kolang_run, po_path, 'translated')
+    (addon / 'resources' / 'settings.xml').write_text(xml.replace("'blada-X'", "'blada-Y'", 1), encoding='utf-8')
     rc, _ = kolang_run()
     assert rc == 0
-    xml = (addon / 'resources' / 'settings.xml').read_text(encoding='utf-8')
-    # Translation preserved → new ID for the new text.
+    assert '#| msgid "blada"\nmsgctxt "#30100"\nmsgid "blada-Y"' in po_path.read_text(encoding='utf-8')
+
+
+def test_edit_copied_text_follows(addon, kolang_run, po_path):
+    """A msgstr that is a copy of msgid (base language) follows the new text, not fuzzy."""
+    _, po = edit_translated(addon, kolang_run, po_path, 'blada')
+    assert 'msgctxt "#30100"\nmsgid "blada-X"\nmsgstr "blada-X"' in po
+    assert 'fuzzy' not in po
+
+
+def test_no_rename_translated_copy_is_fuzzy(addon, kolang_run, po_path):
+    """`--no-rename`: new ID gets the old translation as fuzzy."""
+    xml, po = edit_translated(addon, kolang_run, po_path, 'translated', '--no-rename')
     assert "L[label](30101, 'blada-X')" in xml
-    assert '<setting label="30101"/>' in xml
-    po = po_path.read_text(encoding='utf-8')
-    assert 'msgid "blada"' in po       # old kept (with its translation)
-    assert 'msgid "blada-X"' in po     # new
+    assert '#, fuzzy\n#| msgid "blada"\nmsgctxt "#30101"\nmsgid "blada-X"\nmsgstr "translated"' in po
 
 
 def test_no_rename_flag_disables_rename(addon, kolang_run):

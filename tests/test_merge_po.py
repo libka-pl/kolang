@@ -45,12 +45,12 @@ def test_collision_text_known_in_ours(tmp_path: Path) -> None:
 
 
 def test_translation_3way(tmp_path: Path) -> None:
-    """Translation changed on one side wins, changed differently on both sides is a conflict (ours kept)."""
+    """Translation changed on one side wins, changed differently on both sides is a conflict (ours fuzzy, theirs in comment)."""
     base = po(_30100=('A', 'a'), _30101=('B', 'b'))
     n, out = merge(tmp_path, base, po(_30100=('A', 'a'), _30101=('B', 'b1')), po(_30100=('A', 'a2'), _30101=('B', 'b2')))
     assert n == 1
     assert 'msgid "A"\nmsgstr "a2"' in out
-    assert 'msgid "B"\nmsgstr "b1"' in out
+    assert '# theirs: b2\n#, fuzzy\nmsgctxt "#30101"\nmsgid "B"\nmsgstr "b1"' in out
 
 
 def test_text_edited_on_one_side(tmp_path: Path) -> None:

@@ -714,9 +714,6 @@ class Translate(TranslateBase):
         self.reserved_ids: ranges = reserved_ids or ranges()
         #: Moved IDs  - existings IDs if they were in reserved_ids.
         self._moved_ids: set[int] = set()
-        #: IDs that have a non-empty msgstr in any loaded PO. Used by the
-        #: rename heuristic to refuse silent renames of translated entries.
-        self._translated_ids: set[int] = set()
         #: Cache of compiled `_replace_py` regexes keyed by the tuple of
         #: GLS function patterns active for the scan (recompiling per file
         #: dominated profile traces).
@@ -1460,8 +1457,6 @@ class Translate(TranslateBase):
             else:
                 lid = int(r.group(1))
                 label = Label(lid, text)
-                if entry.msgstr:
-                    self._translated_ids.add(lid)
             self._add_label(label, used=False)
             if entry.obsolete:
                 was_obsolete += 1
@@ -1480,12 +1475,10 @@ class Translate(TranslateBase):
         For each pending new label (`label.id is None, label.ref is L1`):
           - if L1's old text has no remaining source references (`L1.nodes`
             empty),
-          - and the old ID would be discarded anyway (`--obsolete=remove`)
-            or has no translation in any loaded PO,
           - and the new text isn't already claimed by another concrete ID,
           then take L1's ID for the new text instead of generating a new one.
         Renames are recorded in `_renamed_ids` so `translate()` can update
-        the matching `msgid` in each language PO.
+        the matching `msgid` in each language PO (translation becomes fuzzy).
         """
         for new_text, lst in list(self._by_text.items()):
             for label in list(lst):
@@ -1498,9 +1491,6 @@ class Translate(TranslateBase):
                     continue
                 if L1.referenced:
                     continue                  # 'old' still referenced, it's a collision, not an edit
-                if not (self.obsolete is ObsoleteAction.REMOVE
-                        or L1.id not in self._translated_ids):
-                    continue                  # translation worth preserving
                 # Don't rename onto a text that already has its own concrete ID.
                 if any(lb.id is not None and lb is not label for lb in lst):
                     continue
@@ -1652,6 +1642,21 @@ class Translate(TranslateBase):
             with open(path, 'w', encoding=self.encoding, newline='') as f:
                 f.write(input.data)
 
+    @staticmethod
+    def _carry_translation(entry: polib.POEntry, old_msgid: str, old_msgstr: str, previous_msgid: str | None) -> None:
+        """Carry translation of edited text `old_msgid` to `entry` as fuzzy with `#| msgid` (the last reviewed text).
+
+        A copy of the text (base language, `--mark-translated`) is not a translation, it follows the new text.
+        """
+        if not old_msgstr:
+            return
+        if old_msgstr == old_msgid:
+            entry.msgstr = entry.msgid
+            return
+        entry.msgstr = old_msgstr
+        entry.previous_msgid = previous_msgid or old_msgid
+        entry.fuzzy = True
+
     def translate(self, lang: str, path: str | Path, *,
                   stats: GenerateStats | None = None, old_stats: GenerateStats | None) -> None:
         """Translate to `lang` and write to `path` (or `strings.po` in current dir if None)."""
@@ -1688,30 +1693,27 @@ class Translate(TranslateBase):
             }
         ie = {int(r['id']): e for e in po if (r := self._RE_LABEL_NUM.fullmatch(e.msgctxt or '')) is not None}
         # Apply in-place renames: existing entries whose label was reused for
-        # a new text (because old text became unreferenced and untranslated /
-        # `--obsolete=remove`). Update the msgid; msgstr stays — empty by
-        # the rename precondition (or wiped by remove afterwards).
+        # a new text (because old text became unreferenced).
         for old_id, new_text in self._renamed_ids.items():
             entry = ie.get(old_id)
             if entry is not None and entry.msgid != new_text:
-                entry.msgid = new_text
+                old_msgid, entry.msgid = entry.msgid, new_text
+                self._carry_translation(entry, old_msgid, entry.msgstr, entry.previous_msgid)
         for label in self._by_id.values():
             assert label.id is not None
             if label.id not in ie:
                 comment = []
                 if not label.text:
                     comment.append('[empty]')
-                msgstr = ''
-                if label.ref is not None and not label.ref.referenced and label.ref.id in ie:  # edited text, not a collision
-                    msgstr = ie[label.ref.id].msgstr
                 entry = polib.POEntry(
                     msgctxt=f'#{label.id}',
                     msgid=label.text or f'#{label.id}',
-                    # msgstr=label.text or '',
-                    msgstr=msgstr,
                     comment=' '.join(comment),
                     # occurrences=[('welcome.py', '12'), ('anotherfile.py', '34')]
                 )
+                if label.ref is not None and not label.ref.referenced and label.ref.id in ie:  # edited text, not a collision
+                    old = ie[label.ref.id]
+                    self._carry_translation(entry, old.msgid, old.msgstr, old.previous_msgid)
                 po.append(entry)
         # fake translate: copy all EN entries as translated texts
         if self.mark_translated:
@@ -1754,7 +1756,10 @@ class Translate(TranslateBase):
                 nw = f', new: {stats.new}'
                 if stats.moved:
                     mv = f', moved: {stats.moved}'
-            tr = sum(1 for e in po if e.msgstr)
+            tr = sum(1 for e in po if e.msgstr and not e.fuzzy)
+            fz = sum(1 for e in po if e.msgstr and e.fuzzy)
+            if fz:
+                mv += f', fuzzy: {fz}'
             if lang == 'en_GB':  # base language (no translation needed)
                 print(f'Language {lang}: translated: ---- ({tr}/{N}), obsolete: {ob}{nw}{mv}')
             else:
@@ -2101,22 +2106,25 @@ def merge_po(base: Path, ours: Path, theirs: Path) -> int:
     Entries are matched by ID (`msgctxt "#ID"`). Same ID with a different text on both sides (both branches
     took the next free ID) is a collision: theirs entry goes to the ID its text already has in ours or gets
     a new free ID. Run kolang after the merge, it moves the colliding source labels to that ID (by text).
-    Translations are merged 3-way against `base`; changed on both sides → ours is kept and it is a conflict.
+    Translations are merged 3-way against `base`; changed on both sides → conflict: ours is kept as fuzzy
+    with theirs in a translator comment (the merge doesn't stop, kolang counts fuzzy entries).
     """
     def entries(po: polib.POFile) -> dict[int, polib.POEntry]:
         """Return entries with ID."""
         return {int(r['id']): e for e in po if (r := Translate._RE_LABEL_NUM.fullmatch(e.msgctxt or '')) is not None}
 
     def merge_msgstr(e: polib.POEntry, t: polib.POEntry, b: polib.POEntry | None) -> int:
-        """Merge theirs msgstr into ours entry (same text), return 1 on conflict."""
+        """Merge theirs msgstr into ours entry (same text), return 1 on conflict (ours fuzzy, theirs in comment)."""
         old = b.msgstr if b is not None and b.msgid == e.msgid else ''
         if t.msgstr in (e.msgstr, '', old):
             return 0
         if e.msgstr in ('', old):
             e.msgstr = t.msgstr
             return 0
-        print(f'{ours}: {e.msgctxt} {e.msgid!r}: translation conflict, ours {e.msgstr!r} kept, theirs {t.msgstr!r}',
+        print(f'{ours}: {e.msgctxt} {e.msgid!r}: translation conflict, ours {e.msgstr!r} kept as fuzzy, theirs {t.msgstr!r}',
               file=sys.stderr)
+        e.fuzzy = True
+        e.tcomment = '\n'.join(filter(None, (e.tcomment, f'theirs: {t.msgstr}')))
         return 1
 
     polib._BaseEntry.SPLIT_LINES = False
@@ -2216,7 +2224,8 @@ def main(argv=None):
     p.add_argument('input', metavar='PATH', nargs='*', type=Path, help='path XML or PY file or addon folder')
     args = p.parse_args(argv)
     if args.merge_po:
-        sys.exit(1 if merge_po(*args.merge_po) else 0)
+        merge_po(*args.merge_po)
+        return
     if not args.input:
         p.error('the following arguments are required: PATH')
     if args.obsolete is not None:
