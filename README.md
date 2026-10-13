@@ -472,7 +472,9 @@ The driver merges PO by ID:
 
 Then resolve source conflicts (if any; usually take both sides) and run
 kolang. It moves the colliding labels in sources (`L()`, XML `L[]` comments
-and numeric attributes) to the IDs of their texts.
+and numeric attributes) to the IDs of their texts. If a language PO has
+another text under an ID than the model (e.g. hand edits), kolang moves the
+translation to the ID of its text and prints a warning.
 
 If both branches added an identical element at the same place, git keeps one
 element with two `L[]` comments above it. kolang stops with an error on the

@@ -176,6 +176,9 @@ def _git_root(path: Path) -> Path | None:
     return Path(out.stdout.strip()).resolve()
 
 
+#: Base language of sources (no translation needed).
+BASE_LANG: str = 'en_GB'
+
 _RE_OPT_SPLIT = re.compile(r'\s*:\s*')
 # Matches `translate` (general) or `translate[<target>]` (per-attr/text); target
 # may be empty (text content), an attr name, or `attr#index` for lvalues.
@@ -1699,6 +1702,19 @@ class Translate(TranslateBase):
             if entry is not None and entry.msgid != new_text:
                 old_msgid, entry.msgid = entry.msgid, new_text
                 self._carry_translation(entry, old_msgid, entry.msgstr, entry.previous_msgid)
+        # Entries out of sync with the model (other msgid under the ID, e.g. language PO files renumbered
+        # differently by the merge driver or edited by hand): translation moves to the ID of its text.
+        misplaced: dict[str, polib.POEntry] = {}
+        for mid, entry in ie.items():
+            label = self._by_id.get(mid)
+            if label is not None and label.text and entry.msgid != label.text and not entry.obsolete:
+                logger.warning(f'{path}: #{mid} msgid {entry.msgid!r} != {label.text!r}, realign translation by text')
+                misplaced[entry.msgid] = polib.POEntry(msgid=entry.msgid, msgstr=entry.msgstr, flags=list(entry.flags),
+                                                       previous_msgid=entry.previous_msgid)
+                entry.msgid, entry.msgstr, entry.flags, entry.previous_msgid = label.text, '', [], None
+        for mid, entry in ie.items():
+            if (old := misplaced.pop(entry.msgid, None)) is not None:
+                entry.msgstr, entry.flags, entry.previous_msgid = old.msgstr, old.flags, old.previous_msgid
         for label in self._by_id.values():
             assert label.id is not None
             if label.id not in ie:
@@ -1712,7 +1728,9 @@ class Translate(TranslateBase):
                     # occurrences=[('welcome.py', '12'), ('anotherfile.py', '34')]
                 )
                 # edited text, not a collision: old text is unreferenced or renamed by another edit (`#|` keeps it)
-                if label.ref is not None and (not label.ref.referenced or label.ref.id in self._renamed_ids) and label.ref.id in ie:
+                if (old := misplaced.pop(entry.msgid, None)) is not None:
+                    entry.msgstr, entry.flags, entry.previous_msgid = old.msgstr, old.flags, old.previous_msgid
+                elif label.ref is not None and (not label.ref.referenced or label.ref.id in self._renamed_ids) and label.ref.id in ie:
                     old = ie[label.ref.id]
                     self._carry_translation(entry, old.msgid, old.msgstr, old.previous_msgid)
                 po.append(entry)
@@ -1761,7 +1779,7 @@ class Translate(TranslateBase):
             fz = sum(1 for e in po if e.msgstr and e.fuzzy)
             if fz:
                 mv += f', fuzzy: {fz}'
-            if lang == 'en_GB':  # base language (no translation needed)
+            if lang == BASE_LANG:
                 print(f'Language {lang}: translated: ---- ({tr}/{N}), obsolete: {ob}{nw}{mv}')
             else:
                 percent = 100 * tr / (N or 1)
@@ -1999,7 +2017,7 @@ def process(inputs, *, args, langs=None, output=None):
                 langs.add(f'{L}{sep}{C.upper()}')
 
     was: dict[str, GenerateStats] = {}
-    for lang in langs:
+    for lang in sorted(langs, key=lambda lang: (lang != BASE_LANG, lang)):  # base first: it wins if PO files are out of sync
         path = output
         if pattern:
             path = output / pattern.format(lang=lang, lang_lower=lang.lower())
@@ -2132,7 +2150,8 @@ def merge_po(base: Path, ours: Path, theirs: Path) -> int:
     po_base, po_ours, po_theirs = (polib.pofile(str(p), wrapwidth=999999) for p in (base, ours, theirs))
     b_ids, o_ids, t_ids = entries(po_base), entries(po_ours), entries(po_theirs)
     o_text = {e.msgid: e for e in o_ids.values()}
-    # ponytail: new IDs are max+1, same in every language as long as all PO files have the same IDs (kolang writes them so)
+    # New IDs are max+1, same in every language if all PO files have the same IDs (kolang writes them so),
+    # otherwise kolang realigns translations by text on the next run.
     free = max(o_ids.keys() | t_ids.keys(), default=0) + 1
     conflicts = 0
     for mid, t in sorted(t_ids.items()):
