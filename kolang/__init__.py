@@ -227,19 +227,23 @@ def _node_value_target(nv) -> str | None:
 def _find_L_marker(node, target: str | None) -> tuple[int, str] | None:
     """Walk back through XML comments before `node`, find L(...) for `target`.
 
-    Returns (id, text) of the first matching marker (closest to element);
-    None if no marker found. Non-L comments and unrelated L markers are
-    skipped (allowing free-form developer notes interleaved).
+    Returns (id, text) of the matching marker; None if no marker found.
+    Non-L comments and unrelated L markers are skipped (allowing free-form
+    developer notes interleaved). Raise ValueError on the second marker for
+    the same target (e.g. git merged two identical elements into one).
     """
+    found: tuple[int, str] | None = None
     prev = node.getprevious()
     while isinstance(prev, etree._Comment):
         parsed = _parse_L_comment(prev.text or '')
         if parsed is not None:
             attr, lid, text = parsed
             if attr == target:
-                return lid, text
+                if found is not None:
+                    raise ValueError(f'two L() comments for {target!r}: {found} and {(lid, text)}, element lost in merge?')
+                found = lid, text
         prev = prev.getprevious()
-    return None
+    return found
 
 
 def _format_L_comment(attr: str | None, label_id: int, text: str) -> str:
@@ -1068,7 +1072,11 @@ class Translate(TranslateBase):
                     node_error(node, 'Empty node/attr (string expected)')
                 return
             target = _node_value_target(node)
-            marker = _find_L_marker(node.node, target)
+            try:
+                marker = _find_L_marker(node.node, target)
+            except ValueError as exc:
+                logger.error(f'{path}:{node.node.sourceline}: {exc}')
+                sys.exit(1)
             is_numeric = text.isdigit()
             if marker is None:
                 # No L() comment — current default behavior.

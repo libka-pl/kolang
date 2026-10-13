@@ -467,6 +467,10 @@ Then resolve source conflicts (if any; usually take both sides) and run
 kolang. It moves the colliding labels in sources (`L()`, XML `L[]` comments
 and numeric attributes) to the IDs of their texts.
 
+If both branches added an identical element at the same place, git keeps one
+element with two `L[]` comments above it. kolang stops with an error on the
+second comment for the same target — restore the lost element by hand.
+
 ---
 
 ### Examples
