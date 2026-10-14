@@ -178,23 +178,27 @@ _RE_TRANSLATE_KEY = re.compile(r'^translate(?:\[([^\]]*)\])?$')
 # Matches `python` (general) or `python[<target>]` (per-attr/text). Values:
 # 'true' (raw scan), 'false' (no scan), 'fstring' (only {…} blocks).
 _RE_PYTHON_KEY = re.compile(r'^python(?:\[([^\]]*)\])?$')
+# Matches `context` (general) or `context[<target>]`. Value is the text context (no `:` inside).
+_RE_CONTEXT_KEY = re.compile(r'^context(?:\[([^\]]*)\])?$')
+_RE_CONTEXT_DIRECTIVE = re.compile(r'\s*:\s*context(?:\[[^\]]*\])?\s*=[^:]*:')
 
 #: Allowed `:python=…:` values.
 _PYTHON_VALUES = frozenset({'true', 'false', 'fstring'})
 
-# L() comment marker — `L(N, 'text')`, `L[attr](N, 'text')`, `L[attr#N](N, 'text')`.
+# L() comment marker — `L(N, 'text')`, `L[attr](N, 'text')`, `L[attr#N](N, 'text')`, optional `ctx='…'`.
 # Empty `L[]` is rejected (ambiguous with `L(...)`).
 _RE_L_COMMENT = re.compile(
     r'\s*L'
     r'(?:\[(?P<attr>[A-Za-z_][\w.\-:]*(?:#\d+)?)\])?'
     r'\s*\(\s*(?P<id>\d+)\s*,\s*'
     r"(?P<text>'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\")"
+    r"(?:\s*,\s*ctx\s*=\s*(?P<ctx>'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"))?"
     r'\s*\)\s*'
 )
 
 
-def _parse_L_comment(comment_text: str) -> tuple[str | None, int, str] | None:
-    """Parse an XML comment text as `L(...)` marker. Return (attr, id, text) or None.
+def _parse_L_comment(comment_text: str) -> tuple[str | None, int, str, str] | None:
+    """Parse an XML comment text as `L(...)` marker. Return (attr, id, text, ctx) or None.
 
     `attr` is None for text content, attribute name otherwise (may be 'name#N'
     for indexed lvalues). Text is decoded from Python literal (handles `\\u002d`,
@@ -205,9 +209,10 @@ def _parse_L_comment(comment_text: str) -> tuple[str | None, int, str] | None:
         return None
     try:
         text = literal_eval(m.group('text'))
+        ctx = literal_eval(m.group('ctx')) if m.group('ctx') else ''
     except (ValueError, SyntaxError):
         return None
-    return m.group('attr'), int(m.group('id')), text
+    return m.group('attr'), int(m.group('id')), text, ctx
 
 
 def _node_value_target(nv) -> str | None:
@@ -219,35 +224,37 @@ def _node_value_target(nv) -> str | None:
     return nv.attr
 
 
-def _find_L_marker(node, target: str | None) -> tuple[int, str] | None:
+def _find_L_marker(node, target: str | None) -> tuple[int, str, str] | None:
     """Walk back through XML comments before `node`, find L(...) for `target`.
 
-    Returns (id, text) of the matching marker; None if no marker found.
+    Returns (id, text, ctx) of the matching marker; None if no marker found.
     Non-L comments and unrelated L markers are skipped (allowing free-form
     developer notes interleaved). Raise ValueError on the second marker for
     the same target (e.g. git merged two identical elements into one).
     """
-    found: tuple[int, str] | None = None
+    found: tuple[int, str, str] | None = None
     prev = node.getprevious()
     while isinstance(prev, etree._Comment):
         parsed = _parse_L_comment(prev.text or '')
         if parsed is not None:
-            attr, lid, text = parsed
+            attr, lid, text, ctx = parsed
             if attr == target:
                 if found is not None:
-                    raise ValueError(f'two L() comments for {target!r}: {found} and {(lid, text)}, element lost in merge?')
-                found = lid, text
+                    raise ValueError(f'two L() comments for {target!r}: {found[:2]} and {(lid, text)}, element lost in merge?')
+                found = lid, text, ctx
         prev = prev.getprevious()
     return found
 
 
-def _format_L_comment(attr: str | None, label_id: int, text: str) -> str:
+def _format_L_comment(attr: str | None, label_id: int, text: str, ctx: str = '') -> str:
     """Format an L(...) marker as XML comment body (without `<!-- ... -->`).
 
     Each `--` sequence is escaped to `\\u002d` (per char) so the comment stays
     XML-valid. ast.literal_eval round-trips the value back when parsing.
     """
     body_text = repr(text)
+    if ctx:
+        body_text = f'{body_text}, ctx={ctx!r}'
     body_text = re.sub(r'-{2,}', lambda m: '\\u002d' * len(m[0]), body_text)
     if attr:
         return f' L[{attr}]({label_id}, {body_text}) '
@@ -427,6 +434,52 @@ def _python_override(node, target: str | None) -> str | None:
     return general
 
 
+def _parse_context_comment(text: str) -> tuple[str | None, dict[str, str]]:
+    """Parse one comment text for `:context=…:` directives. Return (general, per_target)."""
+    general: str | None = None
+    per_target: dict[str, str] = {}
+    for op in _RE_OPT_SPLIT.split(text or ''):
+        key, sep, value = op.partition('=')
+        if not sep or not (m := _RE_CONTEXT_KEY.match(key.strip())):
+            continue
+        if m.group(1) is None:
+            general = value.strip()
+        else:
+            per_target[m.group(1)] = value.strip()
+    return general, per_target
+
+
+def _context_override(node, target: str | None) -> str | None:
+    """Return `:context=…:` value for `target` on `node` (None if not set). Same hierarchy as `_translation_enabled`,
+    text content is `:context[]=…:`. Closer-to-element comments take precedence.
+    """
+    target = target or ''
+    general: str | None = None
+    prev = node.getprevious()
+    while isinstance(prev, etree._Comment):
+        g, per_target = _parse_context_comment(prev.text or '')
+        for key in (target, target.split('#', 1)[0]):
+            if key in per_target:
+                return per_target[key]
+        if general is None:
+            general = g
+        prev = prev.getprevious()
+    return general
+
+
+def _remove_context_comments(node) -> None:
+    """Remove `:context=…:` directives before `node` (context lives in `L()` marker), drop comments left empty."""
+    prev = node.getprevious()
+    while isinstance(prev, etree._Comment):
+        comment, prev = prev, prev.getprevious()
+        text = _RE_CONTEXT_DIRECTIVE.sub('', comment.text or '')
+        if text != comment.text:
+            if text.strip():
+                comment.text = text if text.endswith(' ') else f'{text} '
+            elif (parent := comment.getparent()) is not None:
+                parent.remove(comment)
+
+
 def _git_tracked_files(repo_root: Path) -> set[Path]:
     """Return absolute paths of files tracked by git (in the index) for given repo."""
     out = subprocess.run(
@@ -515,6 +568,13 @@ class Label:
     nodes: set[NodeValue] = field(default_factory=set)
     trans: list[Trans] = field(default_factory=list)
     ref: Label | None = None
+    #: Text context (Qt-like disambiguation): same text with different contexts gets different IDs.
+    ctx: str = ''
+
+    @property
+    def key(self) -> tuple[str, str | None]:
+        """Identity of the text: (context, text)."""
+        return self.ctx, self.text
 
     @property
     def referenced(self) -> bool:
@@ -636,6 +696,8 @@ class Translate(TranslateBase):
 
     _RE_LABEL_NUM = re.compile(r'#(?P<id>\d+)')
     _RE_PLURAL_NOTE = re.compile(r'\d+ plural forms? separated by \|\|\|')
+    #: `#. context: …` line, text context for translators and for kolang (merge driver, realign).
+    _RE_CONTEXT_NOTE = re.compile(r'context: (?P<ctx>.*)')
     _RE_READ_PO = re.compile(r'(?:^|\n)(?P<var>(?:msgctxt|msgid|msgstr))[ \t]*'
                              r'(?:[ \t]*[\n]"(?P<val>(?:\\.|[^"])*))+"')
     _RE_PO_VAL = re.compile(r'\s*"((?:\\.|[^"])*)"')
@@ -693,7 +755,7 @@ class Translate(TranslateBase):
         self.py_inputs: list[PyInput] = []
         self._ids: set[int] = set()
         self._by_id: dict[int, Label] = {}
-        self._by_text: dict[str, LabelList] = {}
+        self._by_text: dict[tuple[str, str], LabelList] = {}
         self.dry_run = dry_run
         self.dump_output = dump_output
         self.dump_translations = dump_translations
@@ -737,9 +799,9 @@ class Translate(TranslateBase):
         #: GLS function patterns active for the scan (recompiling per file
         #: dominated profile traces).
         self._replace_py_re_cache: dict[tuple[str, ...], re.Pattern[str]] = {}
-        #: Map id → new_text for labels renamed in `generate()`. Used by
+        #: Map id → new (ctx, text) for labels renamed in `generate()`. Used by
         #: `translate()` to update the matching `msgid` in each PO.
-        self._renamed_ids: dict[int, str] = {}
+        self._renamed_ids: dict[int, tuple[str, str]] = {}
         #: True if po msg are splited into mulitple lines.
         self.multi_line_msg: bool = multi_line_msg
         #: Cache of loaded addon configs keyed by resolved config-file path.
@@ -798,21 +860,21 @@ class Translate(TranslateBase):
         if label.text is not None:
             # explicit empty (`L('')`) is a declaration too, distinct from
             # a numeric reference where text is unknown — keep it.
-            lst = self._by_text.setdefault(label.text, LabelList())
+            lst = self._by_text.setdefault(label.key, LabelList())
             L2 = lst.add(label)
         if L1 is not None and L2 is not None and L1 is not L2:
             if L2.id is None:
                 label = Label(L1.id or L2.id, L1.text or L2.text,
                               L1.nodes | L2.nodes | label.nodes,
-                              L1.trans + L2.trans)
+                              L1.trans + L2.trans, ctx=L2.ctx)
                 assert label.id is not None
                 self._by_id[label.id] = label
                 lst[lst.index(L2)] = label
             else:
                 assert L1.id is None or L1.id == L2.id
-                if L1.text and L1.text != L2.text:
+                if L1.text and L1.key != L2.key:
                     L0 = label
-                    if (L2 is L0 or not used or (L2.id == L0.id and L2.text == L0.text)) and L1.id is not None:
+                    if (L2 is L0 or not used or (L2.id == L0.id and L2.key == L0.key)) and L1.id is not None:
                         # text mismatch in the same ID, force to generate new ID (or find another existing)
                         for lb in lst:
                             if lb.id is not None and lb.id != L2.id:
@@ -828,7 +890,7 @@ class Translate(TranslateBase):
                             L2.ref = L1
                             return L2
                     else:
-                        raise ValueError(f'Label #{L2.id}: text mismatch: {L1.text!r} != {L2.text!r}')
+                        raise ValueError(f'Label #{L2.id}: text mismatch: {L1.key!r} != {L2.key!r}')
                 L2.nodes |= L1.nodes
                 L2.trans.extend(L1.trans)
                 assert label.id is not None
@@ -843,6 +905,29 @@ class Translate(TranslateBase):
         if used and label.id is not None:
             self._ids.add(label.id)
         return label
+
+    #: Python call tokens for `_call_ctx()`: string literals (skipped, `ctx=` keyword before), brackets.
+    _RE_CALL_TOKEN = re.compile(r'''(?P<ctx>\bctx\s*=\s*)?(?P<str>"""(?:\\.|[^"]|"(?!""))*"""|'''
+                                r"""'''(?:\\.|[^']|'(?!''))*'''|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|[([{]|[)\]}]""")
+
+    @classmethod
+    def _call_ctx(cls, data: str, pos: int) -> str:
+        """Return `ctx='…'` value of L() call arguments starting at `pos` (after the text), empty if none.
+
+        Scan to the closing bracket of the call, strings and nested brackets are skipped.
+        """
+        depth = 1
+        for m in cls._RE_CALL_TOKEN.finditer(data, pos):
+            if m['str'] is not None:
+                if m['ctx'] is not None and depth == 1:
+                    return literal_eval(m['str'])
+            elif m[0] in '([{':
+                depth += 1
+            else:
+                depth -= 1
+                if not depth:
+                    break
+        return ''
 
     @staticmethod
     def _find_matching_bracket(text: str, open_pos: int) -> int | None:
@@ -939,12 +1024,13 @@ class Translate(TranslateBase):
         """Ensure an `L(...)` XML comment for `label` precedes the element.
 
         Three cases for the existing comment matching this target:
-          - identical (id and text) → skip (idempotent),
-          - stale (id or text differs) → update in place (preserves position
+          - identical (id, text and context) → skip (idempotent),
+          - stale (id, text or context differs) → update in place (preserves position
             and tail), so the next run sees the up-to-date marker,
           - missing → insert a new comment, on its own line, using the
             indent that precedes the element.
 
+        `:context=…:` directives before the element are removed (context is kept in `L()`).
         Skips labels with no text (numeric refs to unknown ids — nothing to
         document).
         """
@@ -952,13 +1038,14 @@ class Translate(TranslateBase):
             return
         target = _node_value_target(node_value)
         elem = node_value.node
-        body = _format_L_comment(target, label.id, label.text)
+        _remove_context_comments(elem)  # context is in L() now
+        body = _format_L_comment(target, label.id, label.text, label.ctx)
         # Walk back through preceding comments looking for one targeting us.
         prev = elem.getprevious()
         while isinstance(prev, etree._Comment):
             parsed = _parse_L_comment(prev.text or '')
             if parsed is not None and parsed[0] == target:
-                if (parsed[1], parsed[2]) == (label.id, label.text):
+                if parsed[1:] == (label.id, label.text, label.ctx):
                     return  # identical
                 prev.text = body  # stale → update in place
                 return
@@ -1098,6 +1185,7 @@ class Translate(TranslateBase):
                 logger.error(f'{path}:{node.node.sourceline}: {exc}')
                 sys.exit(1)
             is_numeric = text.isdigit()
+            ctx = _context_override(node.node, target)
             if marker is None:
                 # No L() comment — current default behavior.
                 if is_numeric:
@@ -1108,14 +1196,25 @@ class Translate(TranslateBase):
                     # attach the node so write-side can inject L() comment.
                     existing = self._by_id.get(nid)
                     if existing is not None and existing.text:
+                        if ctx is not None and ctx != existing.ctx:
+                            logger.error(f'{path}:{node.node.sourceline}: :context={ctx}: on #{nid} with context '
+                                         f'{existing.ctx!r} in PO — use the text instead of the number to change context.')
+                            sys.exit(1)
                         existing.nodes.add(node)
                     return
-                label = Label(None, text)
+                label = Label(None, text, ctx=ctx or '')
                 label.nodes.add(node)
                 self._add_label(label)
                 return
             # L() comment present — comment is authoritative (matrix G).
-            cm_id, cm_text = marker
+            cm_id, cm_text, cm_ctx = marker
+            # `:context:` next to L() is like XML text next to L(): the same → redundant, other → two sources of truth
+            if ctx is not None:
+                if ctx != cm_ctx:
+                    logger.error(f'{path}:{node.node.sourceline}: :context={ctx}: on {target!r} differs from L() comment '
+                                 f'context {cm_ctx!r} — refusing to discard either; edit `ctx=` in the L() comment.')
+                    sys.exit(1)
+                logger.warning(f'{path}:{node.node.sourceline}: :context={ctx}: duplicates L() comment on {target!r}, removed.')
             if is_numeric:
                 xml_id = int(text)
                 if xml_id != cm_id:
@@ -1123,14 +1222,14 @@ class Translate(TranslateBase):
                         f'L() comment ID mismatch on {target!r}: '
                         f'XML=#{xml_id}, comment=#{cm_id} — using comment.'
                     )
-                label = Label(cm_id, cm_text)
+                label = Label(cm_id, cm_text, ctx=cm_ctx)
             else:
                 if text == cm_text:
                     logger.warning(
                         f'L() comment duplicates XML text on {target!r} — '
                         f'replacing XML with #{cm_id}.'
                     )
-                    label = Label(cm_id, cm_text)
+                    label = Label(cm_id, cm_text, ctx=cm_ctx)
                 else:
                     logger.error(
                         f'L() comment text mismatch on {target!r}: '
@@ -1347,6 +1446,13 @@ class Translate(TranslateBase):
                 if s != -1:
                     return s
 
+        def msg_end(r) -> int:
+            """Return position after L() text literal (after closing quotes)."""
+            for g, quotes in zip(_msg_grp, (3, 3, 1, 1)):
+                if (e := r.end(g)) != -1:
+                    return e + quotes
+            return r.end()
+
         _R_CM = r'#[^\S\r\n]*(?P<comment>[^\r\n]+)'
         _R_LL = fr'\b(?P<label>LL?)\s*(?P<label_bracket>\()\s*(?:(?P<mid>\d+)\s*,\s*)?{rstr("msg")}\s*(?:,.*?)?\)'
         pat = f'{_R_CM}|{rstr()}|{_R_LL}'
@@ -1379,7 +1485,7 @@ class Translate(TranslateBase):
                 else:
                     mid = int(mid)
                     tr = Trans(file, start=data_offset + r.start('mid'), end=data_offset + r.end('mid'))
-                label = Label(mid, unescape(msg))
+                label = Label(mid, unescape(msg), ctx=self._call_ctx(data, msg_end(r)))
             # " $LOCALIZE[] "
             elif s is not None:
                 for r in self._RE_PY_LOCALIZE.finditer(s):
@@ -1476,10 +1582,10 @@ class Translate(TranslateBase):
             if self._RE_LABEL_NUM.fullmatch(text) and '[empty]' in entry.comment:
                 text = None
             if (r := self._RE_LABEL_NUM.fullmatch(entry.msgctxt or '')) is None:
-                label = Label(None, text)
+                label = Label(None, text, ctx=self._entry_ctx(entry))
             else:
                 lid = int(r.group(1))
-                label = Label(lid, text)
+                label = Label(lid, text, ctx=self._entry_ctx(entry))
             self._add_label(label, used=False)
             if entry.obsolete:
                 was_obsolete += 1
@@ -1503,7 +1609,7 @@ class Translate(TranslateBase):
         Renames are recorded in `_renamed_ids` so `translate()` can update
         the matching `msgid` in each language PO (translation becomes fuzzy).
         """
-        for new_text, lst in list(self._by_text.items()):
+        for new_key, lst in list(self._by_text.items()):
             for label in list(lst):
                 if label.id is not None or label.ref is None:
                     continue
@@ -1517,17 +1623,17 @@ class Translate(TranslateBase):
                 # Don't rename onto a text that already has its own concrete ID.
                 if any(lb.id is not None and lb is not label for lb in lst):
                     continue
-                old_text: str = L1.text
+                old_key = L1.key
                 old_id: int = L1.id
-                # 1. Remove L1 from _by_text[old_text].
-                old_lst = self._by_text.get(old_text)
+                # 1. Remove L1 from _by_text[old_key].
+                old_lst = self._by_text.get(old_key)
                 if old_lst is not None and L1 in old_lst:
                     old_lst.remove(L1)
                     if not old_lst:
-                        del self._by_text[old_text]
-                # 2. Rename L1 in place — it keeps its id, gets the new text
+                        del self._by_text[old_key]
+                # 2. Rename L1 in place — it keeps its id, gets the new text (and context)
                 #    and absorbs the pending label's nodes/trans.
-                L1.text = new_text
+                L1.ctx, L1.text = new_key
                 L1.nodes |= label.nodes
                 L1.trans.extend(label.trans)
                 L1.ref = None
@@ -1535,9 +1641,9 @@ class Translate(TranslateBase):
                 lst[lst.index(label)] = L1
                 label.id = old_id
                 label.ref = L1
-                self._renamed_ids[old_id] = new_text
+                self._renamed_ids[old_id] = new_key
                 if self.dry_run:
-                    print(f' rename id: {old_id}: {old_text!r} → {new_text!r}')
+                    print(f' rename id: {old_id}: {old_key[1]!r} → {new_key[1]!r}')
 
     def generate(self) -> GenerateStats:
         """Generate new lables. Return number of new translations."""
@@ -1677,6 +1783,22 @@ class Translate(TranslateBase):
             with open(path, 'w', encoding=self.encoding, newline='') as f:
                 f.write(input.data)
 
+    @classmethod
+    def _entry_ctx(cls, entry: polib.POEntry) -> str:
+        """Return text context of PO `entry` (`#. context: …` line), empty if none."""
+        return next((m['ctx'] for ln in entry.comment.split('\n') if (m := cls._RE_CONTEXT_NOTE.fullmatch(ln))), '')
+
+    @classmethod
+    def _entry_key(cls, entry: polib.POEntry) -> tuple[str, str]:
+        """Return identity of PO `entry` text: (context, msgid), like `Label.key`."""
+        return cls._entry_ctx(entry), entry.msgid
+
+    @classmethod
+    def _set_entry_ctx(cls, entry: polib.POEntry, ctx: str) -> None:
+        """Set (or remove if empty) `#. context: …` line of PO `entry`, the first `#.` line."""
+        lines = [ln for ln in entry.comment.split('\n') if ln and not cls._RE_CONTEXT_NOTE.fullmatch(ln)]
+        entry.comment = '\n'.join([f'context: {ctx}'] * bool(ctx) + lines)
+
     @staticmethod
     def _carry_translation(entry: polib.POEntry, old_msgid: str, old_msgstr: str, previous_msgid: str | None) -> None:
         """Carry translation of edited text `old_msgid` to `entry` as fuzzy with `#| msgid` (the last reviewed text).
@@ -1768,23 +1890,25 @@ class Translate(TranslateBase):
         ie = {int(r['id']): e for e in po if (r := self._RE_LABEL_NUM.fullmatch(e.msgctxt or '')) is not None}
         # Apply in-place renames: existing entries whose label was reused for
         # a new text (because old text became unreferenced).
-        for old_id, new_text in self._renamed_ids.items():
+        for old_id, new_key in self._renamed_ids.items():
             entry = ie.get(old_id)
-            if entry is not None and entry.msgid != new_text:
-                old_msgid, entry.msgid = entry.msgid, new_text
+            if entry is not None and self._entry_key(entry) != new_key:
+                old_msgid, entry.msgid = entry.msgid, new_key[1]
+                self._set_entry_ctx(entry, new_key[0])
                 self._carry_translation(entry, old_msgid, entry.msgstr, entry.previous_msgid)
         # Entries out of sync with the model (other msgid under the ID, e.g. language PO files renumbered
         # differently by the merge driver or edited by hand): translation moves to the ID of its text.
-        misplaced: dict[str, polib.POEntry] = {}
+        misplaced: dict[tuple[str, str], polib.POEntry] = {}
         for mid, entry in ie.items():
             label = self._by_id.get(mid)
-            if label is not None and label.text and entry.msgid != label.text and not entry.obsolete:
-                logger.warning(f'{path}: #{mid} msgid {entry.msgid!r} != {label.text!r}, realign translation by text')
-                misplaced[entry.msgid] = polib.POEntry(msgid=entry.msgid, msgstr=entry.msgstr, flags=list(entry.flags),
-                                                       previous_msgid=entry.previous_msgid)
+            if label is not None and label.text and self._entry_key(entry) != label.key and not entry.obsolete:
+                logger.warning(f'{path}: #{mid} msgid {self._entry_key(entry)!r} != {label.key!r}, realign translation by text')
+                misplaced[self._entry_key(entry)] = polib.POEntry(msgid=entry.msgid, msgstr=entry.msgstr, flags=list(entry.flags),
+                                                                  previous_msgid=entry.previous_msgid)
                 entry.msgid, entry.msgstr, entry.flags, entry.previous_msgid = label.text, '', [], None
+                self._set_entry_ctx(entry, label.ctx)
         for mid, entry in ie.items():
-            if (old := misplaced.pop(entry.msgid, None)) is not None:
+            if (old := misplaced.pop(self._entry_key(entry), None)) is not None:
                 entry.msgstr, entry.flags, entry.previous_msgid = old.msgstr, old.flags, old.previous_msgid
         for label in self._by_id.values():
             assert label.id is not None
@@ -1798,10 +1922,13 @@ class Translate(TranslateBase):
                     comment=' '.join(comment),
                     # occurrences=[('welcome.py', '12'), ('anotherfile.py', '34')]
                 )
-                # edited text, not a collision: old text is unreferenced or renamed by another edit (`#|` keeps it)
-                if (old := misplaced.pop(entry.msgid, None)) is not None:
+                self._set_entry_ctx(entry, label.ctx)
+                # edited text, not a collision: old text is unreferenced or renamed by another edit (`#|` keeps it);
+                # split: the same text with another context (meaning) gets a copy of the translation to review
+                if (old := misplaced.pop(label.key, None)) is not None:
                     entry.msgstr, entry.flags, entry.previous_msgid = old.msgstr, old.flags, old.previous_msgid
-                elif label.ref is not None and (not label.ref.referenced or label.ref.id in self._renamed_ids) and label.ref.id in ie:
+                elif (label.ref is not None and label.ref.id in ie
+                      and (not label.ref.referenced or label.ref.id in self._renamed_ids or label.ref.text == label.text)):
                     old = ie[label.ref.id]
                     self._carry_translation(entry, old.msgid, old.msgstr, old.previous_msgid)
                 po.append(entry)
@@ -2230,8 +2357,8 @@ class ConstIncAction(argparse.Action):
 def merge_po(base: Path, ours: Path, theirs: Path) -> int:
     """Merge `theirs` PO into `ours` (git merge driver: %O %A %B), return number of translation conflicts.
 
-    Entries are matched by ID (`msgctxt "#ID"`). Same ID with a different text on both sides (both branches
-    took the next free ID) is a collision: theirs entry goes to the ID its text already has in ours or gets
+    Entries are matched by ID (`msgctxt "#ID"`), text is (`#. context: …`, msgid). Same ID with a different text
+    on both sides (both branches took the next free ID) is a collision: theirs entry goes to the ID its text already has in ours or gets
     a new free ID. Run kolang after the merge, it moves the colliding source labels to that ID (by text).
     Translations are merged 3-way against `base`; changed on both sides → conflict: ours is kept as fuzzy
     with theirs in a translator comment (the merge doesn't stop, kolang counts fuzzy entries).
@@ -2240,9 +2367,11 @@ def merge_po(base: Path, ours: Path, theirs: Path) -> int:
         """Return entries with ID."""
         return {int(r['id']): e for e in po if (r := Translate._RE_LABEL_NUM.fullmatch(e.msgctxt or '')) is not None}
 
+    key = Translate._entry_key
+
     def merge_msgstr(e: polib.POEntry, t: polib.POEntry, b: polib.POEntry | None) -> int:
         """Merge theirs msgstr into ours entry (same text), return 1 on conflict (ours fuzzy, theirs in comment)."""
-        old = b.msgstr if b is not None and b.msgid == e.msgid else ''
+        old = b.msgstr if b is not None and key(b) == key(e) else ''
         if t.msgstr in (e.msgstr, '', old):
             return 0
         if e.msgstr in ('', old):
@@ -2257,7 +2386,7 @@ def merge_po(base: Path, ours: Path, theirs: Path) -> int:
     polib._BaseEntry.SPLIT_LINES = False
     po_base, po_ours, po_theirs = (polib.pofile(str(p), wrapwidth=999999) for p in (base, ours, theirs))
     b_ids, o_ids, t_ids = entries(po_base), entries(po_ours), entries(po_theirs)
-    o_text = {e.msgid: e for e in o_ids.values()}
+    o_text = {key(e): e for e in o_ids.values()}
     # New IDs are max+1, same in every language if all PO files have the same IDs (kolang writes them so),
     # otherwise kolang realigns translations by text on the next run.
     free = max(o_ids.keys() | t_ids.keys(), default=0) + 1
@@ -2266,19 +2395,19 @@ def merge_po(base: Path, ours: Path, theirs: Path) -> int:
         e, b = o_ids.get(mid), b_ids.get(mid)
         if e is None:
             po_ours.append(t)
-        elif e.msgid == t.msgid:
+        elif key(e) == key(t):
             conflicts += merge_msgstr(e, t, b)
-        elif b is not None and b.msgid == e.msgid:  # text edited in theirs only
-            e.msgid, e.msgstr = t.msgid, t.msgstr
-        elif b is not None and b.msgid == t.msgid:  # text edited in ours only
+        elif b is not None and key(b) == key(e):  # text edited in theirs only
+            e.msgid, e.msgstr, e.comment = t.msgid, t.msgstr, t.comment
+        elif b is not None and key(b) == key(t):  # text edited in ours only
             pass
-        elif (e := o_text.get(t.msgid)) is not None:  # collision, text has an ID in ours
+        elif (e := o_text.get(key(t))) is not None:  # collision, text has an ID in ours
             conflicts += merge_msgstr(e, t, None)
         else:  # collision, new ID for theirs text
             t.msgctxt = f'#{free}'
             free += 1
             po_ours.append(t)
-            o_text[t.msgid] = t
+            o_text[key(t)] = t
     po_ours.save(str(ours))
     return conflicts
 

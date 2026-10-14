@@ -180,16 +180,19 @@ class LabelGetter:
         return self._rule
 
     @overload
-    def __call__(self, id: int, string: str, /, *, n: int | None = None, **kwargs) -> str: ...
+    def __call__(self, id: int, string: str, /, *, n: int | None = None, ctx: str = '', **kwargs) -> str: ...
 
     @overload
-    def __call__(self, id: int, /, *, n: int | None = None, **kwargs) -> str: ...
+    def __call__(self, id: int, /, *, n: int | None = None, ctx: str = '', **kwargs) -> str: ...
 
     @overload
-    def __call__(self, string: str, /, *, n: int | None = None, **kwargs) -> str: ...
+    def __call__(self, string: str, /, *, n: int | None = None, ctx: str = '', **kwargs) -> str: ...
 
-    def __call__(self, /, *args, n: int | None = None, **kwargs) -> str:
-        """L(). Get localized string. If there is no ID there string is returned without translation."""
+    def __call__(self, /, *args, n: int | None = None, ctx: str = '', **kwargs) -> str:
+        """L(). Get localized string. If there is no ID there string is returned without translation.
+
+        `ctx` is the text context for kolang only (same text, other meaning → other ID), not a format field.
+        """
         sid: int | None
         text: str
         if len(args) == 2:

@@ -140,6 +140,31 @@ At runtime, `L(30100, '...', n=count)` picks the right form:
 L(30100, '{n} file|||{n} files', n=count)   # EN: "1 file" / "5 files"
 ```
 
+#### Context (`ctx=`)
+
+The same English text can have different meanings (and translations). One text
+gets one ID, unless the context differs (like Qt disambiguation):
+
+```python
+L(30100, 'Open')                       # verb
+L(30101, 'Open', ctx='adjective')      # other ID, other translation
+L(30101, 'Open', n=1, ctx='adjective') # same context → same ID
+```
+
+`ctx` is for kolang only: runtime `L()` ignores it, so it can't be a `{ctx}`
+placeholder. PO keeps the context in a translator comment (Kodi ignores it):
+
+```
+#. context: adjective
+msgctxt "#30101"
+msgid "Open"
+```
+
+Adding a context to some occurrences of an ID splits them to a new ID, the
+translation is copied as `#, fuzzy` (review it). Changing only the context of
+an ID keeps the ID, the translation becomes fuzzy like on text edit.
+`getLocalizedString('text')` and `$LOCALIZE[text]` have no context.
+
 #### In XML — three independent layers
 
 **Plain text / attribute** (settings & skin standard places):
@@ -182,7 +207,7 @@ not rewritten.
 
 ### Comments that control kolang
 
-Three comment shapes, all parsed by kolang from XML comments preceding an
+Four comment shapes, all parsed by kolang from XML comments preceding an
 element. Free-form developer comments between them are skipped.
 
 #### `:translate=…:` — should this go to PO?
@@ -206,6 +231,20 @@ You can combine on one line:
 <!-- :translate[label]=true: :translate[help]=false: -->
 <setting label="Movies" help="$INFO[Window.Property(help)]">
 ```
+
+#### `:context=…:` — text context of a new text
+
+```xml
+<!-- :context=verb: -->                <!-- all targets of the element -->
+<!-- :context[label]=adjective: -->    <!-- only the `label` attr ([] is text content) -->
+<setting label="Open"/>
+```
+
+After the ID is assigned the context moves to the `L()` marker and the
+directive is removed: `<!-- L[label](30101, 'Open', ctx='adjective') -->`.
+Edit the context there. `:context:` next to an `L()` marker is like a text
+next to it: the same context is removed with a warning, a different one is an
+error (two sources of truth). The value can't contain `:`.
 
 #### `:python=…:` — should kolang look for L() calls inside?
 
