@@ -417,6 +417,7 @@ Most-used options:
 | `-f FUNC`, `--localized-function FUNC` | extra L-like function name (CLI shortcut) |
 | `--get-localized-string` / `--no-get-localized-string` | toggle scanning `getLocalizedString()` |
 | `--dry-run` | do not modify anything |
+| `--reset-ids REF` | remove IDs new on the branch before merge into `REF` (see Git) |
 | `--list WHAT` | list `fuzzy` or `untranslated` entries per language (repeatable); with `--dry-run` it's a read-only report |
 | `--verbose` / `--debug` | more output |
 | `--generate-kolang-py` | drop `kolang.py` (the runtime `L()` helper) into the addon |
@@ -539,6 +540,30 @@ translation to the ID of its text and prints a warning.
 If both branches added an identical element at the same place, git keeps one
 element with two `L[]` comments above it. kolang stops with an error on the
 second comment for the same target — restore the lost element by hand.
+
+#### Before merge: `--reset-ids REF`
+
+Collisions can be avoided before the merge: remove IDs that are new on the
+branch (not in the base language PO at `git merge-base HEAD REF`), then IDs
+are assigned once, on `REF` after the merge.
+
+```bash
+python kolang.pyz --reset-ids main .     # on the branch, commit the result
+git checkout main && git merge feature
+python kolang.pyz .                      # on main: new IDs, translations kept
+```
+
+- Sources get the text back: `L(30150, 'New')` → `L('New')`, XML values and
+  `lvalues` items → text, whole skin `$ADDON[addon 30150]` → text, `L()`
+  comment removed (its `ctx` → `:context[…]=…:`).
+- PO entries (all languages) lose `msgctxt "#ID"`: translation waits in an
+  entry without ID (Kodi ignores it, so on the branch the English text is
+  shown). The next normal run gives the text an ID and takes the translation;
+  texts waiting for an ID are reported as `pending: N`.
+- Kept (reported): IDs used by number (`getLocalizedString(30150)`,
+  `$LOCALIZE[30150]`, `label="30150"` without `L()` comment) and texts that
+  have another ID too.
+- The run assigns no new IDs. Run it again if the branch changes.
 
 ---
 

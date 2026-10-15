@@ -11,7 +11,7 @@ from __future__ import annotations
 import sys
 import re
 import string
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dc_replace
 from itertools import chain
 from typing import Any, Literal, overload, TYPE_CHECKING
 from pathlib import Path
@@ -551,6 +551,8 @@ class Trans:
     start: int
     end: int
     fmt: str = '{label.id}'
+    #: End of `ID, ` in `L(ID, 'text')` (start of the text), to remove the ID (`--reset-ids`).
+    id_end: int | None = None
 
     def replace(self, label: Label, *, fmt: str | None = None) -> None:
         if fmt is None:
@@ -802,6 +804,10 @@ class Translate(TranslateBase):
         #: Map id → new (ctx, text) for labels renamed in `generate()`. Used by
         #: `translate()` to update the matching `msgid` in each PO.
         self._renamed_ids: dict[int, tuple[str, str]] = {}
+        #: IDs used by numeric references (`getLocalizedString(N)`, `$LOCALIZE[N]`, `label="N"` without `L()` comment).
+        self._refs: set[int] = set()
+        #: IDs removed by `reset_ids()`, their PO entries lose `msgctxt` (translation waits for a new ID).
+        self._reset_ids: set[int] = set()
         #: True if po msg are splited into mulitple lines.
         self.multi_line_msg: bool = multi_line_msg
         #: Cache of loaded addon configs keyed by resolved config-file path.
@@ -842,6 +848,11 @@ class Translate(TranslateBase):
         #: produce an obsolete entry that has no translation anywhere
         #: (or `--obsolete=remove` is set, so the old entry would be dropped).
         self.rename: bool = rename
+
+    def _add_ref(self, label_id: int) -> None:
+        """Mark `label_id` as used by a numeric reference (no text, the ID can't be found again by text)."""
+        self._ids.add(label_id)
+        self._refs.add(label_id)
 
     def _add_label(self, label: Label, *, used=True):
         """Add label to existing data (by ID and by TEXT)."""
@@ -1191,7 +1202,7 @@ class Translate(TranslateBase):
                 if is_numeric:
                     nid = int(text)
                     logger.debug(f'  numeric XML ref #{nid}')
-                    self._ids.add(nid)
+                    self._add_ref(nid)
                     # Migration: if this ID is known from PO with a text,
                     # attach the node so write-side can inject L() comment.
                     existing = self._by_id.get(nid)
@@ -1317,7 +1328,7 @@ class Translate(TranslateBase):
                 xpath_skin = '|'.join(f'.//{t}' for t in skin_tags)
                 for node in root.xpath(xpath_skin):
                     text = node.text
-                    if not text:
+                    if not text or '$ADDON[' in text:  # `$ADDON[…]` texts are handled below, the rest stays literal
                         continue
                     if not gate(node, '', text):
                         continue
@@ -1342,14 +1353,14 @@ class Translate(TranslateBase):
                     if m['id']:
                         nid = int(m['id'])
                         logger.debug(f'  win.XML $LOCALIZE[#{nid}] reference')
-                        self._ids.add(nid)
+                        self._add_ref(nid)
             for node in root.xpath('.//@*[contains(.,"$LOCALIZE[")]/..'):
                 for attr_name, attr_val in node.attrib.items():
                     for m in self._RE_LOCALIZE.finditer(attr_val):
                         if m['id']:
                             nid = int(m['id'])
                             logger.debug(f'  win.XML attr {attr_name} $LOCALIZE[#{nid}] reference')
-                            self._ids.add(nid)
+                            self._add_ref(nid)
 
             # $ADDON[ID TEXT]
             for node in root.xpath('.//*[text()[contains(.,"$ADDON[")]]'):
@@ -1446,12 +1457,12 @@ class Translate(TranslateBase):
                 if s != -1:
                     return s
 
-        def msg_end(r) -> int:
-            """Return position after L() text literal (after closing quotes)."""
+        def msg_span(r) -> tuple[int, int]:
+            """Return span of L() text literal (with quotes)."""
             for g, quotes in zip(_msg_grp, (3, 3, 1, 1)):
                 if (e := r.end(g)) != -1:
-                    return e + quotes
-            return r.end()
+                    return r.start(g) - quotes, e + quotes
+            return r.span()
 
         _R_CM = r'#[^\S\r\n]*(?P<comment>[^\r\n]+)'
         _R_LL = fr'\b(?P<label>LL?)\s*(?P<label_bracket>\()\s*(?:(?P<mid>\d+)\s*,\s*)?{rstr("msg")}\s*(?:,.*?)?\)'
@@ -1484,8 +1495,9 @@ class Translate(TranslateBase):
                     tr = Trans(file, start=data_offset + offset, end=data_offset + offset, fmt='{label.id}, ')
                 else:
                     mid = int(mid)
-                    tr = Trans(file, start=data_offset + r.start('mid'), end=data_offset + r.end('mid'))
-                label = Label(mid, unescape(msg), ctx=self._call_ctx(data, msg_end(r)))
+                    tr = Trans(file, start=data_offset + r.start('mid'), end=data_offset + r.end('mid'),
+                               id_end=data_offset + msg_span(r)[0])
+                label = Label(mid, unescape(msg), ctx=self._call_ctx(data, msg_span(r)[1]))
             # " $LOCALIZE[] "
             elif s is not None:
                 for r in self._RE_PY_LOCALIZE.finditer(s):
@@ -1497,7 +1509,7 @@ class Translate(TranslateBase):
                         text = self._RE_PY_LOCALIZE_ESC.sub(r'\1', r['text'])
                         label = Label(mid, unescape(text))
                     elif mid is not None:
-                        self._ids.add(mid)  # mark as used
+                        self._add_ref(mid)
             # getLocalizedString()
             elif r['gls'] is not None:
                 mid = r['gls_id']
@@ -1508,7 +1520,7 @@ class Translate(TranslateBase):
                     # Numeric reference (e.g. getLocalizedString(123)) — only
                     # mark the ID as used; declaration lives elsewhere.
                     logger.debug(f'  numeric PY ref #{mid}')
-                    self._ids.add(int(mid))
+                    self._add_ref(int(mid))
                     continue
                 tr = Trans(file, start=data_offset + r.start('gls'), end=data_offset + r.end('gls'))
                 label = Label(None, unescape(text))
@@ -1677,7 +1689,7 @@ class Translate(TranslateBase):
             self._rename_orphan_ids()
         for lst in self._by_text.values():
             for label in lst:
-                if label.id is None:
+                if label.id is None and label.referenced:  # text only in PO (ID-less entry) waits for use
                     new_trans_count += 1
                     label.id = nextid()
                     if self.dry_run:
@@ -1708,6 +1720,81 @@ class Translate(TranslateBase):
             if removed:
                 logger.info(f'Cleaned up {removed} redundant :translate=false: comment(s)')
         return GenerateStats(new=new_trans_count, moved=len(collision), obsolete=was_obsolete)
+
+    def reset_ids(self, ref: str, po_path: Path) -> GenerateStats:
+        """Remove IDs new on this branch (`--reset-ids REF`), they are assigned again after merge into `ref`.
+
+        New IDs are IDs not in base language PO `po_path` at `git merge-base HEAD ref`. Sources get the text back
+        (`L(30150, 'New')` → `L('New')`, XML value, `ctx` → `:context[…]=…:`), PO entries lose `msgctxt` in
+        `translate()`, so translations wait for the new ID. Kept: IDs with numeric references (can't be found
+        by text) and texts with another ID (would mix translations). No new IDs are assigned in this run.
+        """
+        root = _git_root(po_path.parent if po_path.parent.exists() else Path.cwd())
+        if root is None:
+            logger.error(f'--reset-ids: {po_path} is not in a git repository')
+            sys.exit(1)
+
+        def git(*args: str) -> str:
+            """Run git command in the repository, return stdout."""
+            return subprocess.run(['git', *args], cwd=str(root), capture_output=True, text=True, check=True).stdout
+
+        try:
+            base = git('merge-base', 'HEAD', ref).strip()
+        except subprocess.CalledProcessError as exc:
+            logger.error(f'--reset-ids {ref}: {exc.stderr.strip() or "no merge base"}')
+            sys.exit(1)
+        try:
+            text = git('show', f'{base}:{po_path.resolve().relative_to(root).as_posix()}')
+        except subprocess.CalledProcessError:
+            text = ''  # no PO at merge base, all IDs are new
+        base_ids = {int(r['id']) for e in polib.pofile(text) if (r := self._RE_LABEL_NUM.fullmatch(e.msgctxt or ''))} if text else set()
+        reset: list[Label] = []
+        for mid, label in sorted(self._by_id.items()):
+            if mid in base_ids:
+                continue
+            if mid in self._refs or not label.text:
+                print(f' keep id: {mid}: {label.text!r}, numeric reference')
+            elif other := [lb.id for lb in self._by_text.get(label.key, ()) if lb is not label and lb.id is not None]:
+                print(f' keep id: {mid}: {label.text!r}, the same text has ID {other[0]}')
+            else:
+                print(f' reset id: {mid}: {label.text!r}')
+                reset.append(label)
+        # Python `L(ID, …)`: from the end, offsets are in the original value; the same occurrence can be twice in trans
+        spans = {(id(tr.file), tr.start): (lb, tr) for lb in reset for tr in lb.trans if tr.id_end is not None}
+        for label, tr in sorted(spans.values(), key=lambda x: -x[1].start):
+            dc_replace(tr, end=tr.id_end).replace(label, fmt='{before}{after}')
+        for label in reset:
+            assert label.id is not None and label.text is not None
+            for node in label.nodes:
+                if node.python:
+                    continue
+                if node.trans and node.attr is None and self._RE_ADDON.fullmatch(node.node.text or ''):
+                    node.node.text = label.text  # whole `$ADDON[addon ID]` was a plain label
+                else:
+                    node.set_label(label.text)
+                self._reset_L_comment(node, label.ctx)
+            del self._by_id[label.id]
+            self._ids.discard(label.id)
+            self._reset_ids.add(label.id)
+            label.id = None
+        if reset:
+            print(f'IDs reset: {len(reset)}, after merge into {ref} run kolang there to assign them again')
+        return GenerateStats(new=0, obsolete=len(set(self._by_id) - self._ids))
+
+    @staticmethod
+    def _reset_L_comment(node_value: NodeValue, ctx: str) -> None:
+        """Remove `L()` comment of `node_value` target (`--reset-ids`), context goes to `:context[…]=…:`."""
+        target = _node_value_target(node_value)
+        prev = node_value.node.getprevious()
+        while isinstance(prev, etree._Comment):
+            parsed = _parse_L_comment(prev.text or '')
+            if parsed is not None and parsed[0] == target:
+                if ctx:
+                    prev.text = f' :context[{target or ""}]={ctx}: '
+                elif (parent := prev.getparent()) is not None:
+                    parent.remove(prev)
+                return
+            prev = prev.getprevious()
 
     def write(self):
         for input in self.xml_inputs:
@@ -1888,6 +1975,10 @@ class Translate(TranslateBase):
             if not po.metadata.get(key):
                 po.metadata[key] = str(value).replace('{language}', self.LANG_NAMES.get(lang, lang))
         ie = {int(r['id']): e for e in po if (r := self._RE_LABEL_NUM.fullmatch(e.msgctxt or '')) is not None}
+        # `--reset-ids`: ID removed, translation waits in an entry without ID (Kodi ignores it) for a new ID
+        for mid in self._reset_ids & ie.keys():
+            ie.pop(mid).msgctxt = None
+        pending = {self._entry_key(e): e for e in po if not e.msgctxt and e.msgid}
         # Apply in-place renames: existing entries whose label was reused for
         # a new text (because old text became unreferenced).
         for old_id, new_key in self._renamed_ids.items():
@@ -1932,6 +2023,39 @@ class Translate(TranslateBase):
                     old = ie[label.ref.id]
                     self._carry_translation(entry, old.msgid, old.msgstr, old.previous_msgid)
                 po.append(entry)
+                ie[label.id] = entry
+        # Translation waiting without ID (`--reset-ids`, merged from a branch) goes to the ID of its text,
+        # unless the ID entry has its own translation.
+        for label in self._by_id.values():
+            if (old := pending.pop(label.key, None)) is not None and (entry := ie.get(label.id)) is not None:
+                if not entry.msgstr:
+                    entry.msgstr, entry.flags, entry.previous_msgid = old.msgstr, list(old.flags), old.previous_msgid
+                elif old.msgstr and old.msgstr != entry.msgstr:
+                    logger.warning(f'{path}: #{label.id} {label.text!r}: translation {old.msgstr!r} without ID dropped, '
+                                   f'{entry.msgstr!r} kept')
+                po.remove(old)
+        # Translations moved away from an ID with no text to go to: keep them without ID.
+        for key, old in misplaced.items():
+            if key not in pending:
+                self._set_entry_ctx(old, key[0])
+                po.append(old)
+                pending[key] = old
+        # Texts without ID (`--reset-ids` run): entry without ID, so translators can translate them already.
+        for lst in self._by_text.values():
+            for label in lst:
+                if label.id is None and label.referenced and label.ref is None and label.text and label.key not in pending:
+                    entry = polib.POEntry(msgid=label.text)
+                    self._set_entry_ctx(entry, label.ctx)
+                    po.append(entry)
+                    pending[label.key] = entry
+        waiting = {lb.key for lst in self._by_text.values() for lb in lst if lb.id is None and lb.referenced}
+        for key, entry in pending.items():
+            if key in waiting:
+                entry.obsolete = False
+            elif self.obsolete is ObsoleteAction.MARK:
+                entry.obsolete = True
+            elif self.obsolete is ObsoleteAction.REMOVE:
+                po.remove(entry)
         # fake translate: copy all EN entries as translated texts
         if self.mark_translated:
             for entry in po:
@@ -2004,6 +2128,8 @@ class Translate(TranslateBase):
             fz = sum(1 for e in po if e.msgstr and e.fuzzy)
             if fz:
                 mv += f', fuzzy: {fz}'
+            if pd := sum(1 for e in po if not e.msgctxt and not e.obsolete):
+                mv += f', pending: {pd}'
             if lang == BASE_LANG:
                 print(f'Language {lang}: translated: ---- ({tr}/{N}), obsolete: {ob}{nw}{mv}')
             else:
@@ -2275,7 +2401,13 @@ def process(inputs, *, args, langs=None, output=None):
 
     # do the job
     trans.scan()
-    stats = trans.generate()
+    if args.reset_ids:
+        if not pattern:
+            logger.error('--reset-ids needs an addon or skin directory (language PO files)')
+            sys.exit(1)
+        stats = trans.reset_ids(args.reset_ids, output / pattern.format(lang=BASE_LANG, lang_lower=BASE_LANG.lower()))
+    else:
+        stats = trans.generate()
     if langs:
         trans.write()
     else:
@@ -2360,6 +2492,7 @@ def merge_po(base: Path, ours: Path, theirs: Path) -> int:
     Entries are matched by ID (`msgctxt "#ID"`), text is (`#. context: …`, msgid). Same ID with a different text
     on both sides (both branches took the next free ID) is a collision: theirs entry goes to the ID its text already has in ours or gets
     a new free ID. Run kolang after the merge, it moves the colliding source labels to that ID (by text).
+    Entries without ID (`--reset-ids`) are matched by text.
     Translations are merged 3-way against `base`; changed on both sides → conflict: ours is kept as fuzzy
     with theirs in a translator comment (the merge doesn't stop, kolang counts fuzzy entries).
     """
@@ -2408,6 +2541,12 @@ def merge_po(base: Path, ours: Path, theirs: Path) -> int:
             free += 1
             po_ours.append(t)
             o_text[key(t)] = t
+    b_pend, o_pend = ({key(e): e for e in po if not e.msgctxt and e.msgid} for po in (po_base, po_ours))
+    for k, t in ((key(t), t) for t in po_theirs if not t.msgctxt and t.msgid):
+        if (e := o_pend.get(k)) is None:
+            po_ours.append(t)
+        else:
+            conflicts += merge_msgstr(e, t, b_pend.get(k))
     po_ours.save(str(ours))
     return conflicts
 
@@ -2473,6 +2612,9 @@ def main(argv=None):
     p.add_argument('--dry-run', action='store_true', help='do not modify anything')
     p.add_argument('--debug-cat-output', action='store_true', help='print output file if --dry-run')
     p.add_argument('--debug-cat-translation', metavar='LOCALE', help='print output translation if --dry-run')
+    p.add_argument('--reset-ids', metavar='REF',
+                   help='remove IDs new on this branch (not in PO at merge base with REF) before merge into REF, '
+                        'translations wait in PO without ID; run kolang on REF after the merge')
     p.add_argument('--list', action='append', choices=('fuzzy', 'untranslated'),
                    help='list fuzzy or untranslated entries per language (repeatable), with --dry-run nothing is written')
     p.add_argument('--test-plural', help='test plural form and exit')
