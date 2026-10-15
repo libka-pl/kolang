@@ -402,7 +402,7 @@ Most-used options:
 | `--id-min NUM` | warn when label ID below NUM (default = `--id-from`) |
 | `--id-max NUM` | upper bound for new IDs (default 33999) |
 | `--id-policy {max,min}` | strategy for picking next free ID |
-| `--id-reserve A-B,C` | mark ID ranges as reserved (existing labels there get moved) |
+| `--id-reserve A-B,C` | mark ID ranges as reserved (existing labels there get moved with translations; error if an ID there is used by number) |
 | `--addon-id ID` | force `$ADDON[ID …]` prefix in skin labels (else read from `addon.xml`) |
 | `--no-addon-id` | don't add `$ADDON[]` prefix at all |
 | `--obsolete {keep,mark,remove}` | how to treat PO entries no longer referenced |

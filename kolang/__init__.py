@@ -795,8 +795,8 @@ class Translate(TranslateBase):
         self.encoding: str = encoding
         #: Set of ranges of reserved IDs (IDs can be used).
         self.reserved_ids: ranges = reserved_ids or ranges()
-        #: Moved IDs  - existings IDs if they were in reserved_ids.
-        self._moved_ids: set[int] = set()
+        #: Moved IDs (existing IDs in reserved_ids): old → new, None if the unreferenced label is removed.
+        self._moved_ids: dict[int, int | None] = {}
         #: Cache of compiled `_replace_py` regexes keyed by the tuple of
         #: GLS function patterns active for the scan (recompiling per file
         #: dominated profile traces).
@@ -1676,15 +1676,25 @@ class Translate(TranslateBase):
             lidgen = max((*self._by_id, *self._ids), default=self.id_from)
 
         new_trans_count = 0
-        if collision := set(self.reserved_ids.ids()) & self._by_id.keys():
-            for mid in collision:
-                label = self._by_id.pop(mid)
-                label.id = nextid()
-                self._by_id[label.id] = label
-                self._ids.discard(mid)
-                self._moved_ids.add(mid)
+        collision = sorted(set(self.reserved_ids.ids()) & self._by_id.keys())
+        if refs := [mid for mid in collision if mid in self._refs]:
+            # numeric reference in a reserved range points to the reserved ID, moving would break it silently
+            logger.error(f'Reserved IDs used by number (getLocalizedString, $LOCALIZE, label="N"): {refs}, '
+                         f'not moved; fix the references or the reserved range')
+            sys.exit(1)
+        for mid in collision:
+            label = self._by_id.pop(mid)
+            self._ids.discard(mid)
+            if not label.referenced:  # only in PO, nothing to move, entry is removed
+                self._moved_ids[mid] = None
                 if self.dry_run:
-                    print(f' move id: {mid} → {label.id}: {label.text!r}')
+                    print(f' remove id: {mid}: {label.text!r}')
+                continue
+            label.id = nextid()
+            self._by_id[label.id] = label
+            self._moved_ids[mid] = label.id
+            if self.dry_run:
+                print(f' move id: {mid} → {label.id}: {label.text!r}')
         if self.rename:
             self._rename_orphan_ids()
         for lst in self._by_text.values():
@@ -1979,6 +1989,11 @@ class Translate(TranslateBase):
         for mid in self._reset_ids & ie.keys():
             ie.pop(mid).msgctxt = None
         pending = {self._entry_key(e): e for e in po if not e.msgctxt and e.msgid}
+        # `--id-reserve`: entry of a moved ID is renumbered (translation, flags and comments stay)
+        for old_id, new_id in self._moved_ids.items():
+            if new_id is not None and (entry := ie.pop(old_id, None)) is not None:
+                entry.msgctxt = f'#{new_id}'
+                ie[new_id] = entry
         # Apply in-place renames: existing entries whose label was reused for
         # a new text (because old text became unreferenced).
         for old_id, new_key in self._renamed_ids.items():
