@@ -24,6 +24,9 @@ import io
 
 __author__ = 'David Jean Louis <izimobil@gmail.com>'
 __version__ = '1.2.0'
+
+#: kolang: comment without space after `#` / `#.` / `#:` / `#,` / `#|` (not `#~` obsolete entries).
+_RE_COMMENT_NO_SPACE = re.compile(r'^#([.,:|]?)(?=[^\s~.,:|])')
 __all__ = ['pofile', 'POFile', 'POEntry', 'mofile', 'MOFile', 'MOEntry',
            'default_encoding', 'escape', 'unescape', 'detect_encoding', ]
 
@@ -1358,6 +1361,9 @@ class _POFileParser(object):
                 line = line.strip()
                 if line == '':
                     continue
+                # kolang: Kodi PO files have comments without space (`#empty strings …`, `#.Item label …`),
+                # msgfmt accepts them, polib doesn't.
+                line = _RE_COMMENT_NO_SPACE.sub(r'#\1 ', line)
 
                 tokens = line.split(None, 2)
                 nb_tokens = len(tokens)
