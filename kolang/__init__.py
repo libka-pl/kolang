@@ -1732,7 +1732,8 @@ class Translate(TranslateBase):
         if self.id_policy == 'min':
             lidgen = self.id_from
         else:
-            lidgen = max((*self._by_id, *self._ids), default=self.id_from)
+            # only own range: references to Kodi core strings (e.g. `$LOCALIZE[38031]`) are above `id-max`
+            lidgen = max((n for n in chain(self._by_id, self._ids) if self.id_from <= n <= self.id_max), default=self.id_from)
 
         new_trans_count = 0
         collision = sorted(set(self.reserved_ids.ids()) & self._by_id.keys())

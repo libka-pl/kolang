@@ -118,3 +118,11 @@ def test_two_edits_of_one_text(addon: Path, kolang_run, po_path: Path, msgstr: s
             assert f'#, fuzzy\n#| msgid "Save"\nmsgctxt "#{mid}"\nmsgid "{text}"\nmsgstr "Zapisz"' in po, po
         else:
             assert f'msgctxt "#{mid}"\nmsgid "{text}"\nmsgstr ""' in po, po
+
+
+def test_new_id_ignores_core_references(addon: Path, kolang_run, po_path: Path) -> None:
+    """Numeric references outside the own ID range (Kodi core strings) don't move the next free ID above id-max."""
+    py = write_py(addon, "x = getLocalizedString(38031)\ny = getLocalizedString(30105)\na = L('New')\n")
+    rc, out = kolang_run()
+    assert rc == 0, out
+    assert "a = L(30106, 'New')" in py.read_text(encoding='utf-8')
