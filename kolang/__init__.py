@@ -11,6 +11,7 @@ from __future__ import annotations
 import sys
 import re
 import string
+from bisect import bisect
 from dataclasses import dataclass, field, replace as dc_replace
 from itertools import chain
 from typing import Any, Literal, overload, TYPE_CHECKING
@@ -180,6 +181,8 @@ _RE_TRANSLATE_KEY = re.compile(r'^translate(?:\[([^\]]*)\])?$')
 _RE_PYTHON_KEY = re.compile(r'^python(?:\[([^\]]*)\])?$')
 # Matches `context` (general) or `context[<target>]`. Value is the text context (no `:` inside).
 _RE_CONTEXT_KEY = re.compile(r'^context(?:\[([^\]]*)\])?$')
+#: Note for translators (gettext `xgettext --add-comments=Translators:` convention), in Python and XML comments.
+_RE_TRANSLATORS = re.compile(r'\s*translators(?:\[(?P<target>[^\]]*)\])?\s*:\s*(?P<text>.*?)\s*$', re.IGNORECASE | re.DOTALL)
 _RE_CONTEXT_DIRECTIVE = re.compile(r'\s*:\s*context(?:\[[^\]]*\])?\s*=[^:]*:')
 
 #: Allowed `:python=…:` values.
@@ -465,6 +468,20 @@ def _context_override(node, target: str | None) -> str | None:
             general = g
         prev = prev.getprevious()
     return general
+
+
+def _translators_notes(node, target: str | None) -> list[str]:
+    """Return notes of `<!-- Translators: … -->` / `<!-- Translators[target]: … -->` comments before `node` for `target`
+    (general ones too, `[]` is text content, `lvalues#N` matches `[lvalues]`), whitespace collapsed, in document order.
+    """
+    target = target or ''
+    notes: list[str] = []
+    prev = node.getprevious()
+    while isinstance(prev, etree._Comment):
+        if (m := _RE_TRANSLATORS.match(prev.text or '')) and m['target'] in (None, target, target.split('#', 1)[0]):
+            notes.insert(0, ' '.join(m['text'].split()))
+        prev = prev.getprevious()
+    return notes
 
 
 def _remove_context_comments(node) -> None:
@@ -804,6 +821,8 @@ class Translate(TranslateBase):
         #: Map id → new (ctx, text) for labels renamed in `generate()`. Used by
         #: `translate()` to update the matching `msgid` in each PO.
         self._renamed_ids: dict[int, tuple[str, str]] = {}
+        #: Notes for translators (`Translators:` comments in sources) by text key, written as `#. Translators: …`.
+        self._notes: dict[tuple[str, str], list[str]] = {}
         #: IDs used by numeric references (`getLocalizedString(N)`, `$LOCALIZE[N]`, `label="N"` without `L()` comment).
         self._refs: set[int] = set()
         #: IDs removed by `reset_ids()`, their PO entries lose `msgctxt` (translation waits for a new ID).
@@ -848,6 +867,12 @@ class Translate(TranslateBase):
         #: produce an obsolete entry that has no translation anywhere
         #: (or `--obsolete=remove` is set, so the old entry would be dropped).
         self.rename: bool = rename
+
+    def _add_note(self, key: tuple[str, str], note: str) -> None:
+        """Add note for translators (`Translators:` comment) to text `key`, without duplicates."""
+        notes = self._notes.setdefault(key, [])
+        if note and note not in notes:
+            notes.append(note)
 
     def _add_ref(self, label_id: int) -> None:
         """Mark `label_id` as used by a numeric reference (no text, the ID can't be found again by text)."""
@@ -1215,6 +1240,8 @@ class Translate(TranslateBase):
                     return
                 label = Label(None, text, ctx=ctx or '')
                 label.nodes.add(node)
+                for note in _translators_notes(node.node, target):
+                    self._add_note(label.key, note)
                 self._add_label(label)
                 return
             # L() comment present — comment is authoritative (matrix G).
@@ -1249,6 +1276,8 @@ class Translate(TranslateBase):
                     )
                     sys.exit(1)
             label.nodes.add(node)
+            for note in _translators_notes(node.node, target):
+                self._add_note(label.key, note)
             self._add_label(label)
 
         def is_enabled(node: Element) -> bool:
@@ -1480,8 +1509,25 @@ class Translate(TranslateBase):
         if R is None:
             R = re.compile(pat)
             self._replace_py_re_cache[cache_key] = R
+        # `# Translators: …` comment block: notes for L() on the next line (block above) or on the same line (trailing)
+        newlines = [m.start() for m in re.finditer('\n', data)]
+        block: list[str] = []
+        block_line = -2
+        line_keys: tuple[int, list[tuple[str, str]]] = (-1, [])
+        xml_notes = _translators_notes(node.node, _node_value_target(node)) if node is not None else []
         for r in R.finditer(data):
-            if r['comment'] is not None:  # skip comments
+            if r['comment'] is not None:
+                line = bisect(newlines, r.start())
+                own_line = not data[(newlines[line - 1] + 1 if line else 0):r.start()].strip()
+                if m := _RE_TRANSLATORS.match(r['comment']):
+                    if not own_line:
+                        for key in line_keys[1] if line_keys[0] == line else ():
+                            self._add_note(key, m['text'])
+                        continue
+                    block, block_line = [m['text']], line
+                elif own_line and block and block_line == line - 1:
+                    block.append(r['comment'].strip())   # continuation of the block
+                    block_line = line
                 continue
             label: Label | None = None
             tr = None
@@ -1529,6 +1575,14 @@ class Translate(TranslateBase):
                     label.trans.append(tr)
                 if node is not None:
                     label.nodes.add(node)
+                if label.text is not None:
+                    line = bisect(newlines, r.start())
+                    notes = [' '.join(' '.join(block).split())] if block and block_line == line - 1 else []
+                    for note in notes + xml_notes:
+                        self._add_note(label.key, note)
+                    if line_keys[0] != line:
+                        line_keys = line, []
+                    line_keys[1].append(label.key)
                 self._add_label(label)
 
     def _is_git_tracked(self, path: Path) -> bool:
@@ -2115,10 +2169,14 @@ class Translate(TranslateBase):
         nplurals = self._nplurals(lang, po)
         plural_note = f'{nplurals} plural form{"s" if nplurals != 1 else ""} separated by |||'
         for entry in po:
-            lines = [ln for ln in entry.comment.split('\n') if ln and not self._RE_PLURAL_NOTE.fullmatch(ln)]
+            lines = [ln for ln in entry.comment.split('\n')
+                     if ln and not self._RE_PLURAL_NOTE.fullmatch(ln) and not _RE_TRANSLATORS.match(ln)]
             if nplurals and '|||' in entry.msgid and not entry.obsolete:
                 lines.append(plural_note)
-            entry.comment = '\n'.join(lines)
+            # `#. Translators: …` from sources after the context line
+            notes = [] if entry.obsolete else [f'Translators: {note}' for note in self._notes.get(self._entry_key(entry), ())]
+            at = 1 if lines and self._RE_CONTEXT_NOTE.fullmatch(lines[0]) else 0
+            entry.comment = '\n'.join(lines[:at] + notes + lines[at:])
         self._check_translations(lang, path, po)
         for entry in po:
             if entry.obsolete or not entry.msgctxt:

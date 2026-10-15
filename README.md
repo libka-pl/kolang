@@ -165,6 +165,25 @@ translation is copied as `#, fuzzy` (review it). Changing only the context of
 an ID keeps the ID, the translation becomes fuzzy like on text edit.
 `getLocalizedString('text')` and `$LOCALIZE[text]` have no context.
 
+#### Notes for translators (`Translators:`)
+
+A comment starting with `Translators:` (any case, gettext convention) right
+above the line with `L()` (consecutive comment lines are one note) or at the
+end of that line goes to PO as `#. Translators: …`. It doesn't change IDs.
+
+```python
+# Translators: button in the main menu,
+#   keep it short
+L(30100, 'Open')
+L(30101, 'Close')  # Translators: closes the dialog
+```
+
+In XML `<!-- Translators: … -->` before the element is for all its values,
+`<!-- Translators[label]: … -->` for one target (`[]` text content). It also
+covers `L()` in `{…}` / raw Python values of the element. The same text used in
+more places gets all its notes. PO lines follow the sources on every run;
+other `#.` lines are kept.
+
 #### In XML — three independent layers
 
 **Plain text / attribute** (settings & skin standard places):
@@ -207,7 +226,7 @@ not rewritten.
 
 ### Comments that control kolang
 
-Four comment shapes, all parsed by kolang from XML comments preceding an
+Four comment shapes (and `Translators:` notes, see Python), all parsed by kolang from XML comments preceding an
 element. Free-form developer comments between them are skipped.
 
 #### `:translate=…:` — should this go to PO?
