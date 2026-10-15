@@ -1643,7 +1643,9 @@ class Translate(TranslateBase):
         """Load XML and keep data."""
         pofile = polib.pofile(path)
         was_obsolete = 0
-        for entry in pofile:
+        # active entries first: an obsolete entry (old text of the ID, e.g. kept by Weblate) doesn't define the ID
+        # when the ID is known, otherwise it would look like an edit of the text (B27)
+        for entry in sorted(pofile, key=lambda e: e.obsolete):
             text = entry.msgid
             if self._RE_LABEL_NUM.fullmatch(text) and '[empty]' in entry.comment:
                 text = None
@@ -1651,6 +1653,9 @@ class Translate(TranslateBase):
                 label = Label(None, text, ctx=self._entry_ctx(entry))
             else:
                 lid = int(r.group(1))
+                if entry.obsolete and lid in self._by_id:
+                    was_obsolete += 1
+                    continue
                 label = Label(lid, text, ctx=self._entry_ctx(entry))
             self._add_label(label, used=False)
             if entry.obsolete:
@@ -1684,8 +1689,8 @@ class Translate(TranslateBase):
                 # non-empty text and an id — defensively narrow types here.
                 if L1.id is None or L1.text is None:
                     continue
-                if L1.referenced:
-                    continue                  # 'old' still referenced, it's a collision, not an edit
+                if L1.referenced or L1.id in self._refs:
+                    continue                  # 'old' still referenced (also by number), it's a collision, not an edit
                 # Don't rename onto a text that already has its own concrete ID.
                 if any(lb.id is not None and lb is not label for lb in lst):
                     continue
@@ -2038,7 +2043,9 @@ class Translate(TranslateBase):
         for key, value in header.items():
             if not po.metadata.get(key):
                 po.metadata[key] = str(value).replace('{language}', self.LANG_NAMES.get(lang, lang))
-        ie = {int(r['id']): e for e in po if (r := self._RE_LABEL_NUM.fullmatch(e.msgctxt or '')) is not None}
+        # active entry wins over an obsolete one with the same ID (old text kept by Weblate)
+        ie = {int(r['id']): e for e in sorted(po, key=lambda e: not e.obsolete)
+              if (r := self._RE_LABEL_NUM.fullmatch(e.msgctxt or '')) is not None}
         # `--reset-ids`: ID removed, translation waits in an entry without ID (Kodi ignores it) for a new ID
         for mid in self._reset_ids & ie.keys():
             ie.pop(mid).msgctxt = None
@@ -2088,7 +2095,8 @@ class Translate(TranslateBase):
                 if (old := misplaced.pop(label.key, None)) is not None:
                     entry.msgstr, entry.flags, entry.previous_msgid = old.msgstr, old.flags, old.previous_msgid
                 elif (label.ref is not None and label.ref.id in ie
-                      and (not label.ref.referenced or label.ref.id in self._renamed_ids or label.ref.text == label.text)):
+                      and ((not label.ref.referenced and label.ref.id not in self._refs) or label.ref.id in self._renamed_ids
+                           or label.ref.text == label.text)):
                     old = ie[label.ref.id]
                     self._carry_translation(entry, old.msgid, old.msgstr, old.previous_msgid)
                 po.append(entry)
@@ -2134,7 +2142,7 @@ class Translate(TranslateBase):
         for entry in po:
             if entry.obsolete and (r := self._RE_LABEL_NUM.fullmatch(entry.msgctxt or '')) is not None:
                 mid = int(r.group('id'))
-                if mid in self._ids:
+                if mid in self._ids and ie.get(mid) is entry:
                     entry.obsolete = False
         # mark obsolete if ID is not used in XML nor PY (but skip if moved)
         if self.obsolete is ObsoleteAction.MARK:
@@ -2187,18 +2195,18 @@ class Translate(TranslateBase):
             elif 'untranslated' in self.list_entries and not entry.msgstr and lang != BASE_LANG:
                 print(f'{lang} untranslated {entry.msgctxt} {entry.msgid!r}')
         if self.stats:
-            N = len(po)
+            N = sum(1 for e in po if not e.obsolete)
             ob = len(set(self._by_id) - self._ids)
             # nw = len(self._ids) - len(ie)
             nw = mv = ''
             if stats:
                 if old_stats and ob != old_stats.obsolete:
-                    ob = f'{ob} (+{ob - old_stats.obsolete})'
+                    ob = f'{ob} ({ob - old_stats.obsolete:+})'
                 nw = f', new: {stats.new}'
                 if stats.moved:
                     mv = f', moved: {stats.moved}'
-            tr = sum(1 for e in po if e.msgstr and not e.fuzzy)
-            fz = sum(1 for e in po if e.msgstr and e.fuzzy)
+            tr = sum(1 for e in po if e.msgstr and not e.fuzzy and not e.obsolete)
+            fz = sum(1 for e in po if e.msgstr and e.fuzzy and not e.obsolete)
             if fz:
                 mv += f', fuzzy: {fz}'
             if pd := sum(1 for e in po if not e.msgctxt and not e.obsolete):
