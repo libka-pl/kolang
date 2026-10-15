@@ -65,6 +65,17 @@ is a collision (not an edit): the other text gets a new ID.
 
 ---
 
+### Sources
+
+Without `sources` in `.kolang.json` kolang scans `resources/settings.xml`,
+`*.py` in the addon root, `resources/lib`, `lib`, `resources/skins` and, for a
+skin (`xbmc.gui.skin` in `addon.xml`), the `<res folder=…>` folders plus
+`extras` and `shortcuts`. XML with `<window>` or `<includes>` root is scanned
+as skin, `<settings>` as settings; `$LOCALIZE[N]` in any XML and skin
+`<viewtype label="N">` / `<fontset idloc="N">` mark the ID as used.
+`--obsolete mark/remove` stops with an error when no source file was scanned
+(it would make every string obsolete).
+
 ### How translatable strings are spotted
 
 #### In Python (`.py`)

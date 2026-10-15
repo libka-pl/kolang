@@ -1313,7 +1313,7 @@ class Translate(TranslateBase):
         if xtype == XmlType.Auto:
             if root.tag == 'settings':
                 xtype = XmlType.Settings
-            elif root.tag == 'window':
+            elif root.tag in ('window', 'includes'):  # skin window or includes (most of skin labels)
                 xtype = XmlType.Window
 
         def gate(node: Element, target: str | None, text: str | None) -> bool:
@@ -1327,6 +1327,27 @@ class Translate(TranslateBase):
         # -- step 1: python scan (raw / fstring) — modifies values in place.
         is_skin = (xtype == XmlType.Window)
         self._python_scan_pass(root, is_skin=is_skin, path=path)
+
+        # $LOCALIZE[N] in any XML (skin window/includes, skinshortcuts, …) — runtime substitution to Kodi string by ID.
+        # Mark the ID as used so the generator doesn't reassign it to a new label.
+        for node in root.xpath('.//*[text()[contains(.,"$LOCALIZE[")]]'):
+            for m in self._RE_LOCALIZE.finditer(node.text or ''):
+                if m['id']:
+                    nid = int(m['id'])
+                    logger.debug(f'  XML $LOCALIZE[#{nid}] reference')
+                    self._add_ref(nid)
+        for node in root.xpath('.//@*[contains(.,"$LOCALIZE[")]/..'):
+            for attr_name, attr_val in node.attrib.items():
+                for m in self._RE_LOCALIZE.finditer(attr_val):
+                    if m['id']:
+                        nid = int(m['id'])
+                        logger.debug(f'  XML attr {attr_name} $LOCALIZE[#{nid}] reference')
+                        self._add_ref(nid)
+
+        # skin attributes with a string ID: `<viewtype label="N">`, `<fontset idloc="N">` (Font.xml)
+        for value in root.xpath('.//viewtype/@label|.//fontset/@idloc'):
+            if value.isdigit():
+                self._add_ref(int(value))
 
         # -- step 2: translate scan (settings / window).
         text_tags = ('heading', *self.extra_translate_tags)
@@ -1375,22 +1396,6 @@ class Translate(TranslateBase):
                         logger.debug(f'  found win.XML node {node.tag} attr {attr}, value {text!r}')
                         add(text, NodeValue(node, attr, trans=(Trans(None, start=0, end=len(text),
                                                                      fmt='$ADDON[{addon} {id}]'),)))
-            # $LOCALIZE[N] — runtime substitution to Kodi string by ID. Mark the
-            # ID as used so the generator doesn't reassign it to a new label.
-            for node in root.xpath('.//*[text()[contains(.,"$LOCALIZE[")]]'):
-                for m in self._RE_LOCALIZE.finditer(node.text or ''):
-                    if m['id']:
-                        nid = int(m['id'])
-                        logger.debug(f'  win.XML $LOCALIZE[#{nid}] reference')
-                        self._add_ref(nid)
-            for node in root.xpath('.//@*[contains(.,"$LOCALIZE[")]/..'):
-                for attr_name, attr_val in node.attrib.items():
-                    for m in self._RE_LOCALIZE.finditer(attr_val):
-                        if m['id']:
-                            nid = int(m['id'])
-                            logger.debug(f'  win.XML attr {attr_name} $LOCALIZE[#{nid}] reference')
-                            self._add_ref(nid)
-
             # $ADDON[ID TEXT]
             for node in root.xpath('.//*[text()[contains(.,"$ADDON[")]]'):
                 text = node.text
@@ -2227,6 +2232,16 @@ class Translate(TranslateBase):
         else:
             po.save(path)
 
+    @staticmethod
+    def _skin_folders(path: Path) -> list[Path]:
+        """Return XML folders of a skin addon: `<res folder=…>` of `xbmc.gui.skin` in addon.xml, `extras`, `shortcuts`."""
+        if not (path / 'addon.xml').exists():
+            return []
+        folders = etree.parse(str(path / 'addon.xml')).xpath('//extension[@point="xbmc.gui.skin"]/res/@folder')
+        if not folders:
+            return []
+        return [path / name for name in dict.fromkeys((*folders, 'extras', 'shortcuts'))]
+
     def _load_addon_id(self, path: Path) -> str | None:
         """Try to read addon ID from `path` (addon folder with addon.xml). Return ID if found, else None."""
         if (path / 'addon.xml').exists():
@@ -2259,6 +2274,7 @@ class Translate(TranslateBase):
             path / 'resources' / 'lib',
             path / 'lib',
             path / 'resources' / 'skins',
+            *self._skin_folders(path),
         ):
             if p.exists():
                 paths.append(p)
@@ -2480,6 +2496,12 @@ def process(inputs, *, args, langs=None, output=None):
     # override settings from command-line
     if args.obsolete is not None:
         trans.obsolete = args.obsolete
+
+    # `--obsolete mark/remove` with nothing scanned would mark/remove every string (e.g. unknown source layout)
+    if trans.obsolete is not ObsoleteAction.KEEP and not (trans.xml_inputs or trans.py_inputs):
+        logger.error(f'No source file scanned, --obsolete {trans.obsolete.value} would make every string obsolete; '
+                     f'check sources (addon layout, .kolang.json)')
+        sys.exit(1)
 
     # do the job
     trans.scan()
