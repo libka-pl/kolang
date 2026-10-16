@@ -98,6 +98,17 @@ L(30101, 'item|||items', n=cnt)       # ID inserted, n= passes through
 getLocalizedString(30200)             # unchanged — only marked as used
 ```
 
+The first argument must be a plain string literal; the call may span lines and
+adjacent literals are one text (Python concatenation, comments between them
+are fine). `L(30200)` / `L(30200, n=…)` without text only marks the ID as used.
+`L(f'…')`, `L('a' + x)`, `L('a' % x)` can't be translated: kolang warns
+(`L() text is not a plain string literal`). `L(variable)` is silent.
+
+```python
+L('Long text, first part, '            # → L(30101, 'Long text, …'
+  'second part', n=count)
+```
+
 PO gets one entry per unique text:
 ```
 msgctxt "#30100"

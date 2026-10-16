@@ -942,6 +942,12 @@ class Translate(TranslateBase):
             self._ids.add(label.id)
         return label
 
+    #: Python string literal (no prefix), for `L()` regex.
+    _R_PY_LIT: str = (r'(?:"""(?:\\.|[^"]|"(?!""))*"""' + r"|'''(?:\\.|[^']|'(?!''))*'''"
+                      + r'|"(?:\\.|[^"])*"' + r"|'(?:\\.|[^'])*')")
+    #: Parts of adjacent literals in `L()` text: comments (skipped) and literal contents.
+    _RE_PY_LIT_PART = re.compile(r'#[^\n]*|"""((?:\\.|[^"]|"(?!""))*)"""' + r"|'''((?:\\.|[^']|'(?!''))*)'''"
+                                 + r'|"((?:\\.|[^"])*)"' + r"|'((?:\\.|[^'])*)'")
     #: Python call tokens for `_call_ctx()`: string literals (skipped, `ctx=` keyword before), brackets.
     _RE_CALL_TOKEN = re.compile(r'''(?P<ctx>\bctx\s*=\s*)?(?P<str>"""(?:\\.|[^"]|"(?!""))*"""|'''
                                 r"""'''(?:\\.|[^']|'(?!''))*'''|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|[([{]|[)\]}]""")
@@ -1476,7 +1482,6 @@ class Translate(TranslateBase):
         # Pre-computed group name tuples — avoids 4× f-string formatting
         # per call in the hot finditer loop.
         _str_grp = ('str1', 'str2', 'str3', 'str4')
-        _msg_grp = ('msg1', 'msg2', 'msg3', 'msg4')
         _gls_grp = ('gls_text1', 'gls_text2', 'gls_text3', 'gls_text4')
 
         def rval(r, groups=_str_grp):
@@ -1491,15 +1496,15 @@ class Translate(TranslateBase):
                 if s != -1:
                     return s
 
-        def msg_span(r) -> tuple[int, int]:
-            """Return span of L() text literal (with quotes)."""
-            for g, quotes in zip(_msg_grp, (3, 3, 1, 1)):
-                if (e := r.end(g)) != -1:
-                    return r.start(g) - quotes, e + quotes
-            return r.span()
-
         _R_CM = r'#[^\S\r\n]*(?P<comment>[^\r\n]+)'
-        _R_LL = fr'\b(?P<label>LL?)\s*(?P<label_bracket>\()\s*(?:(?P<mid>\d+)\s*,\s*)?{rstr("msg")}\s*(?:,.*?)?\)'
+        # L(ID, 'text' 'more', …): the first argument is exactly a string literal (adjacent literals are one text,
+        # also across lines, comments between them); the end of the call isn't needed (line breaks, nested calls)
+        lit = self._R_PY_LIT
+        _R_LL = (fr'\b(?P<label>LL?)\s*\(\s*(?:(?P<mid>\d+)\s*,\s*)?(?P<msgs>{lit}(?:(?:\s|#[^\n]*)*{lit})*)\s*(?=[,)])'
+                 # L(ID) / L(ID, n=…) without text: numeric reference
+                 fr'|\bLL?\s*\(\s*(?P<ref>\d+)\s*(?=[,)])'
+                 # literal starts the argument, but it isn't a plain literal (f-string, prefix, expression)
+                 fr'|\bLL?\s*\(\s*(?:\d+\s*,\s*)?(?P<bad>(?:[fFrRbBuU]{{1,2}})?{lit})')
         pat = f'{_R_CM}|{rstr()}|{_R_LL}'
         l8funcs = list(l8funcs or ())
         if self.handle_getLocalizedString:
@@ -1536,19 +1541,26 @@ class Translate(TranslateBase):
                 continue
             label: Label | None = None
             tr = None
-            s, msg = rval(r), rval(r, _msg_grp)
+            s = rval(r)
             sstart = rstart(r)
+            if r['ref'] is not None:
+                self._add_ref(int(r['ref']))
+                continue
+            if r['bad'] is not None:
+                where = f'{path}:{node.node.sourceline}' if node is not None else f'{path}:{bisect(newlines, r.start()) + 1}'
+                logger.warning(f'{where}: L() text is not a plain string literal, not translated: {r[0]!r}')
+                continue
             # L()
-            if msg is not None:
-                mid = r['mid']
-                if mid is None:
-                    offset = r.end('label_bracket')
-                    tr = Trans(file, start=data_offset + offset, end=data_offset + offset, fmt='{label.id}, ')
+            if (msgs := r['msgs']) is not None:
+                msg = ''.join(unescape(next(v for v in m.groups() if v is not None))
+                              for m in self._RE_PY_LIT_PART.finditer(msgs) if m[0][0] != '#')
+                start = data_offset + r.start('msgs')
+                if (mid := r['mid']) is None:
+                    tr = Trans(file, start=start, end=start, fmt='{label.id}, ')
                 else:
                     mid = int(mid)
-                    tr = Trans(file, start=data_offset + r.start('mid'), end=data_offset + r.end('mid'),
-                               id_end=data_offset + msg_span(r)[0])
-                label = Label(mid, unescape(msg), ctx=self._call_ctx(data, msg_span(r)[1]))
+                    tr = Trans(file, start=data_offset + r.start('mid'), end=data_offset + r.end('mid'), id_end=start)
+                label = Label(mid, msg, ctx=self._call_ctx(data, r.end('msgs')))
             # " $LOCALIZE[] "
             elif s is not None:
                 for r in self._RE_PY_LOCALIZE.finditer(s):
