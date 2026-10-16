@@ -20,11 +20,15 @@ import struct
 import sys
 import textwrap
 import io
+import logging
 
 
 __author__ = 'David Jean Louis <izimobil@gmail.com>'
 __version__ = '1.2.0'
 
+#: kolang: quoted line (`msgid "…"`, `"…"`, also obsolete / previous) — inner unescaped `"` is tolerated like Kodi does.
+_RE_QUOTED_LINE = re.compile(r'^((?:#[~|]\s*)?(?:msgctxt|msgid(?:_plural)?|msgstr(?:\[\d+\])?)?\s*)"(.*)"$')
+_RE_ESCAPE_OR_QUOTE = re.compile(r'(\\.)|"')
 #: kolang: comment without space after `#` / `#.` / `#:` / `#,` / `#|` (not `#~` obsolete entries).
 _RE_COMMENT_NO_SPACE = re.compile(r'^#([.,:|]?)(?=[^\s~.,:|])')
 __all__ = ['pofile', 'POFile', 'POEntry', 'mofile', 'MOFile', 'MOEntry',
@@ -418,6 +422,7 @@ class _BaseFile(list):
         Returns the file metadata as a :class:`~polib.POFile` instance.
         """
         e = POEntry(msgid='')
+        e.SPLIT_LINES = True  # kolang: header one field per line (gettext standard), whatever SPLIT_LINES is
         mdata = self.ordered_metadata()
         if mdata:
             strs = []
@@ -521,34 +526,8 @@ class _BaseFile(list):
         dictionary. The return value is list of tuples (metadata name,
         metadata_value).
         """
-        # copy the dict first
-        metadata = self.metadata.copy()
-        data_order = [
-            'Project-Id-Version',
-            'Report-Msgid-Bugs-To',
-            'POT-Creation-Date',
-            'PO-Revision-Date',
-            'Last-Translator',
-            'Language-Team',
-            'Language',
-            'MIME-Version',
-            'Content-Type',
-            'Content-Transfer-Encoding',
-            'Plural-Forms'
-        ]
-        ordered_data = []
-        for data in data_order:
-            try:
-                value = metadata.pop(data)
-                ordered_data.append((data, value))
-            except KeyError:
-                pass
-        # the rest of the metadata will be alphabetically ordered since there
-        # are no specs for this AFAIK
-        for data in natural_sort(metadata.keys()):
-            value = metadata[data]
-            ordered_data.append((data, value))
-        return ordered_data
+        # kolang: fields in read / insertion order (no diff noise in PO files from other tools)
+        return list(self.metadata.items())
 
     def to_binary(self):
         """
@@ -1041,21 +1020,8 @@ class POEntry(_BaseEntry):
                     filelist.append('%s:%s' % (fpath, lineno))
                 else:
                     filelist.append(fpath)
-            filestr = ' '.join(filelist)
-            if wrapwidth > 0 and len(filestr) + 3 > wrapwidth:
-                # textwrap split words that contain hyphen, this is not
-                # what we want for filenames, so the dirty hack is to
-                # temporally replace hyphens with a char that a file cannot
-                # contain, like "*"
-                ret += [line.replace('*', '-') for line in textwrap.wrap(
-                    filestr.replace('-', '*'),
-                    wrapwidth,
-                    initial_indent='#: ',
-                    subsequent_indent='#: ',
-                    break_long_words=False
-                )]
-            else:
-                ret.append('#: ' + filestr)
+            # kolang: one occurrence per line (Kodi style), not joined and wrapped like xgettext
+            ret += ['#: ' + f for f in filelist]
 
         # flags (TODO: wrapping ?)
         if self.flags:
@@ -1364,6 +1330,13 @@ class _POFileParser(object):
                 # kolang: Kodi PO files have comments without space (`#empty strings …`, `#.Item label …`),
                 # msgfmt accepts them, polib doesn't.
                 line = _RE_COMMENT_NO_SPACE.sub(r'#\1 ', line)
+                # kolang: unescaped `"` inside a string (`msgid "… "Name""`): Kodi takes the text between the first
+                # and the last quote, polib and msgfmt fail; read like Kodi, written escaped.
+                if (m := _RE_QUOTED_LINE.match(line)) is not None:
+                    text = _RE_ESCAPE_OR_QUOTE.sub(lambda q: q[1] or '\\"', m[2])
+                    if text != m[2]:
+                        logging.getLogger('kolang').warning(f'{fpath}line {self.current_line}: unescaped " in {line!r}')
+                        line = f'{m[1]}"{text}"'
 
                 tokens = line.split(None, 2)
                 nb_tokens = len(tokens)
@@ -1576,6 +1549,10 @@ class _POFileParser(object):
             self.instance.append(self.current_entry)
             self.current_entry = POEntry(linenum=self.current_line)
         occurrences = self.current_token[3:].split()
+        if len(occurrences) > 1:
+            # kolang: more references (xgettext style) or free text (Kodi files) in one line: kept as read
+            self.current_entry.occurrences.append((self.current_token[3:].strip(), ''))
+            return True
         for occurrence in occurrences:
             if occurrence != '':
                 try:
