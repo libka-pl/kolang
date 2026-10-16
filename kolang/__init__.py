@@ -25,6 +25,8 @@ import json
 import argparse
 import subprocess
 import shutil
+import shlex
+import os
 try:
     from lxml import etree
 except ImportError:
@@ -821,6 +823,8 @@ class Translate(TranslateBase):
         #: Map id → new (ctx, text) for labels renamed in `generate()`. Used by
         #: `translate()` to update the matching `msgid` in each PO.
         self._renamed_ids: dict[int, tuple[str, str]] = {}
+        #: Files that are (or with `--dry-run` / `--check` would be) written because their content changes.
+        self.changed: list[Path] = []
         #: `#:` references in PO: 'none', 'file', 'line'; None → derived from the base language PO (`#:` there).
         self.locations: str | None = None
         #: Prefix of `#:` paths (`/` in Kodi skins: `#: /xml/Home.xml`), derived from the base language PO.
@@ -1951,6 +1955,14 @@ class Translate(TranslateBase):
     def _write_xml(self, input):
         decl = input.declaration or ''
         encoding = input.encoding
+
+        def entity(m: re.Match) -> str:
+            code = ord(m[0])
+            return f'&#x{code:04x};'
+        body = etree.tostring(input.tree, encoding=encoding, xml_declaration=False).decode(encoding)
+        data = re.sub(r'[\u2000-\u200f]', entity, decl + body).encode(encoding)
+        if data != input.original:
+            self.changed.append(input.path)
         if self.dry_run:
             logger.debug(f'Write xml: {input.path.resolve()}')
             if (logger.level or logging.root.level) <= logging.DEBUG - 2:
@@ -1959,19 +1971,13 @@ class Translate(TranslateBase):
             if self.dump_output:
                 body = etree.tostring(input.tree, encoding=encoding, xml_declaration=False)
                 print((decl.encode(encoding) + body).decode(encoding))
-        else:
-            def entity(m: re.Match) -> str:
-                code = ord(m[0])
-                return f'&#x{code:04x};'
-            body = etree.tostring(input.tree, encoding=encoding, xml_declaration=False).decode(encoding)
-            data = decl + body
-            data = re.sub(r'[\u2000-\u200f]', entity, data).encode(encoding)
-            if data == input.original:
-                return
+        elif data != input.original:
             path = self._prepare_write_target(input.path.resolve(), base=input.base)
             path.write_bytes(data)
 
     def _write_py(self, input):
+        if input.data != input.original:
+            self.changed.append(input.path)
         if self.dry_run:
             logger.debug(f'Write py:  {input.path.resolve()}')
             if self.dump_output:
@@ -2290,6 +2296,8 @@ class Translate(TranslateBase):
                 percent = 100 * tr / (N or 1)
                 percent = 0.0 if tr == 0 else 100.0 if tr == N else max(1.0, min(99.0, percent))
                 print(f'Language {lang}: translated: {percent:3.0f}% ({tr}/{N}), obsolete: {ob}{nw}{mv}')
+        if not path.exists() or path.read_text(encoding='utf-8').rstrip('\n') != po.__unicode__().rstrip('\n'):
+            self.changed.append(path)
         if self.dry_run:
             logger.debug(f'Write po:  {path}')
             if (logger.level or logging.root.level) < logging.DEBUG:
@@ -2480,7 +2488,7 @@ def unescape(text: str | None) -> str | None:
 
 
 def process(inputs, *, args, langs=None, output=None):
-    trans = Translate(dry_run=args.dry_run, dump_output=args.debug_cat_output,
+    trans = Translate(dry_run=args.dry_run or args.check, dump_output=args.debug_cat_output,
                       dump_translations=args.debug_cat_translation, list_entries=args.list or (),
                       id_from=args.id_from, id_min=args.id_min, id_max=args.id_max,
                       id_policy=args.id_policy, addon_id=args.addon_id,
@@ -2593,6 +2601,11 @@ def process(inputs, *, args, langs=None, output=None):
         if pattern:
             path = output / pattern.format(lang=lang, lang_lower=lang.lower())
         trans.translate(lang, path, stats=stats, old_stats=was.get(lang))
+    if args.check:
+        for path in trans.changed:
+            print(f'would change: {path}')
+        if trans.changed:
+            sys.exit(1)
 
 
 def copy_kolang_py(output: Path = Path()) -> None:
@@ -2726,6 +2739,63 @@ def merge_po(base: Path, ours: Path, theirs: Path) -> int:
     return conflicts
 
 
+#: Marker line of the post-merge hook written by `--git-setup` (an existing other hook is not overwritten).
+GIT_HOOK_MARK: str = '# kolang post-merge hook'
+
+
+def _kolang_command() -> str:
+    """Return shell command running this kolang (pyz / script, or `python -m kolang` with PYTHONPATH)."""
+    script = Path(sys.argv[0]).resolve()
+    if script.name == '__main__.py':
+        return f'PYTHONPATH={shlex.quote(str(script.parent.parent))} {shlex.quote(sys.executable)} -m kolang'
+    return f'{shlex.quote(sys.executable)} {shlex.quote(str(script))}'
+
+
+def git_setup(paths: list[Path]) -> None:
+    """`--git-setup`: `.gitattributes` (strings.po merge=kolang), merge driver config, post-merge hook.
+
+    The hook runs kolang on `paths` only on the default branch (`origin/HEAD`, else `main`): merging the default branch
+    into a feature branch must not assign IDs there (B15). Changed files are listed, nothing is committed.
+    """
+    root = _git_root(paths[0].resolve())
+    if root is None:
+        logger.error(f'--git-setup: {paths[0]} is not in a git repository')
+        sys.exit(1)
+
+    def git(*args: str) -> str:
+        """Run git in the repository, return stdout."""
+        return subprocess.run(['git', *args], cwd=str(root), capture_output=True, text=True, check=True).stdout.strip()
+
+    attrs = root / '.gitattributes'
+    lines = attrs.read_text(encoding='utf-8').splitlines() if attrs.exists() else []
+    if 'strings.po merge=kolang' not in lines:
+        attrs.write_text('\n'.join([*lines, 'strings.po merge=kolang']) + '\n', encoding='utf-8')
+        print(f'{attrs}: strings.po merge=kolang (commit it)')
+    cmd = _kolang_command()
+    git('config', 'merge.kolang.name', 'kolang strings.po merge driver')
+    git('config', 'merge.kolang.driver', f'{cmd} --merge-po %O %A %B')
+    print(f'git config merge.kolang.driver: {cmd} --merge-po %O %A %B')
+    hook = root / git('rev-parse', '--git-path', 'hooks/post-merge')
+    if hook.exists() and GIT_HOOK_MARK not in hook.read_text(encoding='utf-8', errors='replace'):
+        logger.warning(f'{hook} exists and is not kolang\'s, not changed; add: {cmd} <addon>')
+        return
+    dirs = ' '.join(shlex.quote(os.path.relpath(p.resolve(), root)) for p in paths)
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text(f'''#!/bin/sh
+{GIT_HOOK_MARK}: assign IDs of merged texts on the default branch only (written by kolang --git-setup)
+default=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')
+[ "$(git symbolic-ref --short HEAD 2>/dev/null)" = "${{default:-main}}" ] || exit 0
+cd "$(git rev-parse --show-toplevel)" || exit 0
+{cmd} {dirs} || exit 0
+if [ -n "$(git status --porcelain -- {dirs})" ]; then
+    echo "kolang: translations updated after merge, commit the result:"
+    git status --short -- {dirs}
+fi
+''', encoding='utf-8')
+    hook.chmod(0o755)
+    print(f'{hook}: runs kolang on {dirs} after merge on the default branch')
+
+
 def plural_expr(code: str) -> None:
     from simpleeval import simple_eval
     info = next(iter(p for p in plural_forms if p.code == code))
@@ -2787,6 +2857,11 @@ def main(argv=None):
     p.add_argument('--dry-run', action='store_true', help='do not modify anything')
     p.add_argument('--debug-cat-output', action='store_true', help='print output file if --dry-run')
     p.add_argument('--debug-cat-translation', metavar='LOCALE', help='print output translation if --dry-run')
+    p.add_argument('--check', action='store_true',
+                   help='write nothing, list files that would change, exit 1 if any (CI, hooks; with --reset-ids REF too)')
+    p.add_argument('--git-setup', action='store_true',
+                   help='set up git for PATH: .gitattributes + merge driver (--merge-po), post-merge hook running kolang '
+                        'on the default branch')
     p.add_argument('--locations', choices=('none', 'file', 'line'),
                    help='`#:` references in PO: where texts are used [derived from the base language PO]')
     p.add_argument('--reset-ids', metavar='REF',
@@ -2815,6 +2890,9 @@ def main(argv=None):
         return
     if args.generate_kolang_py:
         copy_kolang_py(args.input[0])
+        return
+    if args.git_setup:
+        git_setup(args.input)
         return
     process(args.input, output=args.translation, langs=args.language, args=args)
 

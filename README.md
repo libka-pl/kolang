@@ -469,6 +469,8 @@ Most-used options:
 | `-f FUNC`, `--localized-function FUNC` | extra L-like function name (CLI shortcut) |
 | `--get-localized-string` / `--no-get-localized-string` | toggle scanning `getLocalizedString()` |
 | `--dry-run` | do not modify anything |
+| `--check` | write nothing, list files that would change, exit 1 if any (CI) |
+| `--git-setup` | `.gitattributes`, merge driver, `post-merge` hook (see Git) |
 | `--reset-ids REF` | remove IDs new on the branch before merge into `REF` (see Git) |
 | `--list WHAT` | list `fuzzy` or `untranslated` entries per language (repeatable); with `--dry-run` it's a read-only report |
 | `--verbose` / `--debug` | more output |
@@ -567,8 +569,18 @@ Notes:
 ### Git: merging branches
 
 Every branch takes the next free ID, so two branches give the same ID to
-different texts and `strings.po` always conflicts. Register kolang as the
-merge driver for PO files (once per clone; `.gitattributes` is committed):
+different texts and `strings.po` always conflicts. Once per clone:
+
+```bash
+python kolang.pyz --git-setup .
+```
+
+It adds `strings.po merge=kolang` to `.gitattributes` (commit it), registers
+the merge driver below and a `post-merge` hook: after a merge on the default
+branch (`origin/HEAD`, else `main`) it runs kolang (new IDs for merged texts,
+see `--reset-ids`) and lists changed files to commit. On other branches the
+hook does nothing (merging main into a feature branch must not assign IDs).
+An existing foreign `post-merge` hook is not changed. By hand:
 
 ```bash
 echo 'strings.po merge=kolang' >> .gitattributes
@@ -616,6 +628,20 @@ python kolang.pyz .                      # on main: new IDs, translations kept
   `$LOCALIZE[30150]`, `label="30150"` without `L()` comment) and texts that
   have another ID too.
 - The run assigns no new IDs. Run it again if the branch changes.
+
+#### CI: `--check`
+
+`--check` writes nothing, prints `would change: FILE` and exits with 1 if a
+run would change anything. Web merges (GitHub/GitLab) run no hooks and no
+merge driver, so check in CI, e.g. GitHub Actions:
+
+```yaml
+- run: git fetch origin main
+- if: github.event_name == 'pull_request'     # branch has no new IDs
+  run: python kolang.pyz --check --reset-ids origin/main .
+- if: github.ref == 'refs/heads/main'          # nothing pending / out of sync
+  run: python kolang.pyz --check .
+```
 
 ---
 

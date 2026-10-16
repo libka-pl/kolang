@@ -62,6 +62,7 @@ def test_reset_merge_assign(addon: Path) -> None:
     r.commit('feat')
     assert "b = L(30103, 'Beta', n=1)" in r.py.read_text(encoding='utf-8')
 
+    assert 'would change' in r.kolang('--check', '--reset-ids', 'main', rc=1)    # PR check: branch has new IDs
     out = r.kolang('--reset-ids', 'main')
     assert 'reset id: 30103' in out and 'after merge into main' in out, out
     assert r.py.read_text(encoding='utf-8') == ("from kolang import L\na = L(30100, 'Alpha')\nb = L('Beta', n=1)\n"
@@ -75,6 +76,7 @@ def test_reset_merge_assign(addon: Path) -> None:
     assert '#. context: adjective\nmsgid "Open"\nmsgstr "Otwarty"' in pl
     assert 'pending: 4' in out, out
     r.kolang('--reset-ids', 'main')     # idempotent
+    r.kolang('--check', '--reset-ids', 'main')
     assert r.pl.read_text(encoding='utf-8') == pl
     r.commit('reset')
 
