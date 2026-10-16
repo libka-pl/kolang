@@ -16,5 +16,5 @@ def test_comments_without_space(addon: Path, kolang_run, po_path: Path) -> None:
     rc, out = kolang_run()
     assert rc == 0, out
     po = po_path.read_text(encoding='utf-8')
-    assert '# empty strings from id 30101 to 30102\n#. Item label\n#: xbmc/x.cpp\nmsgctxt "#30103"\nmsgid "B"' in po, po
+    assert '# empty strings from id 30101 to 30102\n#. Item label\n#: main.py\nmsgctxt "#30103"\nmsgid "B"' in po, po
     assert '#~ msgid "Old"' in po

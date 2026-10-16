@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-#: Weblate / Kodi style: header split per field in own order, `#:` one per line and free text, all kolang fields.
+#: Weblate / Kodi style: header split per field in own order, `#:` file references (Kodi `/` prefix), all kolang fields.
 WEBLATE = '''# Kodi Media Center language file
 # Addon Name: t
 # Addon id: t.test
@@ -23,13 +23,12 @@ msgstr ""
 "Plural-Forms: nplurals=2; plural=n != 1;\\n"
 "X-Generator: Weblate 5.0\\n"
 
-#: /xml/Home.xml
-#: /xml/MyFavourites.xml
+#: /main.py
 msgctxt "#30100"
 msgid "Alpha"
 msgstr ""
 
-#: Label of ListItem.Property(foo)
+#: /main.py
 msgctxt "#30101"
 msgid "Beta"
 msgstr ""

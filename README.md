@@ -76,6 +76,17 @@ as skin, `<settings>` as settings; `$LOCALIZE[N]` in any XML and skin
 `--obsolete mark/remove` stops with an error when no source file was scanned
 (it would make every string obsolete).
 
+### References `#:` in PO
+
+`--locations none|file|line` (or `"locations"` in `.kolang.json`) writes where
+each text is used (`#: resources/lib/main.py` or `…main.py:12`), in all
+language files; IDs used by number (`$LOCALIZE[N]`, `getLocalizedString(N)`)
+count too. Default is derived from the base language PO: no `#:` there → none,
+`#:` without line numbers → file (Kodi style, also its `/` prefix), with line
+numbers → line. Existing references keep their order, new ones are appended,
+gone ones removed. Free text in `#:` (seen in Kodi files) moves to `#.`.
+Line numbers change with every edit above the text — prefer `file`.
+
 ### How translatable strings are spotted
 
 #### In Python (`.py`)

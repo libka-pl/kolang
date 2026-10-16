@@ -821,6 +821,16 @@ class Translate(TranslateBase):
         #: Map id → new (ctx, text) for labels renamed in `generate()`. Used by
         #: `translate()` to update the matching `msgid` in each PO.
         self._renamed_ids: dict[int, tuple[str, str]] = {}
+        #: `#:` references in PO: 'none', 'file', 'line'; None → derived from the base language PO (`#:` there).
+        self.locations: str | None = None
+        #: Prefix of `#:` paths (`/` in Kodi skins: `#: /xml/Home.xml`), derived from the base language PO.
+        self._location_prefix: str = ''
+        #: Where texts are used: text key → {(path, line)}, for `#:` references.
+        self._locations: dict[tuple[str, str], set[tuple[Path, int]]] = {}
+        #: Where IDs are used by number: ID → {(path, line)}, for `#:` references.
+        self._ref_locations: dict[int, set[tuple[Path, int]]] = {}
+        #: Addon root, `#:` paths are relative to it.
+        self.root: Path | None = None
         #: Notes for translators (`Translators:` comments in sources) by text key, written as `#. Translators: …`.
         self._notes: dict[tuple[str, str], list[str]] = {}
         #: IDs used by numeric references (`getLocalizedString(N)`, `$LOCALIZE[N]`, `label="N"` without `L()` comment).
@@ -868,16 +878,23 @@ class Translate(TranslateBase):
         #: (or `--obsolete=remove` is set, so the old entry would be dropped).
         self.rename: bool = rename
 
+    def _add_location(self, key: tuple[str, str], path: Path | None, line: int | None) -> None:
+        """Remember where text `key` is used (`#:` reference)."""
+        if path is not None:
+            self._locations.setdefault(key, set()).add((Path(path), line or 0))
+
     def _add_note(self, key: tuple[str, str], note: str) -> None:
         """Add note for translators (`Translators:` comment) to text `key`, without duplicates."""
         notes = self._notes.setdefault(key, [])
         if note and note not in notes:
             notes.append(note)
 
-    def _add_ref(self, label_id: int) -> None:
-        """Mark `label_id` as used by a numeric reference (no text, the ID can't be found again by text)."""
+    def _add_ref(self, label_id: int, path: Path | None = None, line: int | None = None) -> None:
+        """Mark `label_id` as used by a numeric reference (no text, the ID can't be found again by text) at `path:line`."""
         self._ids.add(label_id)
         self._refs.add(label_id)
+        if path is not None:
+            self._ref_locations.setdefault(label_id, set()).add((Path(path), line or 0))
 
     def _add_label(self, label: Label, *, used=True):
         """Add label to existing data (by ID and by TEXT)."""
@@ -1233,7 +1250,7 @@ class Translate(TranslateBase):
                 if is_numeric:
                     nid = int(text)
                     logger.debug(f'  numeric XML ref #{nid}')
-                    self._add_ref(nid)
+                    self._add_ref(nid, path, node.node.sourceline)
                     # Migration: if this ID is known from PO with a text,
                     # attach the node so write-side can inject L() comment.
                     existing = self._by_id.get(nid)
@@ -1246,6 +1263,7 @@ class Translate(TranslateBase):
                     return
                 label = Label(None, text, ctx=ctx or '')
                 label.nodes.add(node)
+                self._add_location(label.key, path, node.node.sourceline)
                 for note in _translators_notes(node.node, target):
                     self._add_note(label.key, note)
                 self._add_label(label)
@@ -1282,6 +1300,7 @@ class Translate(TranslateBase):
                     )
                     sys.exit(1)
             label.nodes.add(node)
+            self._add_location(label.key, path, node.node.sourceline)
             for note in _translators_notes(node.node, target):
                 self._add_note(label.key, note)
             self._add_label(label)
@@ -1341,19 +1360,19 @@ class Translate(TranslateBase):
                 if m['id']:
                     nid = int(m['id'])
                     logger.debug(f'  XML $LOCALIZE[#{nid}] reference')
-                    self._add_ref(nid)
+                    self._add_ref(nid, path, node.sourceline)
         for node in root.xpath('.//@*[contains(.,"$LOCALIZE[")]/..'):
             for attr_name, attr_val in node.attrib.items():
                 for m in self._RE_LOCALIZE.finditer(attr_val):
                     if m['id']:
                         nid = int(m['id'])
                         logger.debug(f'  XML attr {attr_name} $LOCALIZE[#{nid}] reference')
-                        self._add_ref(nid)
+                        self._add_ref(nid, path, node.sourceline)
 
         # skin attributes with a string ID: `<viewtype label="N">`, `<fontset idloc="N">` (Font.xml)
         for value in root.xpath('.//viewtype/@label|.//fontset/@idloc'):
             if value.isdigit():
-                self._add_ref(int(value))
+                self._add_ref(int(value), path, value.getparent().sourceline)
 
         # -- step 2: translate scan (settings / window).
         text_tags = ('heading', *self.extra_translate_tags)
@@ -1544,7 +1563,7 @@ class Translate(TranslateBase):
             s = rval(r)
             sstart = rstart(r)
             if r['ref'] is not None:
-                self._add_ref(int(r['ref']))
+                self._add_ref(int(r['ref']), path, node.node.sourceline if node is not None else bisect(newlines, r.start()) + 1)
                 continue
             if r['bad'] is not None:
                 where = f'{path}:{node.node.sourceline}' if node is not None else f'{path}:{bisect(newlines, r.start()) + 1}'
@@ -1572,7 +1591,7 @@ class Translate(TranslateBase):
                         text = self._RE_PY_LOCALIZE_ESC.sub(r'\1', r['text'])
                         label = Label(mid, unescape(text))
                     elif mid is not None:
-                        self._add_ref(mid)
+                        self._add_ref(mid, path, node.node.sourceline if node is not None else bisect(newlines, sstart) + 1)
             # getLocalizedString()
             elif r['gls'] is not None:
                 mid = r['gls_id']
@@ -1583,7 +1602,7 @@ class Translate(TranslateBase):
                     # Numeric reference (e.g. getLocalizedString(123)) — only
                     # mark the ID as used; declaration lives elsewhere.
                     logger.debug(f'  numeric PY ref #{mid}')
-                    self._add_ref(int(mid))
+                    self._add_ref(int(mid), path, node.node.sourceline if node is not None else bisect(newlines, r.start()) + 1)
                     continue
                 tr = Trans(file, start=data_offset + r.start('gls'), end=data_offset + r.end('gls'))
                 label = Label(None, unescape(text))
@@ -1594,6 +1613,7 @@ class Translate(TranslateBase):
                     label.nodes.add(node)
                 if label.text is not None:
                     line = bisect(newlines, r.start())
+                    self._add_location(label.key, path, node.node.sourceline if node is not None else line + 1)
                     notes = [' '.join(' '.join(block).split())] if block and block_line == line - 1 else []
                     for note in notes + xml_notes:
                         self._add_note(label.key, note)
@@ -1656,9 +1676,13 @@ class Translate(TranslateBase):
     #     path = Path(path or '')
     #     return self.load_input(path / 'resources' / 'settings.xml')
 
-    def load_translate(self, path: str | Path) -> GenerateStats:
-        """Load XML and keep data."""
+    def load_translate(self, path: str | Path, *, base: bool = False) -> GenerateStats:
+        """Load PO file `path` (`base`: base language, `#:` style is derived from it) and keep data."""
         pofile = polib.pofile(path)
+        if base and self.locations is None:
+            occurrences = [o for e in pofile for o in e.occurrences if ' ' not in o[0]]
+            self.locations = 'line' if any(line for _, line in occurrences) else 'file' if occurrences else 'none'
+            self._location_prefix = '/' if sum(f.startswith('/') for f, _ in occurrences) * 2 > len(occurrences) else ''
         was_obsolete = 0
         # active entries first: an obsolete entry (old text of the ID, e.g. kept by Weblate) doesn't define the ID
         # when the ID is known, otherwise it would look like an edit of the text (B27)
@@ -1957,6 +1981,35 @@ class Translate(TranslateBase):
             with open(path, 'w', encoding=self.encoding, newline='') as f:
                 f.write(input.data)
 
+    def _write_locations(self, po: polib.POFile) -> None:
+        """Set `#:` references of active entries from sources: existing ones kept in their order (no diff noise),
+        new ones appended sorted, gone ones removed; free text in `#:` (Kodi files) moves to `#.` comment."""
+        for entry in po:
+            if entry.obsolete:
+                continue
+            # `#:` line read as one item (B24): more paths (xgettext style) or free text (a word without `/` or `.`)
+            free, occurrences = [], []
+            for f, line in entry.occurrences:
+                if ' ' not in f:
+                    occurrences.append((f, line))
+                elif all('/' in t or '.' in t for t in f.split()):
+                    occurrences += [(t, '') for t in f.split()]
+                else:
+                    free.append(f)
+            if free:
+                entry.comment = '\n'.join(filter(None, (entry.comment, *free)))
+            used = []
+            mid = int(r['id']) if (r := self._RE_LABEL_NUM.fullmatch(entry.msgctxt or '')) is not None else None
+            for path, line in self._locations.get(self._entry_key(entry), set()) | self._ref_locations.get(mid, set()):
+                try:
+                    rel = path.resolve().relative_to(self.root.resolve()) if self.root else path
+                except ValueError:
+                    rel = path
+                used.append((f'{self._location_prefix}{rel.as_posix()}', str(line) if self.locations == 'line' and line else ''))
+            new = set(used)
+            kept = list(dict.fromkeys(o for o in occurrences if o in new))
+            entry.occurrences = kept + sorted(new - set(kept))
+
     @classmethod
     def _entry_ctx(cls, entry: polib.POEntry) -> str:
         """Return text context of PO `entry` (`#. context: …` line), empty if none."""
@@ -2191,6 +2244,8 @@ class Translate(TranslateBase):
                 entry.flags.append('python-brace-format')
             elif not has_fields and 'python-brace-format' in entry.flags:
                 entry.flags.remove('python-brace-format')
+        if self.locations in ('file', 'line'):
+            self._write_locations(po)
         # `#.` comment for translators on plural entries (kolang line is replaced, the rest of the comment kept)
         nplurals = self._nplurals(lang, po)
         plural_note = f'{nplurals} plural form{"s" if nplurals != 1 else ""} separated by |||'
@@ -2330,7 +2385,7 @@ class Translate(TranslateBase):
         options = dict(conf.get('options', {}))
         for attr in ('id-from', 'id-min', 'id-max', 'id-policy', 'mark-translated',
                      'backup-pattern', 'addon-id', 'po-wrap-width', 'encoding', 'multi-line-msg',
-                     'git-only', 'extra-translate-attrs', 'extra-translate-tags', 'rename', 'po-header'):
+                     'git-only', 'extra-translate-attrs', 'extra-translate-tags', 'rename', 'po-header', 'locations'):
             if (val := options.pop(attr, None)) is not None:
                 setattr(self, attr.replace('-', '_'), val)
         # python-tags/python-attrs additively extend defaults (set semantics).
@@ -2493,7 +2548,7 @@ def process(inputs, *, args, langs=None, output=None):
         if pattern:
             path = output / pattern.format(lang=lang, lang_lower=lang.lower())
         if path.exists():
-            was[lang] = trans.load_translate(path)
+            was[lang] = trans.load_translate(path, base=lang == BASE_LANG)
 
     for path in inputs:
         path = Path(path).resolve()
@@ -2514,6 +2569,10 @@ def process(inputs, *, args, langs=None, output=None):
         logger.error(f'No source file scanned, --obsolete {trans.obsolete.value} would make every string obsolete; '
                      f'check sources (addon layout, .kolang.json)')
         sys.exit(1)
+
+    trans.root = Path(base) if base else Path.cwd()
+    if args.locations is not None:
+        trans.locations = args.locations
 
     # do the job
     trans.scan()
@@ -2728,6 +2787,8 @@ def main(argv=None):
     p.add_argument('--dry-run', action='store_true', help='do not modify anything')
     p.add_argument('--debug-cat-output', action='store_true', help='print output file if --dry-run')
     p.add_argument('--debug-cat-translation', metavar='LOCALE', help='print output translation if --dry-run')
+    p.add_argument('--locations', choices=('none', 'file', 'line'),
+                   help='`#:` references in PO: where texts are used [derived from the base language PO]')
     p.add_argument('--reset-ids', metavar='REF',
                    help='remove IDs new on this branch (not in PO at merge base with REF) before merge into REF, '
                         'translations wait in PO without ID; run kolang on REF after the merge')
