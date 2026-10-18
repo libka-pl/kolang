@@ -114,6 +114,8 @@ class XmlInput:
     encoding: str = 'utf-8'
     #: Original file content, unchanged file is not written.
     original: bytes = field(default=b'', repr=False)
+    #: Original start tag source of each element (keeps line breaks and spacing inside tags).
+    start_tags: dict[Element, str] = field(default_factory=dict, repr=False)
 
 
 @dataclass
@@ -730,6 +732,10 @@ class Translate(TranslateBase):
     # bytes-version of _RE_XML_DECL — used before we know the file's encoding
     _RE_XML_DECL_BYTES: re.Pattern = re.compile(rb'''\s*<\?(?:"(?:\.|[^"])*"|'(?:\.|[^'])*'|[^>])*>\s*''')
     _RE_XML_DECL_ENCODING: re.Pattern = re.compile(rb'''encoding\s*=\s*['"]([^'"]+)['"]''')
+    # XML markup tokens, only start tags are captured (`tag`), the rest is skipped.
+    _RE_XML_START_TAG: re.Pattern = re.compile(r'''<!--.*?-->|<!\[CDATA\[.*?\]\]>|<\?.*?\?>|<!DOCTYPE(?:[^>\[]|\[.*?\])*>|</[^>]*>'''
+                                               r'''|(?P<tag><[^\s/>!?](?:[^>"']|"[^"]*"|'[^']*')*>)''', re.DOTALL)
+    _RE_XML_ATTR: re.Pattern = re.compile(r'''([^\s=<>/]+)\s*=\s*("[^"]*"|'[^']*')''')
 
     # `$LOCALIZE[...]` inside Python string literal — used by _replace_py.
     _RE_PY_LOCALIZE = re.compile(r'\$LOCALIZE\[(?:(?P<id>\d+)|(?P<text>(?:[\\%].|\[(?:[\\%].|[^]])*\]|[^]])+))\]')
@@ -1460,7 +1466,10 @@ class Translate(TranslateBase):
         tree = etree.parse(BytesIO(content_bytes))
         m: re.Match = self._RE_XML_DECL.match(content)
         decl: str = m and m[0]
-        self.xml_inputs.append(XmlInput(path, tree, base, declaration=decl, encoding=encoding, original=content_bytes))
+        tags = [m['tag'] for m in self._RE_XML_START_TAG.finditer(content) if m['tag']]
+        elems = list(tree.iter(etree.Element))
+        start_tags = dict(zip(elems, tags)) if len(tags) == len(elems) else {}
+        self.xml_inputs.append(XmlInput(path, tree, base, declaration=decl, encoding=encoding, original=content_bytes, start_tags=start_tags))
         self._scan_xml(tree, path=path)
         return tree
 
@@ -1952,6 +1961,24 @@ class Translate(TranslateBase):
                     logger.warning(f'Backup {bak} is not ignored by git, add its pattern to .gitignore (e.g. "*~")')
         return path
 
+    def _restore_start_tags(self, input: XmlInput, body: str) -> str:
+        """Put back original start tags (lxml joins multi-line tags), with changed attribute values patched in place."""
+        elems = iter(input.tree.iter(etree.Element))
+
+        def restore(m: re.Match) -> str:
+            new = m['tag']
+            if not new:
+                return m[0]
+            old = input.start_tags.get(next(elems, None))
+            if old is None or old == new or old.endswith('/>') != new.endswith('/>'):
+                return new
+            new_attrs = dict(self._RE_XML_ATTR.findall(new))
+            if [a for a, _ in self._RE_XML_ATTR.findall(old)] != list(new_attrs):
+                return new  # attribute added, removed or reordered
+            return self._RE_XML_ATTR.sub(lambda a: a[0] if a[2][1:-1] == new_attrs[a[1]][1:-1] else f'{a[1]}={new_attrs[a[1]]}', old)
+
+        return self._RE_XML_START_TAG.sub(restore, body)
+
     def _write_xml(self, input):
         decl = input.declaration or ''
         encoding = input.encoding
@@ -1960,6 +1987,8 @@ class Translate(TranslateBase):
             code = ord(m[0])
             return f'&#x{code:04x};'
         body = etree.tostring(input.tree, encoding=encoding, xml_declaration=False).decode(encoding)
+        if input.start_tags:
+            body = self._restore_start_tags(input, body)
         data = re.sub(r'[\u2000-\u200f]', entity, decl + body).encode(encoding)
         if data != input.original:
             self.changed.append(input.path)
