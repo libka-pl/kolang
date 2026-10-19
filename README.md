@@ -76,6 +76,12 @@ as skin, `<settings>` as settings; `$LOCALIZE[N]` in any XML and skin
 `--obsolete mark/remove` stops with an error when no source file was scanned
 (it would make every string obsolete).
 
+A source that is a symlink leaving the addon (e.g. a skin file linked to a
+user's debug file, kept as a link by `cp -r`) is read-only: its IDs count as
+used, but it is never written and its new texts get no ID (warning). A link
+whose target is inside the addon is written through. To translate such a file,
+replace the link by a copy.
+
 ### References `#:` in PO
 
 `--locations none|file|line` (or `"locations"` in `.kolang.json`) writes where

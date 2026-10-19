@@ -116,6 +116,8 @@ class XmlInput:
     original: bytes = field(default=b'', repr=False)
     #: Original start tag source of each element (keeps line breaks and spacing inside tags).
     start_tags: dict[Element, str] = field(default_factory=dict, repr=False)
+    #: Symlink leaving the addon: scanned, never written (B30).
+    readonly: bool = False
 
 
 @dataclass
@@ -125,6 +127,8 @@ class PyInput:
     base: Path
     #: Original file content, unchanged file is not written.
     original: str = field(default='', repr=False)
+    #: Symlink leaving the addon: scanned, never written (B30).
+    readonly: bool = False
 
     def __post_init__(self) -> None:
         """Remember original content."""
@@ -501,14 +505,24 @@ def _remove_context_comments(node) -> None:
                 parent.remove(comment)
 
 
+def _leaves_root(path: Path, root: Path) -> bool:
+    """True if `path` is inside `root` by name, but a symlink takes it outside (read-only source, B30)."""
+    return (Path(os.path.normpath(path.absolute())).is_relative_to(Path(os.path.normpath(root.absolute())))
+            and not path.resolve().is_relative_to(root.resolve()))
+
+
+def _link_path(path: Path) -> Path:
+    """Absolute path with resolved directories, the last component kept: a tracked symlink is the link, not its target."""
+    return path.absolute().parent.resolve() / path.name
+
+
 def _git_tracked_files(repo_root: Path) -> set[Path]:
     """Return absolute paths of files tracked by git (in the index) for given repo."""
     out = subprocess.run(
         ['git', 'ls-files', '-z'],
         cwd=str(repo_root), capture_output=True, check=True,
     )
-    return {(repo_root / name.decode()).resolve()
-            for name in out.stdout.split(b'\x00') if name}
+    return {repo_root / name.decode() for name in out.stdout.split(b'\x00') if name}
 
 
 def _git_clean_files(repo_root: Path) -> set[Path]:
@@ -517,7 +531,7 @@ def _git_clean_files(repo_root: Path) -> set[Path]:
         out = subprocess.run(['git', 'diff', '--name-only', '-z', 'HEAD'], cwd=str(repo_root), capture_output=True, check=True)
     except subprocess.CalledProcessError:  # no commit yet
         return set()
-    changed = {(repo_root / name.decode()).resolve() for name in out.stdout.split(b'\x00') if name}
+    changed = {repo_root / name.decode() for name in out.stdout.split(b'\x00') if name}
     return _git_tracked_files(repo_root) - changed
 
 
@@ -786,6 +800,8 @@ class Translate(TranslateBase):
                  ) -> None:
         self.xml_inputs: list[XmlInput] = []
         self.py_inputs: list[PyInput] = []
+        #: Root elements of read-only XML inputs (B30) → file path.
+        self._readonly_roots: dict[Element, Path] = {}
         self._ids: set[int] = set()
         self._by_id: dict[int, Label] = {}
         self._by_text: dict[tuple[str, str], LabelList] = {}
@@ -1487,7 +1503,7 @@ class Translate(TranslateBase):
                         trans.append(Trans(None, start, start, fmt=f'{self.addon_id} '))
                     add(text[start:end], NodeValue(node, None, trans=tuple(trans)))
 
-    def load_xml(self, path: str | Path, base: str | Path | None = None):
+    def load_xml(self, path: str | Path, base: str | Path | None = None, *, readonly: bool = False):
         """Load XML and keep data."""
         path = Path(path)
         if base is not None:
@@ -1509,19 +1525,22 @@ class Translate(TranslateBase):
         tags = [m['tag'] for m in self._RE_XML_START_TAG.finditer(content) if m['tag']]
         elems = list(tree.iter(etree.Element))
         start_tags = dict(zip(elems, tags)) if len(tags) == len(elems) else {}
-        self.xml_inputs.append(XmlInput(path, tree, base, declaration=decl, encoding=encoding, original=content_bytes, start_tags=start_tags))
+        self.xml_inputs.append(XmlInput(path, tree, base, declaration=decl, encoding=encoding, original=content_bytes, start_tags=start_tags,
+                                        readonly=readonly))
+        if readonly:
+            self._readonly_roots[tree.getroot()] = path
         self._scan_xml(tree, path=path)
         return tree
 
     def load_py(self, path: str | Path, base: str | Path | None = None, *,
-                l8funcs: list[L8Func] | None = None) -> None:
+                l8funcs: list[L8Func] | None = None, readonly: bool = False) -> None:
         """Load strings from Python source and keep data."""
         path = Path(path)
         if base is not None:
             base = Path(base)
         with open(path, encoding=self.encoding, newline='') as f:
             data = f.read()
-        file = PyInput(path, data, base)
+        file = PyInput(path, data, base, readonly=readonly)
         self.py_inputs.append(file)
         self._replace_py(data, file=file, l8funcs=l8funcs, path=path)
 
@@ -1680,7 +1699,7 @@ class Translate(TranslateBase):
         Hard-exits if the path is not in any git repository (--git-only contract)."""
         if not self.git_only:
             return True
-        abspath = path.resolve()
+        abspath = _link_path(path)
         root = _git_root(abspath)
         if root is None:
             logger.error(f'{abspath} is not in a git repository (--git-only requires git tracking)')
@@ -1689,21 +1708,29 @@ class Translate(TranslateBase):
             self._git_tracked_by_repo[root] = _git_tracked_files(root)
         return abspath in self._git_tracked_by_repo[root]
 
-    def _load_input(self, path: Path, *, l8funcs: list[L8Func] | None = None) -> None:
+    def _load_input(self, path: Path, *, l8funcs: list[L8Func] | None = None, readonly: bool = False) -> None:
         """Load single file (XML / py) and keep data."""
         logger.info(f'Loading source {path}')
+        if readonly:
+            logger.warning(f'Read-only source {path} -> {path.resolve()} (symlink outside the addon), not written')
         if path.suffix == '.py':
-            return self.load_py(path, l8funcs=l8funcs)
-        return self.load_xml(path)
+            return self.load_py(path, l8funcs=l8funcs, readonly=readonly)
+        return self.load_xml(path, readonly=readonly)
 
     def load_input(self,
                    path: str | Path,
                    *,
                    skip: set[Path] = set(),
-                   l8funcs: list[L8Func] | None = None) -> None:
-        """Load input file / py-dir (XML / py) and keep data."""
+                   l8funcs: list[L8Func] | None = None,
+                   root: Path | None = None) -> None:
+        """Load input file / py-dir (XML / py) and keep data.
+
+        Source leaving `root` (addon dir, default: the dir itself or the file's dir) through a symlink is read-only.
+        """
         res = None
         path = Path(path)
+        if root is None:
+            root = path if path.is_dir() else path.parent
         if not path.exists():
             logger.warning('Path does not exist: {!r}, skipping.'.format(str(path)))
         elif path.is_dir():
@@ -1712,17 +1739,20 @@ class Translate(TranslateBase):
             # lexical `is_relative_to` is enough; avoid `resolve()` per file
             # (each `resolve()` does lstat per path component, and this loop
             # easily sees thousands of files).
+            # `**` doesn't descend into symlinked dirs (Python 3.9–3.15), only a symlinked file or the dir itself
+            # can leave the root — `resolve()` only for links.
+            dir_leaves = _leaves_root(path, root)
             for p in chain(path.glob('**/*.xml'), path.glob('**/*.py')):
                 if skip and any(p.is_relative_to(s) for s in skip):
                     pass
                 elif not self._is_git_tracked(p):
                     logger.debug(f'Skipping non-tracked: {p}')
                 else:
-                    res = self._load_input(p, l8funcs=l8funcs)
+                    res = self._load_input(p, l8funcs=l8funcs, readonly=dir_leaves or (p.is_symlink() and _leaves_root(p, root)))
         elif not self._is_git_tracked(path):
             logger.debug(f'Skipping non-tracked: {path}')
         else:
-            res = self._load_input(path, l8funcs=l8funcs)
+            res = self._load_input(path, l8funcs=l8funcs, readonly=_leaves_root(path, root))
         return res
 
     # def load_settings(self, path: str | Path | None = None):
@@ -1810,8 +1840,39 @@ class Translate(TranslateBase):
                 if self.dry_run:
                     print(f' rename id: {old_id}: {old_key[1]!r} → {new_key[1]!r}')
 
+    def _readonly_path(self, use: NodeValue | Trans) -> Path | None:
+        """Path of the read-only source of a label use (XML node or python L() occurrence), None if it is written."""
+        if isinstance(use, Trans):
+            if isinstance(use.file, PyInput):
+                return use.file.path if use.file.readonly else None
+            if not isinstance(use.file, XmlValueInput):
+                return None
+            use = use.file.node
+        return self._readonly_roots.get(use.node.getroottree().getroot()) if self._readonly_roots else None
+
+    def _drop_readonly_new(self) -> None:
+        """New texts (no ID yet) used in read-only sources (B30) get no ID: their uses there are dropped, warned."""
+        if not self._readonly_roots and not any(f.readonly for f in self.py_inputs):
+            return
+        dropped: dict[Path, list[str | None]] = {}
+        for lst in self._by_text.values():
+            for label in lst:
+                if label.id is not None:
+                    continue
+                paths = {p for use in (*label.nodes, *label.trans) if (p := self._readonly_path(use)) is not None}
+                if paths:
+                    label.nodes = {n for n in label.nodes if self._readonly_path(n) is None}
+                    label.trans = [tr for tr in label.trans if self._readonly_path(tr) is None]
+                    for path in paths:
+                        dropped.setdefault(path, []).append(label.text)
+        for path, texts in sorted(dropped.items()):
+            more = f', … (+{len(texts) - 3})' if len(texts) > 3 else ''
+            logger.warning(f'{path}: {len(texts)} new text(s) not assigned, read-only source (symlink outside the addon): '
+                           f'{", ".join(map(repr, texts[:3]))}{more}')
+
     def generate(self) -> GenerateStats:
         """Generate new lables. Return number of new translations."""
+        self._drop_readonly_new()
         def nextid():
             nonlocal lidgen
             for n in range(lidgen, self.id_max + 1):
@@ -1898,6 +1959,7 @@ class Translate(TranslateBase):
         `translate()`, so translations wait for the new ID. Kept: IDs with numeric references (can't be found
         by text) and texts with another ID (would mix translations). No new IDs are assigned in this run.
         """
+        self._drop_readonly_new()
         root = _git_root(po_path.parent if po_path.parent.exists() else Path.cwd())
         if root is None:
             logger.error(f'--reset-ids: {po_path} is not in a git repository')
@@ -2035,6 +2097,10 @@ class Translate(TranslateBase):
         if input.start_tags:
             body = self._restore_start_tags(input, body)
         data = re.sub(r'[\u2000-\u200f]', entity, decl + body).encode(encoding)
+        if input.readonly:
+            if data != input.original:
+                logger.warning(f'Not written: {input.path} -> {input.path.resolve()} (symlink outside the addon)')
+            return
         if data != input.original:
             self.changed.append(input.path)
         if self.dry_run:
@@ -2050,6 +2116,10 @@ class Translate(TranslateBase):
             path.write_bytes(data)
 
     def _write_py(self, input):
+        if input.readonly:
+            if input.data != input.original:
+                logger.warning(f'Not written: {input.path} -> {input.path.resolve()} (symlink outside the addon)')
+            return
         if input.data != input.original:
             self.changed.append(input.path)
         if self.dry_run:
@@ -2545,7 +2615,7 @@ class Translate(TranslateBase):
             skip = set(Path(s) for s in skip or ()) | conf.skip
             skip = {s.resolve() for s in skip}
             for p in conf.paths:
-                self.load_input(p, skip=skip, l8funcs=l8funcs)
+                self.load_input(p, skip=skip, l8funcs=l8funcs, root=path)
 
 
 @overload
@@ -2636,8 +2706,9 @@ def process(inputs, *, args, langs=None, output=None):
             was[lang] = trans.load_translate(path, base=lang == BASE_LANG)
 
     for path in inputs:
-        path = Path(path).resolve()
+        path = Path(path).absolute()  # not resolved: a symlinked file must be seen as a link (B30)
         if path.is_dir():
+            path = path.resolve()
             if (path / 'addon.xml').exists():
                 trans.load_addon(path, skip=args.skip, l8funcs=l8funcs)
             else:
