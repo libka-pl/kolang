@@ -62,4 +62,4 @@ def test_includes_and_skin_attributes(tmp_path: Path) -> None:
     text = po.read_text(encoding='utf-8')
     assert '#~' not in text, text
     assert 'msgid "Plain text"' in text
-    assert '<label>$ADDON[skin.t 31004]</label>' in (tmp_path / 'xml' / 'Includes.xml').read_text(encoding='utf-8')
+    assert '<label>$ADDON[skin.t 31100]</label>' in (tmp_path / 'xml' / 'Includes.xml').read_text(encoding='utf-8')

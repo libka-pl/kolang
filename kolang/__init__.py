@@ -696,9 +696,15 @@ class TranslateBase:
 class Translate(TranslateBase):
     """Whole translate process handler."""
 
-    #: Default upper bound for newly assigned IDs. Kodi reserves 30000-33999
-    #: for plugins/skins/scripts/common. Override via --id-max / "id-max".
-    ID_MAX_DEFAULT: int = 33999
+    #: Default lowest ID for newly assigned strings. Override via --id-from / "id-from".
+    ID_FROM_DEFAULT: int = 30100
+    #: Default upper bound for newly assigned IDs. Kodi reserves 30000-32999 for plugins/skins/scripts,
+    #: 33000-33999 are Kodi core common strings. Override via --id-max / "id-max".
+    ID_MAX_DEFAULT: int = 32999
+    #: Skin string IDs: `$LOCALIZE[N]` and numeric labels find skin strings only in this range (Kodi `IsSkinStringId`).
+    SKIN_ID_RANGE: tuple[int, int] = (31000, 31999)
+    #: Default lowest ID for newly assigned skin strings.
+    SKIN_ID_FROM_DEFAULT: int = 31100
 
     #: Default raw-Python tags (cała text+tail to Python source).
     DEFAULT_PYTHON_TAGS: tuple[str, ...] = ('ff:vars',)
@@ -757,7 +763,7 @@ class Translate(TranslateBase):
                  dump_translations: str | None = None,
                  stats: bool = True,
                  list_entries: Sequence[str] = (),
-                 id_from: int = 30100,
+                 id_from: int | None = None,
                  id_min: int | None = None,
                  id_max: int | None = None,
                  id_policy: Literal['min', 'max'] = 'max',
@@ -798,12 +804,14 @@ class Translate(TranslateBase):
         self._addon_header_loaded: bool = False
         self.stats = stats
         self.handle_getLocalizedString = handle_getLocalizedString
-        #: Lowest avaliable ID.
-        self.id_from = id_from
-        #: Lower bound for "ID below threshold" warning. None → fall back to id_from.
-        self.id_min: int | None = id_min
-        #: Upper bound for newly assigned IDs (used by nextid()).
-        self.id_max: int = id_max if id_max is not None else self.ID_MAX_DEFAULT
+        #: Skin addon (`xbmc.gui.skin` in addon.xml or `--type skin`), ID range defaults follow Kodi skin range.
+        self.skin: bool = False
+        #: ID range options set explicitly (CLI, then config); None → default derived from addon type.
+        self._id_from: int | None = id_from
+        self._id_min: int | None = id_min
+        self._id_max: int | None = id_max
+        #: ID range options given on the command line, config doesn't override them.
+        self._cli_options: set[str] = {k for k, v in (('id-from', id_from), ('id-min', id_min), ('id-max', id_max)) if v is not None}
         #: New ID policy:  min – lower avaliavle, max – above last used.
         self.id_policy: Literal['min', 'max'] = id_policy
         #: Addon ID for $ADDON[] XML label.
@@ -893,6 +901,39 @@ class Translate(TranslateBase):
         if path is not None:
             self._locations.setdefault(key, set()).add((Path(path), line or 0))
 
+    @property
+    def id_from(self) -> int:
+        """Lowest ID for new labels."""
+        if self._id_from is not None:
+            return self._id_from
+        return self.SKIN_ID_FROM_DEFAULT if self.skin else self.ID_FROM_DEFAULT
+
+    @id_from.setter
+    def id_from(self, value: int | None) -> None:
+        self._id_from = value
+
+    @property
+    def id_min(self) -> int:
+        """Lower bound for "ID below threshold" warning."""
+        if self._id_min is not None:
+            return self._id_min
+        return self.SKIN_ID_RANGE[0] if self.skin else self.id_from
+
+    @id_min.setter
+    def id_min(self, value: int | None) -> None:
+        self._id_min = value
+
+    @property
+    def id_max(self) -> int:
+        """Upper bound for newly assigned IDs (used by nextid())."""
+        if self._id_max is not None:
+            return self._id_max
+        return self.SKIN_ID_RANGE[1] if self.skin else self.ID_MAX_DEFAULT
+
+    @id_max.setter
+    def id_max(self, value: int | None) -> None:
+        self._id_max = value
+
     def _add_note(self, key: tuple[str, str], note: str) -> None:
         """Add note for translators (`Translators:` comment) to text `key`, without duplicates."""
         notes = self._notes.setdefault(key, [])
@@ -913,9 +954,8 @@ class Translate(TranslateBase):
         if label is None:
             return
         if label.id is not None:
-            threshold = self.id_min if self.id_min is not None else self.id_from
-            if label.id < threshold:
-                logger.warning(f'Label #{label.id} < #{threshold}')
+            if label.id < self.id_min:
+                logger.warning(f'Label #{label.id} < #{self.id_min}')
             L1 = self._by_id.setdefault(label.id, label)
             # NOTE: don't merge label into L1 here — wait until conflict
             # resolution, otherwise a mismatched text would still pollute
@@ -1783,6 +1823,11 @@ class Translate(TranslateBase):
             raise ValueError(f'No new label ID avaliable (id_max={self.id_max})')
 
         was_obsolete = len(set(self._by_id) - self._ids)
+        if self.skin:
+            lo, hi = self.SKIN_ID_RANGE
+            for mid in sorted(mid for mid in self._refs & self._by_id.keys() if not lo <= mid <= hi):
+                where = ', '.join(f'{p}:{n}' for p, n in sorted(self._ref_locations.get(mid, ())))
+                logger.warning(f'Skin string #{mid} is used by number ({where}), Kodi finds skin strings by number only in {lo}-{hi}')
         if self.id_policy == 'min':
             lidgen = self.id_from
         else:
@@ -2352,6 +2397,8 @@ class Translate(TranslateBase):
             atree = etree.parse(str(path / 'addon.xml'))
             aroot = atree.getroot()
             if aroot.tag == 'addon':
+                if aroot.find('extension[@point="xbmc.gui.skin"]') is not None:
+                    self.skin = True
                 if not self._addon_header_loaded:
                     self._addon_header_loaded = True
                     info = {'Addon Name': aroot.get('name'), 'Addon id': aroot.get('id'), 'Addon Provider': aroot.get('provider-name')}
@@ -2423,7 +2470,7 @@ class Translate(TranslateBase):
         for attr in ('id-from', 'id-min', 'id-max', 'id-policy', 'mark-translated',
                      'backup-pattern', 'addon-id', 'po-wrap-width', 'encoding', 'multi-line-msg',
                      'git-only', 'extra-translate-attrs', 'extra-translate-tags', 'rename', 'po-header', 'locations'):
-            if (val := options.pop(attr, None)) is not None:
+            if (val := options.pop(attr, None)) is not None and attr not in self._cli_options:
                 setattr(self, attr.replace('-', '_'), val)
         # python-tags/python-attrs additively extend defaults (set semantics).
         for tag in options.pop('python-tags', ()):
@@ -2528,6 +2575,7 @@ def process(inputs, *, args, langs=None, output=None):
                       cleanup_translate_comments=args.cleanup_translate_comments,
                       rename=args.rename,
                       )
+    trans.skin = args.type == 'skin'
     if args.verbose:
         logging.basicConfig(level=args.verbose)
     else:
@@ -2842,11 +2890,12 @@ def main(argv=None):
     p.add_argument('--mark-translated', action='store_true', help='copy original string to all non-translated entries')
     p.add_argument('--remove', action='store_const', const='remove', dest='obsolete',
                    help='remove unused translations (alias for --obsolete=remove)')
-    p.add_argument('--id-from', metavar='NUM', type=int, default=30100, help='lowest label ID (start from) [30100]')
+    p.add_argument('--id-from', metavar='NUM', type=int, default=None,
+                   help=f'lowest label ID (start from) [{Translate.ID_FROM_DEFAULT}, skin {Translate.SKIN_ID_FROM_DEFAULT}]')
     p.add_argument('--id-min', metavar='NUM', type=int, default=None,
-                   help='warn if any label ID is below NUM (default: --id-from)')
+                   help=f'warn if any label ID is below NUM [--id-from, skin {Translate.SKIN_ID_RANGE[0]}]')
     p.add_argument('--id-max', metavar='NUM', type=int, default=None,
-                   help=f'highest label ID for new entries [{Translate.ID_MAX_DEFAULT}]')
+                   help=f'highest label ID for new entries [{Translate.ID_MAX_DEFAULT}, skin {Translate.SKIN_ID_RANGE[1]}]')
     p.add_argument('--id-policy', choices=('max', 'min'), default='max', help='new label ID policy [max]')
     p.add_argument('--id-reserve', metavar='ID[-ID]...', type=parse_ranges,
                    help='reserve IDs, move another to keep the range empty')

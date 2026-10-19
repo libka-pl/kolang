@@ -450,9 +450,9 @@ Most-used options:
 | `--type {addon,skin}` | force layout (else auto-detected) |
 | `-c CONFIG` | use specific `.kolang.json` |
 | `-s PATH`, `--skip PATH` | skip a file/dir |
-| `--id-from NUM` | lowest ID for newly assigned strings (default 30100) |
-| `--id-min NUM` | warn when label ID below NUM (default = `--id-from`) |
-| `--id-max NUM` | upper bound for new IDs (default 33999) |
+| `--id-from NUM` | lowest ID for newly assigned strings (default 30100, skin 31100) |
+| `--id-min NUM` | warn when label ID below NUM (default = `--id-from`, skin 31000) |
+| `--id-max NUM` | upper bound for new IDs (default 32999, skin 31999) |
 | `--id-policy {max,min}` | strategy for picking next free ID |
 | `--id-reserve A-B,C` | mark ID ranges as reserved (existing labels there get moved with translations; error if an ID there is used by number) |
 | `--addon-id ID` | force `$ADDON[ID …]` prefix in skin labels (else read from `addon.xml`) |
@@ -478,6 +478,11 @@ Most-used options:
 
 Run `python kolang.pyz --help` for the complete list.
 
+ID range defaults follow the addon type: a skin (`xbmc.gui.skin` in `addon.xml` or `--type skin`) gets 31100–31999,
+because Kodi finds skin strings by number (`$LOCALIZE[N]`, `<label>N</label>`) only in 31000–31999 — a numeric
+reference to an own string outside it is reported. Other addons get 30100–32999 (33000–33999 are Kodi core strings).
+`--id-from` / `--id-min` / `--id-max` on the command line win over `.kolang.json`.
+
 ---
 
 ### Configuration (`.kolang.json`)
@@ -490,7 +495,7 @@ Lives at the addon root by default. All sections are optional.
         "addon-id": null,
         "id-from": 30100,
         "id-min": null,
-        "id-max": 33999,
+        "id-max": 32999,
         "id-policy": "max",
         "mark-translated": false,
         "get-localized-string": true,
