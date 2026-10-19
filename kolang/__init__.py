@@ -13,7 +13,7 @@ import re
 import string
 from bisect import bisect
 from dataclasses import dataclass, field, replace as dc_replace
-from itertools import chain
+from itertools import chain, count
 from typing import Any, Literal, overload, TYPE_CHECKING
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -33,7 +33,7 @@ except ImportError:
     sys.stderr.write('Missing lxml module, try `pip install lxml`\n')
     sys.exit(1)
 if TYPE_CHECKING:
-    from typing import Sequence
+    from typing import Iterable, Sequence
     from lxml.etree import _ElementTree as ElementTree
     from lxml.etree import _Element as Element
 from . import polib
@@ -53,6 +53,10 @@ class GenerateStats:
     new: int
     moved: int = 0
     obsolete: int = 0
+
+
+class NoFreeIdError(ValueError):
+    """No free label ID in the ID range."""
 
 
 class FuncType(Enum):
@@ -797,6 +801,7 @@ class Translate(TranslateBase):
                  python_attrs: list | None = None,
                  cleanup_translate_comments: bool = False,
                  rename: bool = True,
+                 compact_ids: bool = False,
                  ) -> None:
         self.xml_inputs: list[XmlInput] = []
         self.py_inputs: list[PyInput] = []
@@ -911,6 +916,8 @@ class Translate(TranslateBase):
         #: produce an obsolete entry that has no translation anywhere
         #: (or `--obsolete=remove` is set, so the old entry would be dropped).
         self.rename: bool = rename
+        #: Renumber own IDs one after another from `id-from` (`--compact-ids`).
+        self.compact_ids: bool = compact_ids
 
     def _add_location(self, key: tuple[str, str], path: Path | None, line: int | None) -> None:
         """Remember where text `key` is used (`#:` reference)."""
@@ -1708,6 +1715,18 @@ class Translate(TranslateBase):
             self._git_tracked_by_repo[root] = _git_tracked_files(root)
         return abspath in self._git_tracked_by_repo[root]
 
+    def uncommitted(self, paths: Iterable[Path]) -> list[Path]:
+        """Return `paths` git can't restore: outside a repository, untracked or with local changes."""
+        result = []
+        for path in paths:
+            path = _link_path(path)
+            root = _git_root(path) if shutil.which('git') else None
+            if root is not None and root not in self._git_clean_by_repo:
+                self._git_clean_by_repo[root] = _git_clean_files(root)
+            if root is None or path not in self._git_clean_by_repo[root]:
+                result.append(path)
+        return result
+
     def _load_input(self, path: Path, *, l8funcs: list[L8Func] | None = None, readonly: bool = False) -> None:
         """Load single file (XML / py) and keep data."""
         logger.info(f'Loading source {path}')
@@ -1870,18 +1889,97 @@ class Translate(TranslateBase):
             logger.warning(f'{path}: {len(texts)} new text(s) not assigned, read-only source (symlink outside the addon): '
                            f'{", ".join(map(repr, texts[:3]))}{more}')
 
+    def _compact(self) -> tuple[int, int]:
+        """Renumber own IDs one after another from `id-from` (`--compact-ids`), return (moved IDs, new IDs).
+
+        Order: used IDs (as they are), new texts (scan order), unused labels (only in PO; removed with
+        `--obsolete remove`) — the same order next time, so a second run changes nothing.
+        Kept in place: IDs used by number (`getLocalizedString(N)`, `$LOCALIZE[N]`, … — can't be rewritten), labels
+        without text, IDs below `id-from`; their numbers (and `--id-reserve`, Kodi core references) are skipped.
+        Translations move with the ID (PO entry renumbered in place, like `--id-reserve`).
+        """
+        edited = {lb.ref.id for lst in self._by_text.values() for lb in lst if lb.id is None and lb.ref is not None}
+        paths = {inp.tree.getroot(): inp.path for inp in self.xml_inputs if not inp.readonly}
+
+        def pinned(mid: int, label: Label) -> bool:
+            """ID used by number somewhere kolang can't rewrite (XML number with the node attached is rewritten)."""
+            if mid not in self._refs:
+                return False
+            nodes = {(paths.get(n.node.getroottree().getroot()), n.node.sourceline) for n in label.nodes}
+            locations = self._ref_locations.get(mid, set())
+            return not locations or any(loc not in nodes for loc in locations)
+
+        own = sorted(mid for mid, lb in self._by_id.items() if mid >= self.id_from and lb.text and not pinned(mid, lb))
+        used = [mid for mid in own if mid in self._ids or self._by_id[mid].referenced or mid in edited]
+        unused = sorted(set(own) - set(used))
+        new = [lb for lst in self._by_text.values() for lb in lst if lb.id is None and lb.referenced]
+        orig = {new_id: old for old, new_id in self._moved_ids.items() if new_id is not None}  # `--id-reserve` moves first
+        if self.obsolete is ObsoleteAction.REMOVE:
+            for mid in unused:
+                label = self._by_id.pop(mid)
+                self._moved_ids[orig.get(mid, mid)] = None
+                if self.dry_run:
+                    print(f' remove id: {mid}: {label.text!r}')
+            unused = []
+        old_ids = set(used + unused)
+        taken = (set(self._by_id) | self._ids) - old_ids
+        slots = (n for n in count(self.id_from) if n not in taken and n not in self.reserved_ids)
+        existing = [self._by_id[mid] for mid in used]
+        renumbered: dict[int, int] = {}
+        for label in (*existing, *new, *(self._by_id[mid] for mid in unused)):
+            old, label.id = label.id, next(slots)
+            if old is None:
+                if label.id > self.id_max:
+                    raise NoFreeIdError(f'No free label ID in {self.id_from}-{self.id_max} for new texts; raise --id-max')
+                self._ids.add(label.id)
+                if self.dry_run:
+                    print(f' add id: {label.id}: {label.text!r}')
+            elif label.id != old:
+                renumbered[old] = label.id
+                self._moved_ids[orig.get(old, old)] = label.id
+                if old in self._ids:
+                    self._ids.discard(old)
+                    self._ids.add(label.id)
+                if self.dry_run:
+                    print(f' move id: {old} → {label.id}: {label.text!r}')
+        rest = {mid: lb for mid, lb in self._by_id.items() if mid not in old_ids}
+        moved = [self._by_id[mid] for mid in sorted(old_ids)]
+        self._by_id.clear()
+        self._by_id.update(rest)
+        self._by_id.update((label.id, label) for label in (*moved, *new))
+        # renamed in place (`_rename_orphan_ids`) before the renumbering: PO entry is found under its new ID
+        self._renamed_ids = {renumbered.get(mid, mid): key for mid, key in self._renamed_ids.items()}
+        return len(renumbered), len(new)
+
+    def _add_text_refs(self) -> None:
+        """`$LOCALIZE[N]` inside the text of a used label is a numeric reference too (kept, not renumbered)."""
+        for lst in self._by_text.values():
+            for label in lst:
+                if label.text and '$LOCALIZE[' in label.text and (label.referenced or label.id in self._ids):
+                    for m in self._RE_LOCALIZE.finditer(label.text):
+                        if m['id']:
+                            self._add_ref(int(m['id']))
+
     def generate(self) -> GenerateStats:
         """Generate new lables. Return number of new translations."""
         self._drop_readonly_new()
+        self._add_text_refs()
         def nextid():
-            nonlocal lidgen
-            for n in range(lidgen, self.id_max + 1):
+            nonlocal lidgen, wrapped
+            # `max` policy: above the last used ID; when the top of the range is full, gaps from `id-from`
+            for n in chain(range(lidgen, self.id_max + 1), range(self.id_from, lidgen)):
                 # _ids holds numeric references to IDs declared elsewhere
                 # (Kodi core, other addons) — must not be reassigned.
                 if n not in self._by_id and n not in self._ids and n not in self.reserved_ids:
+                    if n < lidgen and not wrapped:
+                        wrapped = True
+                        logger.warning(f'No free ID above #{lidgen} (id-max {self.id_max}), new IDs fill gaps from #{self.id_from}')
                     lidgen = n
                     return n
-            raise ValueError(f'No new label ID avaliable (id_max={self.id_max})')
+            unused = sum(1 for mid, lb in self._by_id.items()
+                         if self.id_from <= mid <= self.id_max and not lb.referenced and mid not in self._ids)
+            raise NoFreeIdError(f'No free label ID in {self.id_from}-{self.id_max}; raise --id-max, '
+                                f'or free IDs: --obsolete remove ({unused} unused PO entries hold IDs), --compact-ids')
 
         was_obsolete = len(set(self._by_id) - self._ids)
         if self.skin:
@@ -1895,6 +1993,7 @@ class Translate(TranslateBase):
             # only own range: references to Kodi core strings (e.g. `$LOCALIZE[38031]`) are above `id-max`
             lidgen = max((n for n in chain(self._by_id, self._ids) if self.id_from <= n <= self.id_max), default=self.id_from)
 
+        wrapped = False
         new_trans_count = 0
         collision = sorted(set(self.reserved_ids.ids()) & self._by_id.keys())
         if refs := [mid for mid in collision if mid in self._refs]:
@@ -1917,6 +2016,9 @@ class Translate(TranslateBase):
                 print(f' move id: {mid} → {label.id}: {label.text!r}')
         if self.rename:
             self._rename_orphan_ids()
+        compacted = 0
+        if self.compact_ids:
+            compacted, new_trans_count = self._compact()
         for lst in self._by_text.values():
             for label in lst:
                 if label.id is None and label.referenced:  # text only in PO (ID-less entry) waits for use
@@ -1949,7 +2051,7 @@ class Translate(TranslateBase):
             removed = sum(self._cleanup_translate_comments_in(inp.tree) for inp in self.xml_inputs)
             if removed:
                 logger.info(f'Cleaned up {removed} redundant :translate=false: comment(s)')
-        return GenerateStats(new=new_trans_count, moved=len(collision), obsolete=was_obsolete)
+        return GenerateStats(new=new_trans_count, moved=len(collision) + compacted, obsolete=was_obsolete)
 
     def reset_ids(self, ref: str, po_path: Path) -> GenerateStats:
         """Remove IDs new on this branch (`--reset-ids REF`), they are assigned again after merge into `ref`.
@@ -2271,11 +2373,15 @@ class Translate(TranslateBase):
         for mid in self._reset_ids & ie.keys():
             ie.pop(mid).msgctxt = None
         pending = {self._entry_key(e): e for e in po if not e.msgctxt and e.msgid}
-        # `--id-reserve`: entry of a moved ID is renumbered (translation, flags and comments stay)
-        for old_id, new_id in self._moved_ids.items():
-            if new_id is not None and (entry := ie.pop(old_id, None)) is not None:
-                entry.msgctxt = f'#{new_id}'
-                ie[new_id] = entry
+        # `--id-reserve` / `--compact-ids`: entry of a moved ID is renumbered (translation, flags and comments stay);
+        # all moved entries out first, a new ID can be the old ID of another moved entry (compact)
+        moved = {new_id: entry for old_id, new_id in self._moved_ids.items()
+                 if new_id is not None and (entry := ie.pop(old_id, None)) is not None}
+        for new_id, entry in moved.items():
+            entry.msgctxt = f'#{new_id}'
+            ie[new_id] = entry
+        # old IDs no label has now (a new text can take an old ID in the same run): their entries go away
+        stale = set(self._moved_ids) - self._by_id.keys()
         # Apply in-place renames: existing entries whose label was reused for
         # a new text (because old text became unreferenced).
         for old_id, new_key in self._renamed_ids.items():
@@ -2370,18 +2476,20 @@ class Translate(TranslateBase):
             for entry in po:
                 if (r := self._RE_LABEL_NUM.fullmatch(entry.msgctxt or '')) is not None:
                     mid = int(r.group('id'))
-                    if mid not in self._ids and mid not in self._moved_ids:
+                    if mid not in self._ids and mid not in stale:
                         entry.obsolete = True
         elif self.obsolete is ObsoleteAction.REMOVE:
             to_remove = [i for i, entry in enumerate(po)
                          if ((mch := self._RE_LABEL_NUM.fullmatch(entry.msgctxt or '')) is not None
-                             and ((mid := int(mch.group('id'))) in self._moved_ids or mid not in self._ids))]
+                             and ((mid := int(mch.group('id'))) in stale or mid not in self._ids))]
             for i in reversed(to_remove):
                 del po[i]
         if self._moved_ids:
+            # the entry of each live ID stays; other ones with a moved ID (removed labels, obsolete duplicates) go away
+            kept = {id(e) for mid, e in ie.items() if mid in self._by_id}
             to_remove = [i for i, entry in enumerate(po)
                          if ((mch := self._RE_LABEL_NUM.fullmatch(entry.msgctxt or '')) is not None
-                             and int(mch.group('id')) in self._moved_ids)]
+                             and int(mch.group('id')) in self._moved_ids and id(entry) not in kept)]
             for i in reversed(to_remove):
                 del po[i]
         for entry in po:
@@ -2607,6 +2715,11 @@ class Translate(TranslateBase):
         conf = self.load_addon_config(path)
         if conf is None:
             conf = self.load_addon_files(path)
+        if (path / 'addon.xml').exists():
+            # e.g. `kodi.context.item` menu `<label>30150</label>`: own string used by number
+            for node in etree.parse(str(path / 'addon.xml')).iter('label'):
+                if (node.text or '').strip().isdigit():
+                    self._add_ref(int(node.text), path / 'addon.xml', node.sourceline)
         if conf is not None:
             # `load_addon_config` already sets self.addon_id from addon.xml; cover
             # the no-config path here so skin label scan stays enabled.
@@ -2643,7 +2756,7 @@ def process(inputs, *, args, langs=None, output=None):
                       po_wrap_width=args.po_wrap_width, reserved_ids=args.id_reserve,
                       git_only=args.git_only,
                       cleanup_translate_comments=args.cleanup_translate_comments,
-                      rename=args.rename,
+                      rename=args.rename, compact_ids=args.compact_ids,
                       )
     trans.skin = args.type == 'skin'
     if args.verbose:
@@ -2738,7 +2851,18 @@ def process(inputs, *, args, langs=None, output=None):
             sys.exit(1)
         stats = trans.reset_ids(args.reset_ids, output / pattern.format(lang=BASE_LANG, lang_lower=BASE_LANG.lower()))
     else:
-        stats = trans.generate()
+        if args.compact_ids and not trans.dry_run:
+            po_files = [output / pattern.format(lang=lang, lang_lower=lang.lower()) if pattern else output for lang in langs]
+            if dirty := trans.uncommitted([*(f.path for f in (*trans.xml_inputs, *trans.py_inputs) if not f.readonly),
+                                           *(p for p in po_files if p.exists())]):
+                logger.error(f'--compact-ids rewrites every source and PO file, commit first (git restores them): '
+                             f'{", ".join(map(str, dirty[:5]))}{" …" if len(dirty) > 5 else ""}')
+                sys.exit(1)
+        try:
+            stats = trans.generate()
+        except NoFreeIdError as exc:
+            logger.error(exc)
+            sys.exit(1)
     if langs:
         trans.write()
     else:
@@ -3013,6 +3137,9 @@ def main(argv=None):
                         'on the default branch')
     p.add_argument('--locations', choices=('none', 'file', 'line'),
                    help='`#:` references in PO: where texts are used [derived from the base language PO]')
+    p.add_argument('--compact-ids', action='store_true',
+                   help='renumber own IDs one after another from --id-from (translations move with them); IDs used by number '
+                        'stay; needs committed sources and PO (git)')
     p.add_argument('--reset-ids', metavar='REF',
                    help='remove IDs new on this branch (not in PO at merge base with REF) before merge into REF, '
                         'translations wait in PO without ID; run kolang on REF after the merge')

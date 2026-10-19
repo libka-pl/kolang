@@ -461,6 +461,7 @@ Most-used options:
 | `--id-max NUM` | upper bound for new IDs (default 32999, skin 31999) |
 | `--id-policy {max,min}` | strategy for picking next free ID |
 | `--id-reserve A-B,C` | mark ID ranges as reserved (existing labels there get moved with translations; error if an ID there is used by number) |
+| `--compact-ids` | renumber own IDs one after another from `--id-from` (translations move with them; IDs used by number stay); needs committed sources and PO |
 | `--addon-id ID` | force `$ADDON[ID …]` prefix in skin labels (else read from `addon.xml`) |
 | `--no-addon-id` | don't add `$ADDON[]` prefix at all |
 | `--obsolete {keep,mark,remove}` | how to treat PO entries no longer referenced |
@@ -488,6 +489,18 @@ ID range defaults follow the addon type: a skin (`xbmc.gui.skin` in `addon.xml` 
 because Kodi finds skin strings by number (`$LOCALIZE[N]`, `<label>N</label>`) only in 31000–31999 — a numeric
 reference to an own string outside it is reported. Other addons get 30100–32999 (33000–33999 are Kodi core strings).
 `--id-from` / `--id-min` / `--id-max` on the command line win over `.kolang.json`.
+
+New IDs go above the highest used one (`--id-policy max`); when the top of the range is full, they fill gaps from
+`--id-from` (warning). With no free ID at all kolang stops with a hint: raise `--id-max`, free IDs held by unused PO
+entries (`--obsolete remove`) or renumber with `--compact-ids`.
+
+`--compact-ids` renumbers own IDs (from `--id-from` up) one after another in their current order, PO entries are
+renumbered in place in all languages (translation, fuzzy, comments stay). IDs used by number (`getLocalizedString(N)`,
+`L(N)`, `$LOCALIZE[N]`, `label="N"` without `L()` comment, `<label>N</label>` in `addon.xml`) stay, the rest is
+numbered around them. Unused PO entries follow the used ones (`--obsolete remove` drops them). Before running it:
+merge or `--reset-ids` other branches (every ID line changes), check that no other addon or skin uses the strings by
+number (kolang can't see them), commit (kolang refuses uncommitted sources/PO). `L()` in comments is not rewritten.
+Try `--dry-run --compact-ids` first (`move id: old → new`).
 
 ---
 
