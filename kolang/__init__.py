@@ -45,7 +45,7 @@ logger = logging.getLogger('kolang')
 
 
 __author__ = 'rysson'
-__version__ = '0.2.2'
+__version__ = '0.2.999'
 
 
 @dataclass(frozen=True)
