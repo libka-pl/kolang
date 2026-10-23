@@ -2881,14 +2881,9 @@ def process(inputs, *, args, langs=None, output=None):
 
 
 def copy_kolang_py(output: Path = Path()) -> None:
-    mod = Path(__file__).parent.parent
-    if mod.is_file():  # pyz
-        from zipfile import ZipFile
-        with ZipFile(str(mod)) as z:
-            with z.open('kolang/kolang.py') as f:
-                content = f.read().decode()
-    else:
-        content = (mod / 'kolang' / 'kolang.py').read_text(encoding='utf8')
+    """Write the runtime `L()` helper (`kolang.py`) into `output` (works from a package dir and from pyz)."""
+    from importlib.resources import files
+    content = files(__package__).joinpath('kolang.py').read_text(encoding='utf8')
     output /= 'kolang.py'
     if output.exists():
         logger.error(f'{output} already exists, remove it if you want get generate new kolang.py')
