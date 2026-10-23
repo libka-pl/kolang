@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kolang"
+description = "Kodi language tool"
+dynamic = ["version"]
+authors = [{name = "Robert Kalinowski", email = "robert.kalinowski@sharkbits.com"}]
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["lxml"]
+
+[project.scripts]
+kolang = "kolang:main"
+
+[tool.setuptools]
+packages = ["kolang"]
+
+[tool.setuptools.dynamic]
+version = {attr = "kolang.__version__"}

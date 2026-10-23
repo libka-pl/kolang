@@ -21,7 +21,7 @@ git clone …
 cd kolang
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt   # installs lxml
+pip install -e .                  # installs lxml, `kolang` command
 ```
 
 ---
