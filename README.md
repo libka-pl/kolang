@@ -24,6 +24,14 @@ source .venv/bin/activate
 pip install -e .                  # installs lxml, `kolang` command
 ```
 
+Build `dist/kolang-X.Y.Z.pyz` (version from `kolang/__init__.py`):
+
+```bash
+make            # build the pyz
+make release    # clean tree only: tag vX.Y.Z and build (push is up to you)
+make clean
+```
+
 ---
 
 ### Quick start

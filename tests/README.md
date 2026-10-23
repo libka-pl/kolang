@@ -1,7 +1,8 @@
 # kolang tests
 
+From the repository root, with kolang installed in the venv (`pip install -e . pytest`):
+
 ```bash
-cd kolang
 .venv/bin/python -m pytest tests/ -v
 ```
 
