@@ -33,7 +33,7 @@ except ImportError:
     sys.stderr.write('Missing lxml module, try `pip install lxml`\n')
     sys.exit(1)
 if TYPE_CHECKING:
-    from typing import Iterable, Sequence
+    from typing import Iterable, Iterator, Sequence
     from lxml.etree import _ElementTree as ElementTree
     from lxml.etree import _Element as Element
 from . import polib
@@ -396,41 +396,133 @@ def _get_python_overrides(node) -> tuple[str | None, dict[str, str]]:
 
 
 def _extract_fstring_blocks(text: str) -> list[tuple[int, int, str]]:
-    """Return [(start, end, code), …] for `{…}` expressions in `text`.
+    """Return [(start, end, code), …] for `{…}` expressions in `text` (f-string body without quotes).
 
-    `{{` / `}}` at the top level are literal `{` / `}` (Python f-string convention).
-    Inside an expression, braces are matched normally (depth counter).
-    Indices `start`/`end` are positions in `text` of the inner code (between
-    the outer `{` and `}`); the outer braces are NOT included.
+    `{{` / `}}` are literal `{` / `}`. Expressions may contain strings, nested f-strings and format specs
+    (`{x:>{w}}` gives `x` and `w`). Indices are positions in `text` of the code, without the braces.
+    On unbalanced input blocks found so far are returned.
     """
-    blocks: list[tuple[int, int, str]] = []
-    i = 0
-    n = len(text)
-    while i < n:
-        c = text[i]
-        if c == '{':
-            if i + 1 < n and text[i + 1] == '{':
-                i += 2  # literal `{`
-                continue
-            depth = 1
-            j = i + 1
-            while j < n and depth > 0:
-                cj = text[j]
-                if cj == '{':
-                    depth += 1
-                elif cj == '}':
-                    depth -= 1
-                j += 1
-            if depth == 0:
-                blocks.append((i + 1, j - 1, text[i + 1:j - 1]))
-                i = j
-            else:
-                break  # unmatched `{` — give up
-        elif c == '}' and i + 1 < n and text[i + 1] == '}':
-            i += 2  # literal `}`
+    _end, blocks = _scan_fstring_body(text, 0, len(text), '', raw=True)
+    return [(start, end, text[start:end]) for start, end in blocks]
+
+
+#: Python string literal prefix characters (`t` is PEP 750 template string, same syntax as f-string).
+_STR_PREFIX: frozenset[str] = frozenset('rRbBuUfFtT')
+
+
+def _scan_str(text: str, i: int, end: int) -> tuple[int | None, list[tuple[int, int]]]:
+    """Scan Python string literal starting at `text[i]` (prefix or quote), stop before `end`.
+
+    Returns (index after the closing quote or None if it's not a complete literal, [(start, end), …] of `{…}` code
+    in f/t-strings). Plain text scan, independent of the running Python: supports PEP 701 (same quotes, comments
+    and backslashes inside nested f-string expressions).
+    """
+    j = i
+    while j < end and text[j] in _STR_PREFIX:
+        j += 1
+    prefix = text[i:j].lower()
+    if j >= end or text[j] not in '\'"' or len(prefix) > 2:
+        return None, []
+    quote = text[j] * 3 if text.startswith(text[j] * 3, j) else text[j]
+    j += len(quote)
+    if 'f' in prefix or 't' in prefix:
+        return _scan_fstring_body(text, j, end, quote, raw='r' in prefix)
+    while j < end:
+        c = text[j]
+        if c == '\\':
+            j += 2
+        elif text.startswith(quote, j):
+            return j + len(quote), []
+        elif c == '\n' and len(quote) == 1:
+            return None, []
         else:
-            i += 1
-    return blocks
+            j += 1
+    return None, []
+
+
+def _scan_fstring_body(text: str, i: int, end: int, quote: str, *, raw: bool,
+                       spec: bool = False) -> tuple[int | None, list[tuple[int, int]]]:
+    """Scan f-string text part from `i`: up to the closing `quote`, or `end` if `quote` is empty (XML value).
+
+    In a format `spec` the scan stops at `}` and returns its index. Returns (index after the quote / of `}` or None
+    if unterminated, [(start, end), …] of expression code).
+    """
+    blocks: list[tuple[int, int]] = []
+    j = i
+    while j < end:
+        c = text[j]
+        if quote and text.startswith(quote, j):
+            return j + len(quote), blocks
+        if c == '\\':
+            if not raw and text.startswith('N{', j + 1):  # `\N{NAME}` is a character name, not an expression
+                close = text.find('}', j, end)
+                if close < 0:
+                    return None, blocks
+                j = close + 1
+            else:  # escaped quote or backslash doesn't end the literal, `\{` still starts an expression
+                j += 2 if j + 1 < end and text[j + 1] in '\'"\\' else 1
+        elif c == '{':
+            if not spec and text.startswith('{{', j):
+                j += 2
+                continue
+            j, inner = _scan_fstring_expr(text, j + 1, end, raw=raw)
+            if j is None:
+                return None, blocks
+            blocks.extend(inner)
+        elif c == '}':
+            if spec:
+                return j, blocks
+            j += 2 if text.startswith('}}', j) else 1
+        elif c == '\n' and len(quote) == 1:
+            return None, blocks
+        else:
+            j += 1
+    return (end, blocks) if not quote else (None, blocks)
+
+
+def _scan_fstring_expr(text: str, i: int, end: int, *, raw: bool) -> tuple[int | None, list[tuple[int, int]]]:
+    """Scan f-string replacement field after `{` at `i`: expression, `!conversion`, `:spec`, closing `}`.
+
+    Returns (index after `}` or None, [(start, end) of the expression, then of `{…}` inside the spec]).
+    """
+    depth = 0
+    j = i
+    while j < end:
+        c = text[j]
+        if c in '([{':
+            depth += 1
+        elif c in ')]}':
+            if not depth:
+                return (j + 1, [(i, j)]) if c == '}' else (None, [])
+            depth -= 1
+        elif c in '\'"' or (c in _STR_PREFIX and (j == i or not (text[j - 1].isalnum() or text[j - 1] == '_'))):
+            stop, _blocks = _scan_str(text, j, end)  # nested literal, its own `{…}` are found by the caller's rescan
+            if stop is not None:
+                j = stop
+                continue
+            if c in '\'"':
+                return None, []
+        elif c == '#':
+            j = text.find('\n', j, end)
+            if j < 0:
+                return None, []
+            continue
+        elif not depth and ((c == '!' and not text.startswith('!=', j)) or c == ':'):
+            expr = (i, j)
+            if c == '!':
+                j += 1
+                while j < end and (text[j].isalnum() or text[j] == '_'):
+                    j += 1
+                if j < end and text[j] == '}':
+                    return j + 1, [expr]
+                if j >= end or text[j] != ':':
+                    return None, []
+            stop, inner = _scan_fstring_body(text, j + 1, end, '', raw=raw, spec=True)
+            if stop is None or stop >= end or text[stop] != '}':
+                return None, []
+            return stop + 1, [expr, *inner]
+        j += 1
+    return None, []
 
 
 def _python_override(node, target: str | None) -> str | None:
@@ -1603,7 +1695,8 @@ class Translate(TranslateBase):
                  fr'|\bLL?\s*\(\s*(?P<ref>\d+)\s*(?=[,)])'
                  # literal starts the argument, but it isn't a plain literal (f-string, prefix, expression)
                  fr'|\bLL?\s*\(\s*(?:\d+\s*,\s*)?(?P<bad>(?:[fFrRbBuU]{{1,2}})?{lit})')
-        pat = f'{_R_CM}|{rstr()}|{_R_LL}'
+        # string literal with its prefix (`pfx`): f/t-strings are scanned for `{…}` code
+        pat = fr'{_R_CM}|(?P<pfx>(?<!\w)[rRbBuUfFtT]{{1,2}})?{rstr()}|{_R_LL}'
         l8funcs = list(l8funcs or ())
         if self.handle_getLocalizedString:
             l8funcs.append(L8Func('getLocalizedString'))
@@ -1623,7 +1716,22 @@ class Translate(TranslateBase):
         block_line = -2
         line_keys: tuple[int, list[tuple[str, str]]] = (-1, [])
         xml_notes = _translators_notes(node.node, _node_value_target(node)) if node is not None else []
-        for r in R.finditer(data):
+
+        def matches(pos: int, endpos: int) -> Iterator[re.Match[str]]:
+            """Matches in `data[pos:endpos]`, code in `{…}` of f/t-strings included (positions stay absolute)."""
+            while (r := R.search(data, pos, endpos)) is not None:
+                yield r
+                pos = r.end()
+                if (pfx := r['pfx']) and ('f' in pfx.lower() or 't' in pfx.lower()):
+                    stop, blocks = _scan_str(data, r.start(), endpos)
+                    if stop is None:
+                        logger.debug(f'{path}:{bisect(newlines, r.start()) + 1}: unterminated f-string, its code skipped')
+                        continue
+                    pos = stop
+                    for start, end in blocks:
+                        yield from matches(start, end)
+
+        for r in matches(0, len(data)):
             if r['comment'] is not None:
                 line = bisect(newlines, r.start())
                 own_line = not data[(newlines[line - 1] + 1 if line else 0):r.start()].strip()
