@@ -2988,15 +2988,22 @@ def process(inputs, *, args, langs=None, output=None):
             sys.exit(1)
 
 
-def copy_kolang_py(output: Path = Path()) -> None:
-    """Write the runtime `L()` helper (`kolang.py`) into `output` (works from a package dir and from pyz)."""
+def copy_kolang_py(output: Path = Path(), *, backup_pattern: str | None = '{}~') -> None:
+    """Write the runtime `L()` helper (`kolang.py`) into `output` (works from a package dir and from pyz).
+
+    An existing different file is overwritten like any file kolang rewrites (backup unless git restores it).
+    """
     from importlib.resources import files
     content = files(__package__).joinpath('kolang.py').read_text(encoding='utf8')
     output /= 'kolang.py'
     if output.exists():
-        logger.error(f'{output} already exists, remove it if you want get generate new kolang.py')
-    else:
-        output.write_text(content, encoding='utf8')
+        if output.read_text(encoding='utf8') == content:
+            print(f'{output}: up to date')
+            return
+        output = Translate(backup_pattern=backup_pattern)._prepare_write_target(output.resolve(), base=None)
+        print(f'{output}: updated')
+    with open(output, 'w', encoding='utf8', newline='') as f:
+        f.write(content)
 
 
 def parse_lang_arg(ss):
@@ -3279,7 +3286,7 @@ def main(argv=None):
     # print(args); exit()
 
     if args.generate_kolang_py:
-        copy_kolang_py(args.input[0])
+        copy_kolang_py(args.input[0], backup_pattern=args.backup_pattern)
         return
     if args.git_setup:
         git_setup(args.input)
