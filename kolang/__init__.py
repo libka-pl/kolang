@@ -3000,8 +3000,8 @@ def copy_kolang_py(output: Path = Path(), *, backup_pattern: str | None = '{}~')
         if output.read_text(encoding='utf8') == content:
             print(f'{output}: up to date')
             return
-        output = Translate(backup_pattern=backup_pattern)._prepare_write_target(output.resolve(), base=None)
         print(f'{output}: updated')
+        output = Translate(backup_pattern=backup_pattern)._prepare_write_target(output.resolve(), base=None)
     with open(output, 'w', encoding='utf8', newline='') as f:
         f.write(content)
 
