@@ -33,7 +33,7 @@ except ImportError:
     sys.stderr.write('Missing lxml module, try `pip install lxml`\n')
     sys.exit(1)
 if TYPE_CHECKING:
-    from typing import Iterable, Iterator, Sequence
+    from typing import Callable, Iterable, Iterator, Sequence
     from lxml.etree import _ElementTree as ElementTree
     from lxml.etree import _Element as Element
 from . import polib
@@ -393,6 +393,21 @@ def _get_python_overrides(node) -> tuple[str | None, dict[str, str]]:
             general = g
         prev = prev.getprevious()
     return general, per_target
+
+
+def _parse_plural_forms(forms: str) -> tuple[int, Callable[[int], int]]:
+    """Parse `Plural-Forms` value (`nplurals=N; plural=EXPR;`) into (N, n → form index) like runtime `L()` (gettext).
+
+    Raise ValueError if the value is malformed or the expression is rejected by `gettext.c2py`.
+    """
+    import gettext
+    mch = re.fullmatch(r'\s*nplurals\s*=\s*(\d+)\s*;\s*plural\s*=\s*([^;]+);?\s*', forms)
+    if mch is None:
+        raise ValueError(f'malformed {forms!r}')
+    try:
+        return int(mch[1]), gettext.c2py(mch[2].strip())
+    except (SyntaxError, RecursionError) as exc:
+        raise ValueError(str(exc)) from None
 
 
 def _extract_fstring_blocks(text: str) -> list[tuple[int, int, str]]:
@@ -2411,8 +2426,42 @@ class Translate(TranslateBase):
         rule = po.metadata.get('Plural-Forms') or self.PLURAL_FORMS.get(lang, self.DEF_PLURAL_FORMS)
         return int(mch[1]) if (mch := re.search(r'nplurals\s*=\s*(\d+)', rule)) else 0
 
+    #: Numbers to compare plural rules on (covers `% 100` rules).
+    PLURAL_CHECK_RANGE: range = range(1000)
+
+    def _check_plural_header(self, lang: str, path: Path, po: polib.POFile) -> None:
+        """Warn on `Plural-Forms` of the PO header that runtime `L()` can't use or that differs from the expected one.
+
+        Expected: what kolang writes into a new PO (`po-header` from the config, the kolang table); unknown language
+        (no table entry) isn't compared.
+        """
+        header = po.metadata.get('Plural-Forms', '')
+        try:
+            nplurals, rule = _parse_plural_forms(header)
+        except ValueError as exc:
+            logger.warning(f'{path}: Plural-Forms {header!r} is incorrect ({exc}), '
+                           f'runtime L() uses gettext default n != 1')
+            return
+        used = {rule(n) for n in self.PLURAL_CHECK_RANGE}
+        if max(used) >= nplurals or len(used) < nplurals:
+            logger.warning(f'{path}: Plural-Forms {header!r} is inconsistent, nplurals={nplurals} but plural gives '
+                           f'forms {sorted(used)}')
+        expected = self.po_header.get('Plural-Forms') or self.PLURAL_FORMS.get(lang)
+        if not expected or expected == header:
+            return
+        try:
+            exp_nplurals, exp_rule = _parse_plural_forms(expected)
+        except ValueError:
+            return
+        diff = next((n for n in self.PLURAL_CHECK_RANGE if rule(n) != exp_rule(n)), None)
+        if exp_nplurals != nplurals or diff is not None:
+            at = f', n={diff} → form {rule(diff)}, expected {exp_rule(diff)}' if diff is not None else ''
+            logger.warning(f'{path}: Plural-Forms {header!r} differs from {expected!r} ({lang}){at}; '
+                           f'fix the PO header')
+
     def _check_translations(self, lang: str, path: Path, po: polib.POFile) -> None:
-        """Warn on translations broken at runtime: wrong number of `|||` forms, placeholders other than in msgid."""
+        """Warn on translations broken at runtime: plural header, wrong number of `|||` forms, placeholders."""
+        self._check_plural_header(lang, path, po)
         nplurals = self._nplurals(lang, po)
         for entry in po:
             if entry.obsolete or not entry.msgstr:
@@ -3180,15 +3229,14 @@ fi
 
 def plural_expr(code: str) -> None:
     """Print plural rule of the language (`plural.py`) and its form index for n 0–30, like runtime `L()` (gettext)."""
-    import gettext
     info = next((p for p in plural_forms if p.code == code or TranslateBase.lang_code(p.code) == code), None)
     if info is None:
         logger.error(f'Unknown language {code!r}')
         sys.exit(1)
     print(f'{info.code} ({info.name}): {info.forms}')
     try:
-        rule = gettext.c2py(info.forms.split('plural=', 1)[1].split(';', 1)[0])
-    except (IndexError, ValueError, SyntaxError) as exc:
+        _nplurals, rule = _parse_plural_forms(info.forms)
+    except ValueError as exc:
         logger.error(f'Incorrect plural rule: {exc}')
         sys.exit(1)
     for n in range(31):

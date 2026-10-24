@@ -87,7 +87,7 @@ plural_forms = (
     Plural('mfe', 'Mauritian Creole', 'nplurals=2; plural=(n > 1);'),
     Plural('mg', 'Malagasy', 'nplurals=2; plural=(n > 1);'),
     Plural('mi', 'Maori', 'nplurals=2; plural=(n > 1);'),
-    Plural('mk', 'Macedonian', 'nplurals=2; plural= n==1 || n%10==1 ? 0 : 1; Can’t be correct needs a 2 somewhere'),
+    Plural('mk', 'Macedonian', 'nplurals=2; plural=(n%10==1 && n%100!=11) ? 0 : 1;'),
     Plural('ml', 'Malayalam', 'nplurals=2; plural=(n != 1);'),
     Plural('mn', 'Mongolian', 'nplurals=2; plural=(n != 1);'),
     Plural('mni', 'Manipuri', 'nplurals=2; plural=(n != 1);'),
