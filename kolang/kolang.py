@@ -22,8 +22,6 @@ Python version: 3.8+
 from __future__ import annotations
 from typing import Literal, overload, TYPE_CHECKING
 from pathlib import Path
-from types import CodeType
-import ast
 import re
 try:
     from xbmcaddon import Addon
@@ -37,39 +35,20 @@ except ModuleNotFoundError:
                 pass
             def getLocalizedString(self, v):   # noqa: D102, E301
                 return str(v)
+            def getAddonInfo(self, key):       # noqa: D102, E301
+                return ''                      # addon path: current directory
 if TYPE_CHECKING:
-    from typing import Sequence, Mapping, ClassVar
-    from typing_extensions import TypeAlias
-    from simpleeval import SimpleEval
-    from ast import stmt
-    #: Plural rule, parsed by simpleeval (statement) or compiled with checked AST (if there is no simpleeval).
-    PluralRule: TypeAlias = 'stmt | CodeType'
+    from typing import Callable, ClassVar
 
 
 FALLBACK_LOCALE: str = 'en-US'
-
-#: AST nodes allowed in plural rules compiled without simpleeval: `n`, int constants, arithmetic (no `**`),
-#: comparisons and boolean logic. No attributes, calls, subscripts, strings, so there is no way to reach any object.
-_RULE_NODES: tuple[type[ast.AST], ...] = (
-    ast.Expression, ast.Name, ast.Load, ast.Constant,
-    ast.BoolOp, ast.And, ast.Or, ast.UnaryOp, ast.Not, ast.USub, ast.UAdd,
-    ast.BinOp, ast.Mod, ast.Add, ast.Sub, ast.Mult, ast.FloorDiv,
-    ast.Compare, ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
-)
+#: Locale of source texts in `L(id, 'text')`, Kodi returns them if there is no translation.
+SOURCE_LOCALE: str = 'en-GB'
 
 
-def compile_rule(rule: str) -> CodeType:
-    """
-    Compile plural rule (Python expression of `n`) for eval() without simpleeval.
-
-    Every AST node is checked against `_RULE_NODES`, raise ValueError on forbidden node (e.g. malicious rules.json).
-    """
-    tree: ast.Expression = ast.parse(rule, mode='eval')
-    for node in ast.walk(tree):
-        if (not isinstance(node, _RULE_NODES) or (isinstance(node, ast.Name) and node.id != 'n')
-                or (isinstance(node, ast.Constant) and type(node.value) is not int)):
-            raise ValueError(f'forbidden {type(node).__name__} in plural rule {rule!r}')
-    return compile(tree, 'rules.json', 'eval')
+def _default_plural(n: int) -> int:
+    """Gettext default plural rule: two forms, the first one for 1."""
+    return int(n != 1)
 
 
 def kodi_locale() -> str:
@@ -112,13 +91,10 @@ class LabelGetter:
     def __init__(self, id: str | None = None) -> None:
         #: Addon ID.
         self.id: str | None = id or None
-        #: Rules for all languages.
-        self._rules: Mapping[str, Sequence[PluralRule]] | None = None
-        #: Rule for locale.
-        self._rule: Sequence[PluralRule] | None = None
-        #: Current locale.
+        #: Plural rule (n → form index) per locale, from `Plural-Forms` of the addon PO.
+        self._plurals: dict[str, Callable[[int], int]] = {}
+        #: Current Kodi UI locale (None: not checked yet).
         self._locale: str | None = None
-        self.reset()
 
     @property
     def addon(self) -> Addon:
@@ -128,56 +104,71 @@ class LabelGetter:
         return Addon(self.id)
 
     def reset(self) -> None:
-        """Forget the locale plural rule if Kodi language has changed."""
-        if self._locale is None or (kodi_locale() != self._locale):
-            self._rule = None
+        """Forget the UI locale if Kodi language has changed."""
+        if self._locale is not None and kodi_locale() != self._locale:
             self._locale = None
 
     def destroy(self) -> None:
         """Destroy addon."""
-        self._rules = None
-        self._rule = None
+        self._plurals.clear()
         self._locale = None
 
-    def load_rules(self) -> dict[str, tuple[PluralRule, ...]]:
-        """Load plural rules for all languages, parsed by simpleeval or compiled (checked AST) if there is no simpleeval."""
-        import json
-        path = Path(__file__).parent.parent / 'resources' / 'language' / 'rules.json'
+    @property
+    def locale(self) -> str:
+        """Current Kodi UI locale, cached."""
+        if self._locale is None:
+            self._locale = kodi_locale()
+        return self._locale
+
+    def plural(self, locale: str | None = None) -> Callable[[int], int]:
+        """Return plural rule (n → form index) for the locale (Kodi UI locale by default), cached."""
+        locale = locale or self.locale
+        rule = self._plurals.get(locale)
+        if rule is None:
+            rule = self._plurals[locale] = self._load_plural(locale)
+        return rule
+
+    def _po_path(self, locale: str) -> Path | None:
+        """Find the addon PO file for the locale: exact `ll_cc`, other folder of the language, `en_gb`."""
+        base = Path(self.addon.getAddonInfo('path')) / 'resources' / 'language'
+        lang, _, region = locale.lower().partition('-')
+        prefix = f'resource.language.{lang}'
+        try:
+            others = sorted(p.name for p in base.iterdir()
+                            if p.name.startswith(prefix) and p.name[len(prefix):][:1] in ('', '_', '@'))
+        except OSError:
+            others = []
+        for name in (f'{prefix}_{region}', *others, 'resource.language.en_gb'):
+            if (path := base / name / 'strings.po').is_file():
+                return path
+        return None
+
+    def _load_plural(self, locale: str) -> Callable[[int], int]:
+        """Read `Plural-Forms` from the PO header for the locale, gettext default rule if missing or broken."""
+        import gettext
+        path = self._po_path(locale)
+        if path is None:
+            _log(f'No language PO file for {locale!r}, default plural rule', 'warning')
+            return _default_plural
+        header: list[str] = []
         try:
             with open(path, encoding='utf-8') as f:
-                plural: dict[str, list[str]] = json.load(f).get('plural', {})
-        except OSError:
-            _log(f'Missing language rules {path}')
-            return {}
+                for line in f:
+                    if not line.strip() and any(h.startswith('msgstr') for h in header):
+                        break
+                    header.append(line)
+        except OSError as exc:
+            _log(f'Can not read {path}: {exc}, default plural rule', 'warning')
+            return _default_plural
+        values = KodiLabels._join_po_strings(''.join(h for h in header if h.startswith('"') or h.startswith('msgstr')))
+        if (mch := re.search(r'Plural-Forms:[^\\]*?plural\s*=\s*([^;\\"]+)', values)) is None:
+            _log(f'No Plural-Forms in {path}, default plural rule', 'warning')
+            return _default_plural
         try:
-            from simpleeval import SimpleEval
-        except ModuleNotFoundError:
-            pass
-        else:
-            se = SimpleEval()
-            return {k: tuple(se.parse(v) for v in vv) for k, vv in plural.items()}
-        rules: dict[str, tuple[PluralRule, ...]] = {}
-        for lang, exprs in plural.items():
-            try:
-                rules[lang] = tuple(compile_rule(v) for v in exprs)
-            except (SyntaxError, ValueError) as exc:
-                _log(f'Incorrect plural rule for {lang!r}: {exc}', 'error')  # language uses the last form only
-        return rules
-
-    def rules(self, *, locale: str | None = None) -> Sequence[PluralRule]:
-        """Return plural rules for the locale (Kodi locale by default), cached."""
-        if self._rule is None:
-            if self._rules is None:
-                self._rules = self.load_rules()
-            if not locale:
-                if self._locale is None:
-                    self._locale = kodi_locale()
-                locale = self._locale
-            rules = self._rules.get(locale)
-            if rules is None:
-                rules = self._rules.get(locale.partition('-')[0], ())
-            self._rule = rules
-        return self._rule
+            return gettext.c2py(mch[1].strip())
+        except (ValueError, SyntaxError, RecursionError) as exc:
+            _log(f'Incorrect Plural-Forms in {path}: {exc}, default plural rule', 'error')
+            return _default_plural
 
     @overload
     def __call__(self, id: int, string: str, /, *, n: int | None = None, ctx: str = '', **kwargs) -> str: ...
@@ -204,32 +195,22 @@ class LabelGetter:
                 sid, text = None, args[0]
         else:
             raise TypeError(f'L{args} – incorrect arguments')
-        if sid:
-            if translated := self.addon.getLocalizedString(sid):
-                text = translated
-        return self._apply_plural(text, n, **kwargs)
+        # Kodi returns the English source if there is no translation, then the source plural rule fits
+        locale: str | None = SOURCE_LOCALE
+        if sid and (translated := self.addon.getLocalizedString(sid)) and translated != text:
+            text, locale = translated, None
+        return self._apply_plural(text, n, locale, **kwargs)
 
     def get_text(self, string: str, /, *, n: int | None = None, **kwargs) -> str:
         """Get value of already translated label. Useful for number forms."""
-        return self._apply_plural(string, n, **kwargs)
+        return self._apply_plural(string, n, None, **kwargs)
 
-    def _apply_plural(self, text: str, n: int | None, /, **kwargs) -> str:
-        """Apply locale's plural rule and format with `n` + kwargs."""
+    def _apply_plural(self, text: str, n: int | None, locale: str | None, /, **kwargs) -> str:
+        """Apply plural rule of the locale (UI locale if None) and format with `n` + kwargs."""
         if n is None:
             return text.format(**kwargs) if kwargs else text
         forms = text.split('|||')
-        se: SimpleEval | None = None
-        for rule, frm in zip(self.rules(), forms):
-            if isinstance(rule, CodeType):
-                matched = eval(rule, {'__builtins__': {}}, {'n': abs(n)})  # AST is checked in compile_rule()
-            else:
-                if se is None:
-                    from simpleeval import SimpleEval
-                    se = SimpleEval(names={'n': abs(n)})
-                matched = se.eval('', previously_parsed=rule)
-            if matched:
-                return frm.format(n=n, **kwargs)
-        return forms[-1].format(n=n, **kwargs)
+        return forms[min(self.plural(locale)(abs(n)), len(forms) - 1)].format(n=n, **kwargs)
 
 
 class KodiLabels:
