@@ -14,7 +14,12 @@ Used modules:
 
 ### Install
 
-Use `kolang.pyz` standalone, or:
+Use the single-file `kolang-X.Y.Z.pyz` (`python kolang.pyz …`, Linux and Windows). It needs lxml: if the
+interpreter has none, the first run installs it with pip into a private cache (`~/.cache/kolang/` or
+`%LOCALAPPDATA%\kolang\`, per Python version and platform). Without pip or network install lxml yourself
+(`sudo apt install python3-lxml` or `python -m pip install lxml`).
+
+Or from the source:
 
 ```bash
 git clone …
