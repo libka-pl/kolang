@@ -3172,9 +3172,20 @@ fi
 
 
 def plural_expr(code: str) -> None:
-    from simpleeval import simple_eval
-    info = next(iter(p for p in plural_forms if p.code == code))
-    print(simple_eval(info.forms))
+    """Print plural rule of the language (`plural.py`) and its form index for n 0–30, like runtime `L()` (gettext)."""
+    import gettext
+    info = next((p for p in plural_forms if p.code == code or TranslateBase.lang_code(p.code) == code), None)
+    if info is None:
+        logger.error(f'Unknown language {code!r}')
+        sys.exit(1)
+    print(f'{info.code} ({info.name}): {info.forms}')
+    try:
+        rule = gettext.c2py(info.forms.split('plural=', 1)[1].split(';', 1)[0])
+    except (IndexError, ValueError, SyntaxError) as exc:
+        logger.error(f'Incorrect plural rule: {exc}')
+        sys.exit(1)
+    for n in range(31):
+        print(f'{n:3} → {rule(n)}')
 
 
 def main(argv=None):
@@ -3258,15 +3269,15 @@ def main(argv=None):
     if args.merge_po:
         merge_po(*args.merge_po)
         return
+    if args.test_plural:
+        plural_expr(args.test_plural)
+        return
     if not args.input:
         p.error('the following arguments are required: PATH')
     if args.obsolete is not None:
         args.obsolete = ObsoleteAction(args.obsolete)
     # print(args); exit()
 
-    if args.test_plural:
-        plural_expr(args.test_plural)
-        return
     if args.generate_kolang_py:
         copy_kolang_py(args.input[0])
         return

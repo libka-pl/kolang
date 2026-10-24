@@ -157,3 +157,14 @@ def test_c2py_rejects(rule: str) -> None:
     """Guard of the trust assumption: gettext.c2py accepts only `n`, numbers and C operators, limited size."""
     with pytest.raises(ValueError):
         gettext.c2py(rule)
+
+
+def test_cli_test_plural() -> None:
+    """`--test-plural CODE` prints the `plural.py` rule and form indexes (no PATH needed), unknown code fails."""
+    import subprocess
+    import sys
+    res = subprocess.run([sys.executable, '-m', 'kolang', '--test-plural', 'pl'], capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr
+    assert all(f'{n:3} → {i}\n' in res.stdout for n, i in ((1, 0), (2, 1), (5, 2), (22, 1))), res.stdout
+    res = subprocess.run([sys.executable, '-m', 'kolang', '--test-plural', 'xx'], capture_output=True, text=True)
+    assert res.returncode == 1 and 'Unknown language' in res.stderr
