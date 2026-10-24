@@ -185,6 +185,15 @@ At runtime, `L(30100, '...', n=count)` picks the right form:
 - EN, `n=1` → `"file"`; `n=0`, `n=2`, … → `"files"`.
 - PL, `n=1` → `"plik"`; `n=2/3/4/22/…` → `"pliki"`; rest → `"plików"`.
 
+The rule is the `Plural-Forms` header of the addon PO for the Kodi language
+(`resources/language/resource.language.<ll_cc>/strings.po`, any folder of the
+language, then `en_gb`), evaluated with Python's `gettext`. A text without
+translation (Kodi shows the English source) uses the English rule. Missing or
+broken header: gettext default `n != 1` and a warning in the Kodi log.
+`rules.json` from older `kolang.py` versions is not used, remove it after
+refreshing `kolang.py`. `python kolang.pyz --test-plural pl` shows the forms
+of a language for n 0–30.
+
 `{n}` inside the form is substituted with the value (kolang's runtime calls
 `form.format(n=n, **kwargs)`):
 
@@ -494,7 +503,7 @@ Most-used options:
 | `--reset-ids REF` | remove IDs new on the branch before merge into `REF` (see Git) |
 | `--list WHAT` | list `fuzzy` or `untranslated` entries per language (repeatable); with `--dry-run` it's a read-only report |
 | `--verbose` / `--debug` | more output |
-| `--generate-kolang-py` | drop `kolang.py` (the runtime `L()` helper) into the addon |
+| `--generate-kolang-py` | drop `kolang.py` (the runtime `L()` helper) into PATH, a changed one is overwritten (backup unless git restores it) |
 
 Run `python kolang.pyz --help` for the complete list.
 
@@ -829,5 +838,5 @@ The flow on each invocation:
   be dropped into addons via `--generate-kolang-py`.
 * `kolang/plural.py` — gettext plural rules.
 * `kolang/polib.py` — vendored PO file library.
-* `kolang/release.py` — builds `kolang.pyz`.
+* `Makefile` — builds `dist/kolang-X.Y.Z.pyz`.
 * `tests/` — pytest suite (`pytest tests/` from project root).
