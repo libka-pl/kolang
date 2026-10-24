@@ -129,16 +129,9 @@ class LabelGetter:
         return rule
 
     def _po_path(self, locale: str) -> Path | None:
-        """Find the addon PO file for the locale: exact `ll_cc`, other folder of the language, `en_gb`."""
+        """Find the addon PO file for the locale like Kodi loads it: exact `ll_cc` folder, then `en_gb`."""
         base = Path(self.addon.getAddonInfo('path')) / 'resources' / 'language'
-        lang, _, region = locale.lower().partition('-')
-        prefix = f'resource.language.{lang}'
-        try:
-            others = sorted(p.name for p in base.iterdir()
-                            if p.name.startswith(prefix) and p.name[len(prefix):][:1] in ('', '_', '@'))
-        except OSError:
-            others = []
-        for name in (f'{prefix}_{region}', *others, 'resource.language.en_gb'):
+        for name in (f'resource.language.{locale.lower().replace("-", "_")}', 'resource.language.en_gb'):
             if (path := base / name / 'strings.po').is_file():
                 return path
         return None

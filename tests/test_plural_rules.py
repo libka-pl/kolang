@@ -96,9 +96,16 @@ def test_too_few_forms(getter: LabelGetter, tmp_path: Path) -> None:
     assert getter.get_text('one|||many', n=5) == 'many'
 
 
-def test_folder_without_region(getter: LabelGetter, tmp_path: Path) -> None:
-    """No `pl_pl`: other folder of the language."""
+def test_other_folder_of_language_ignored(getter: LabelGetter, tmp_path: Path) -> None:
+    """No `pl_pl`: Kodi doesn't load other folders of the language (`pl`), so the `en_gb` rule (B39)."""
     write_po(tmp_path, 'pl', PL)
+    assert forms(getter, (1, 2, 5)) == [0, 1, 1]
+
+
+def test_folder_without_region(getter: LabelGetter, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Kodi language without region (`eo`): its exact folder."""
+    monkeypatch.setattr(kolang, 'kodi_locale', lambda: 'eo')
+    write_po(tmp_path, 'eo', 'nplurals=3; plural=(n==1 ? 0 : n==2 ? 1 : 2);')
     assert forms(getter, (1, 2, 5)) == [0, 1, 2]
 
 

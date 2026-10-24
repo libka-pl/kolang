@@ -106,6 +106,7 @@ plural_forms = (
     Plural('nso', 'Northern Sotho', 'nplurals=2; plural=(n != 1);'),
     Plural('oc', 'Occitan', 'nplurals=2; plural=(n > 1);'),
     Plural('or', 'Oriya', 'nplurals=2; plural=(n != 1);'),
+    Plural('os', 'Ossetian', 'nplurals=2; plural=(n != 1);'),
     Plural('pa', 'Punjabi', 'nplurals=2; plural=(n != 1);'),
     Plural('pap', 'Papiamento', 'nplurals=2; plural=(n != 1);'),
     Plural('pl', 'Polish', 'nplurals=3; plural=(n==1 ? 0 : n%10>=2 && n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2);'),
@@ -132,6 +133,7 @@ plural_forms = (
     Plural('su', 'Sundanese', 'nplurals=1; plural=0;'),
     Plural('sv', 'Swedish', 'nplurals=2; plural=(n != 1);'),
     Plural('sw', 'Swahili', 'nplurals=2; plural=(n != 1);'),
+    Plural('szl', 'Silesian', 'nplurals=3; plural=(n==1 ? 0 : n%10>=2 && n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2);'),
     Plural('ta', 'Tamil', 'nplurals=2; plural=(n != 1);'),
     Plural('te', 'Telugu', 'nplurals=2; plural=(n != 1);'),
     Plural('tg', 'Tajik', 'nplurals=2; plural=(n > 1);'),
@@ -150,4 +152,18 @@ plural_forms = (
     Plural('yo', 'Yoruba', 'nplurals=2; plural=(n != 1);'),
     Plural('zh', 'Chinese [2]', 'nplurals=1; plural=0;'),
     Plural('zh', 'Chinese [3]', 'nplurals=2; plural=(n > 1);'),
+)
+
+
+#: Kodi language add-on IDs without the `resource.language.` prefix: Kodi loads add-on strings only from
+#: `resources/language/resource.language.<ID>` of the UI language (and `en_gb`), so PO folders must use them.
+#: Source: https://github.com/xbmc/repo-resources (branch omega, 78) + `en_gb` built into Kodi. Refresh for a new Kodi.
+KODI_LANGUAGES: tuple[str, ...] = (
+    'af_za', 'am_et', 'ar_sa', 'ast_es', 'az_az', 'be_by', 'bg_bg', 'bs_ba', 'ca_es', 'cs_cz', 'cy_gb', 'da_dk',
+    'de_de', 'el_gr', 'en_au', 'en_gb', 'en_nz', 'en_us', 'eo', 'es_ar', 'es_es', 'es_mx', 'et_ee', 'eu_es',
+    'fa_af', 'fa_ir', 'fi_fi', 'fil', 'fo_fo', 'fr_ca', 'fr_fr', 'ga_ie', 'gl_es', 'he_il', 'hi_in', 'hr_hr',
+    'hu_hu', 'hy_am', 'id_id', 'is_is', 'it_it', 'ja_jp', 'kn_in', 'ko_kr', 'lt_lt', 'lv_lv', 'mi', 'mk_mk',
+    'ml_in', 'mn_mn', 'ms_my', 'mt_mt', 'my_mm', 'nb_no', 'nl_nl', 'os_os', 'pl_pl', 'pt_br', 'pt_pt', 'ro_ro',
+    'ru_ru', 'si_lk', 'sk_sk', 'sl_si', 'sq_al', 'sr_rs', 'sr_rs@latin', 'sv_se', 'szl', 'ta_in', 'te_in', 'tg_tj',
+    'th_th', 'tr_tr', 'uk_ua', 'uz_uz', 'vi_vn', 'zh_cn', 'zh_tw',
 )

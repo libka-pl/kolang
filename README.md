@@ -189,8 +189,8 @@ At runtime, `L(30100, '...', n=count)` picks the right form:
 - PL, `n=1` → `"plik"`; `n=2/3/4/22/…` → `"pliki"`; rest → `"plików"`.
 
 The rule is the `Plural-Forms` header of the addon PO for the Kodi language
-(`resources/language/resource.language.<ll_cc>/strings.po`, any folder of the
-language, then `en_gb`), evaluated with Python's `gettext`. A text without
+(`resources/language/resource.language.<ll_cc>/strings.po`, then `en_gb`, the
+same folders Kodi loads), evaluated with Python's `gettext`. A text without
 translation (Kodi shows the English source) uses the English rule. Missing or
 broken header: gettext default `n != 1` and a warning in the Kodi log.
 `rules.json` from older `kolang.py` versions is not used, remove it after
@@ -585,8 +585,12 @@ Lives at the addon root by default. All sections are optional.
 Notes:
 
 * `options` — defaults; everything also available as a CLI flag (see `--help`).
-* `languages` — codes like `pl`, `en_US`. Country defaults guessed if you
-  give just the language part.
+* `languages` — codes like `pl`, `en_US`, `sr_RS@latin`. Kodi loads add-on
+  strings only from `resource.language.<Kodi language ID>` (e.g. `he_il`,
+  `ar_sa`, `eo`), so a short code is the Kodi language of it (`he` → `he_IL`,
+  `en` → `en_GB`, `zh` → `zh_CN`, `fa` → `fa_IR`); a full code is kept. A PO
+  folder Kodi never loads gets a warning; a folder of an older kolang guess
+  (e.g. `he_he`) is still written, with the `git mv` to the right name.
 * `sources` — directories, single files, globs, or other addons. A bare
   string is shorthand for `{"path": "…"}`.
 * `skip` — path globs to omit when walking directories.

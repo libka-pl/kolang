@@ -33,11 +33,11 @@ except ImportError:
     sys.stderr.write('Missing lxml module, try `pip install lxml`\n')
     sys.exit(1)
 if TYPE_CHECKING:
-    from typing import Callable, Iterable, Iterator, Sequence
+    from typing import Callable, ClassVar, Iterable, Iterator, Sequence
     from lxml.etree import _ElementTree as ElementTree
     from lxml.etree import _Element as Element
 from . import polib
-from .plural import plural_forms
+from .plural import plural_forms, Plural, KODI_LANGUAGES
 
 import logging
 import logging.config
@@ -802,20 +802,58 @@ class NodeValue:
 class TranslateBase:
     """Whole translate process handler."""
 
-    DEF_LANG = {c.partition('_')[0]: c for c in (
-        'sq_AL', 'ar_EG', 'be_BY', 'bn_IN', 'ca_ES', 'zh_CN', 'cs_CZ', 'da_DK', 'en_GB', 'et_EE',
-        'el_GR', 'iw_IL', 'hi_IN', 'in_ID', 'ga_IE', 'ja_JP', 'ko_KR', 'ms_MY', 'sr_RS', 'sl_SI',
-        'sv_SE', 'uk_UA', 'vi_VN')}
+    #: Language code: `ll[l]`, optional `_CC` region, optional `@variant` (like Kodi `sr_rs@latin`).
+    _RE_LANG: ClassVar[re.Pattern[str]] = re.compile(
+        r'(?P<lang>[a-zA-Z]{2,3})(?:_(?P<region>[a-zA-Z]{2}))?(?:@(?P<variant>\w+))?')
+    #: Kodi language of a short code with more Kodi variants and no `xx_xx` one.
+    _LANG_DEFAULT: ClassVar[dict[str, str]] = {'en': 'en_gb', 'zh': 'zh_cn', 'sr': 'sr_rs', 'fa': 'fa_ir'}
+    #: Obsolete (Java) language codes → current ones.
+    _LANG_ALIAS: ClassVar[dict[str, str]] = {'iw': 'he', 'in': 'id'}
+    #: `plural.py` entries by code in lower case (the later entry of a code wins).
+    _PLURALS: ClassVar[dict[str, Plural]] = {p.code.lower(): p for p in plural_forms}
+
+    @classmethod
+    def lang_case(cls, code: str) -> str:
+        """Return the code in `ll_CC@variant` case (`sr_rs@latin` → `sr_RS@latin`), raise ValueError if malformed."""
+        mch = cls._RE_LANG.fullmatch(code.strip())
+        if mch is None:
+            raise ValueError(f'Unknown language format {code!r}')
+        region, variant = mch['region'], mch['variant']
+        region = f'_{region.upper()}' if region else ''
+        variant = f'@{variant.lower()}' if variant else ''
+        return f"{mch['lang'].lower()}{region}{variant}"
 
     @classmethod
     def lang_code(cls, code: str) -> str:
-        """Return language code like "en_US". Try guess, ex "pl" -> "pl_PL"."""
-        if '_' not in code:
-            try:
-                code = cls.DEF_LANG[code]
-            except KeyError:
-                code = f'{code.lower()}_{code.upper()}'
-        return code
+        """Return language code like "pl_PL", a short code is the Kodi language add-on of it ("he" → "he_IL").
+
+        Language without Kodi add-on: guess "xx_XX" (the caller warns, Kodi doesn't load it).
+        """
+        code = cls.lang_case(code)
+        if '_' in code or '@' in code:
+            return code
+        lang = cls._LANG_ALIAS.get(code, code)
+        ids = [k for k in KODI_LANGUAGES if re.split('[_@]', k)[0] == lang]
+        kid = (cls._LANG_DEFAULT.get(lang)
+               or (ids[0] if len(ids) == 1 else f'{lang}_{lang}' if f'{lang}_{lang}' in ids else None))
+        return cls.lang_case(kid) if kid else f'{lang}_{lang.upper()}'
+
+    @classmethod
+    def plural_info(cls, lang: str) -> Plural | None:
+        """Return `plural.py` entry of the language: by the full code ("pt_BR"), then by the language ("es_MX")."""
+        code = lang.lower().partition('@')[0]
+        short = code.partition('_')[0]
+        return cls._PLURALS.get(code) or cls._PLURALS.get(cls._LANG_ALIAS.get(short, short))
+
+    @classmethod
+    def lang_plural_forms(cls, lang: str) -> str | None:
+        """Return `Plural-Forms` of the language from the kolang table, None if unknown."""
+        return info.forms if (info := cls.plural_info(lang)) else None
+
+    @classmethod
+    def lang_name(cls, lang: str) -> str:
+        """Return English name of the language (for `Language-Team`) without notes like "[1]", the code if unknown."""
+        return re.sub(r'\s*\[.*?\]', '', info.name) if (info := cls.plural_info(lang)) else lang
 
 
 class Translate(TranslateBase):
@@ -841,12 +879,6 @@ class Translate(TranslateBase):
     )
 
     DEF_PLURAL_FORMS = 'nplurals=2; plural=(n != 1);'
-    # see
-    # - https://doc.qt.io/archives/qq/qq19-plurals.html
-    # - http://docs.translatehouse.org/projects/localization-guide/en/latest/l10n/pluralforms.html
-    PLURAL_FORMS = {TranslateBase.lang_code(p.code): p.forms for p in plural_forms}
-    #: Language names (for `Language-Team`), without notes like "[1]".
-    LANG_NAMES = {TranslateBase.lang_code(p.code): re.sub(r'\s*\[.*?\]', '', p.name) for p in plural_forms}
 
     _RE_LABEL_NUM = re.compile(r'#(?P<id>\d+)')
     _RE_PLURAL_NOTE = re.compile(r'\d+ plural forms? separated by \|\|\|')
@@ -2423,7 +2455,7 @@ class Translate(TranslateBase):
 
     def _nplurals(self, lang: str, po: polib.POFile) -> int:
         """Return number of plural forms of the language (PO header, kolang table), 0 if unknown."""
-        rule = po.metadata.get('Plural-Forms') or self.PLURAL_FORMS.get(lang, self.DEF_PLURAL_FORMS)
+        rule = po.metadata.get('Plural-Forms') or self.lang_plural_forms(lang) or self.DEF_PLURAL_FORMS
         return int(mch[1]) if (mch := re.search(r'nplurals\s*=\s*(\d+)', rule)) else 0
 
     #: Numbers to compare plural rules on (covers `% 100` rules).
@@ -2446,7 +2478,7 @@ class Translate(TranslateBase):
         if max(used) >= nplurals or len(used) < nplurals:
             logger.warning(f'{path}: Plural-Forms {header!r} is inconsistent, nplurals={nplurals} but plural gives '
                            f'forms {sorted(used)}')
-        expected = self.po_header.get('Plural-Forms') or self.PLURAL_FORMS.get(lang)
+        expected = self.po_header.get('Plural-Forms') or self.lang_plural_forms(lang)
         if not expected or expected == header:
             return
         try:
@@ -2516,13 +2548,13 @@ class Translate(TranslateBase):
             'MIME-Version': '1.0',
             'Content-Type': 'text/plain; charset=utf-8',
             'Content-Transfer-Encoding': '8bit',
-            'Plural-Forms': self.PLURAL_FORMS.get(lang, self.DEF_PLURAL_FORMS),
+            'Plural-Forms': self.lang_plural_forms(lang) or self.DEF_PLURAL_FORMS,
             **self._addon_header,
             **self.po_header,
         }
         for key, value in header.items():
             if not po.metadata.get(key):
-                po.metadata[key] = str(value).replace('{language}', self.LANG_NAMES.get(lang, lang))
+                po.metadata[key] = str(value).replace('{language}', self.lang_name(lang))
         # active entry wins over an obsolete one with the same ID (old text kept by Weblate)
         ie = {int(r['id']): e for e in sorted(po, key=lambda e: not e.obsolete)
               if (r := self._RE_LABEL_NUM.fullmatch(e.msgctxt or '')) is not None}
@@ -2958,14 +2990,17 @@ def process(inputs, *, args, langs=None, output=None):
                 # pattern = 'resource.language.{lang_lower}/strings.po'
                 logger.info("Unsure addon type, guess it's plugin/module")
                 pattern = addon_type
+        disk: set[str] = set()
         for lpath in output.glob(pattern.replace('{lang_lower}', '*')):
             lpath = lpath.resolve()
             pat = re.escape(pattern.replace('{lang_lower}', '__LANG__')).replace('__LANG__', '(.*?)').replace('/', r'[/\\]')
             r = re.fullmatch(fr'.*[/\\]{pat}', str(lpath))
             if r is not None:
-                L = r.group(1)
-                L, sep, C = L.partition('_')
-                langs.add(f'{L}{sep}{C.upper()}')
+                try:
+                    disk.add(trans.lang_case(r.group(1)))
+                except ValueError:
+                    logger.warning(f'{lpath}: folder is not a language code, skipped')
+    langs = _kodi_language_folders(langs, disk, pattern)
 
     was: dict[str, GenerateStats] = {}
     for lang in sorted(langs, key=lambda lang: (lang != BASE_LANG, lang)):  # base first: it wins if PO files are out of sync
@@ -3055,12 +3090,41 @@ def copy_kolang_py(output: Path = Path(), *, backup_pattern: str | None = '{}~')
         f.write(content)
 
 
-def parse_lang_arg(ss):
-    rlang = re.compile(r'[a-z]{2,3}(?:_[a-zA-Z]{2})?')
+def _kodi_language_folders(langs: set[str], disk: set[str], pattern: str) -> set[str]:
+    """Return languages to write: configured `langs` and PO folders on `disk`, warn on folders Kodi doesn't load.
+
+    Kodi loads `resource.language.<Kodi language ID>` only. A configured language without its folder, but with an
+    existing folder of the same language that isn't a Kodi language (old kolang guess like `he_he`), keeps using it
+    (no split of translations) until it's renamed.
+    """
+    def short(lang: str) -> str:
+        code = re.split('[_@]', lang.lower())[0]
+        return TranslateBase._LANG_ALIAS.get(code, code)
+
+    folder = (pattern or 'resource.language.{lang_lower}/').partition('{lang_lower}')[0]
+    on_disk = {d.lower() for d in disk}
+    result = set(disk)
+    kept: set[str] = set()
+    for lang in sorted(langs):
+        if lang.lower() not in on_disk and lang.lower() in KODI_LANGUAGES:
+            if old := sorted(d for d in disk if short(d) == short(lang) and d.lower() not in KODI_LANGUAGES):
+                kept.add(old[0])
+                logger.warning(f'{folder}{old[0].lower()} is not a Kodi language folder, Kodi loads '
+                               f'{folder}{lang.lower()} only; kept until renamed: '
+                               f'git mv {folder}{old[0].lower()} {folder}{lang.lower()}')
+                continue
+        result.add(lang)
+    for lang in sorted(result - kept):
+        if lang.lower() not in KODI_LANGUAGES:
+            logger.warning(f'{folder}{lang.lower()}: Kodi has no such language add-on, it never loads this PO')
+    return result
+
+
+def parse_lang_arg(ss: str) -> list[str]:
+    """Parse comma separated language codes (`pl`, `pt_BR`, `sr_RS@latin`), raise ValueError on a malformed one."""
     ss = [s.strip() for s in ss.split(',') if s.strip()]
     for s in ss:
-        if not rlang.fullmatch(s):
-            raise ValueError(f'Unknown language fomrat {s!r}')
+        TranslateBase.lang_case(s)
     return ss
 
 
@@ -3229,7 +3293,7 @@ fi
 
 def plural_expr(code: str) -> None:
     """Print plural rule of the language (`plural.py`) and its form index for n 0–30, like runtime `L()` (gettext)."""
-    info = next((p for p in plural_forms if p.code == code or TranslateBase.lang_code(p.code) == code), None)
+    info = TranslateBase.plural_info(code)
     if info is None:
         logger.error(f'Unknown language {code!r}')
         sys.exit(1)
