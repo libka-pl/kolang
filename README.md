@@ -153,7 +153,10 @@ Custom L-like functions can be declared in config (see below).
 
 Forms inside one `msgid` are separated by `|||`. The number of forms must
 match the language's `Plural-Forms` rule (kolang seeds the PO header with
-the right rule for the declared `--language`).
+the right rule for the declared `--language`). An existing header is kept;
+kolang warns when it can't be used, is inconsistent (`nplurals` vs forms the
+rule gives) or differs from the rule kolang would write (`po-header` from the
+config or kolang's table), e.g. Weblate default `n != 1` for Polish.
 
 Source (English declaration):
 ```python
