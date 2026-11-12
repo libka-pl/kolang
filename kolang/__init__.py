@@ -11,6 +11,7 @@ from __future__ import annotations
 import sys
 import re
 import string
+import html
 from bisect import bisect
 from dataclasses import dataclass, field, replace as dc_replace
 from itertools import chain, count
@@ -122,6 +123,9 @@ class XmlInput:
     start_tags: dict[Element, str] = field(default_factory=dict, repr=False)
     #: Symlink leaving the addon: scanned, never written (B30).
     readonly: bool = False
+    #: Whitespace before each top-level node (comments, PIs, the root) and under None after the last one,
+    #: lxml keeps none of it (B41). Empty: unknown layout (e.g. a DOCTYPE), written as lxml serializes it.
+    top_space: dict[Element | None, str] = field(default_factory=dict, repr=False)
 
 
 @dataclass
@@ -1671,8 +1675,9 @@ class Translate(TranslateBase):
         tags = [m['tag'] for m in self._RE_XML_START_TAG.finditer(content) if m['tag']]
         elems = list(tree.iter(etree.Element))
         start_tags = dict(zip(elems, tags)) if len(tags) == len(elems) else {}
+        top_space = self._top_level_space(tree, content, len(decl or ''))
         self.xml_inputs.append(XmlInput(path, tree, base, declaration=decl, encoding=encoding, original=content_bytes, start_tags=start_tags,
-                                        readonly=readonly))
+                                        readonly=readonly, top_space=top_space))
         if readonly:
             self._readonly_roots[tree.getroot()] = path
         self._scan_xml(tree, path=path)
@@ -2325,6 +2330,83 @@ class Translate(TranslateBase):
                     logger.warning(f'Backup {bak} is not ignored by git, add its pattern to .gitignore (e.g. "*~")')
         return path
 
+    @staticmethod
+    def _top_level_nodes(tree: ElementTree) -> list[Element]:
+        """Return the top-level nodes in order: the comments and PIs before the root, the root, the ones after it."""
+        root = tree.getroot()
+        return [*reversed(list(root.itersiblings(preceding=True))), root, *root.itersiblings()]
+
+    @classmethod
+    def _top_level_space(cls, tree: ElementTree, content: str, pos: int) -> dict[Element | None, str]:
+        """Return the whitespace around the top-level nodes of `content` from `pos` (after the declaration).
+
+        See XmlInput.top_space. The comments and PIs are serialized as in the source: found from the start before
+        the root, from the end after it.
+        """
+        if tree.docinfo.doctype:
+            return {}
+        nodes = cls._top_level_nodes(tree)
+        root = tree.getroot()
+        at_root = nodes.index(root)
+        space: dict[Element | None, str] = {}
+        for node in nodes[:at_root]:
+            text = etree.tostring(node, encoding=str)
+            at = content.find(text, pos)
+            if at < 0 or content[pos:at].strip():
+                return {}
+            space[node] = content[pos:at]
+            pos = at + len(text)
+        end = len(content)
+        after: Element | None = None
+        for node in reversed(nodes[at_root + 1:]):
+            text = etree.tostring(node, encoding=str)
+            at = content.rfind(text, pos, end)
+            if at < 0 or content[at + len(text):end].strip():
+                return {}
+            space[after] = content[at + len(text):end]
+            after = node
+            end = at
+        body = content[pos:end]
+        space[root] = body[:len(body) - len(body.lstrip())]
+        space[after] = body[len(body.rstrip()):]
+        return space
+
+    def _put_top_level_space(self, input: XmlInput, body: str) -> str:
+        """Put the source whitespace back around the top-level nodes of the serialized `body`.
+
+        lxml glues them and drops the final newline. A new node before the root takes the whitespace before it and
+        the root gets a line of its own, a new node after the root gets a line of its own: the whitespace at the ends
+        of the file stays.
+        """
+        space = input.top_space
+        if not space:
+            return body
+        nodes = self._top_level_nodes(input.tree)
+        encoding = input.encoding
+        texts = [etree.tostring(node, encoding=encoding, xml_declaration=False).decode(encoding) for node in nodes]
+        if ''.join(texts) != body:
+            return body  # unexpected serialization, keep it as is
+        root = input.tree.getroot()
+        out: list[str] = []
+        held = False  # a new node took the whitespace of the next known one
+        for index, (node, text) in enumerate(zip(nodes, texts)):
+            if node in space:
+                out.append('\n' if held else space[node])
+                held = False
+            elif index > nodes.index(root):
+                out.append('\n')
+            else:
+                out.append('\n' if held else space[next(n for n in nodes[index + 1:] if n in space)])
+                held = True
+            out.append(text)
+        out.append(space[None])
+        return ''.join(out)
+
+    @staticmethod
+    def _xml_attr_value(source: str) -> str:
+        """Return the value of a quoted attribute `source`: literal whitespace as spaces (XML), references resolved."""
+        return html.unescape(re.sub(r'\r\n|[\t\n\r]', ' ', source[1:-1]))
+
     def _restore_start_tags(self, input: XmlInput, body: str) -> str:
         """Put back original start tags (lxml joins multi-line tags), with changed attribute values patched in place."""
         elems = iter(input.tree.iter(etree.Element))
@@ -2337,9 +2419,11 @@ class Translate(TranslateBase):
             if old is None or old == new or old.endswith('/>') != new.endswith('/>'):
                 return new
             new_attrs = dict(self._RE_XML_ATTR.findall(new))
-            if [a for a, _ in self._RE_XML_ATTR.findall(old)] != list(new_attrs):
-                return new  # attribute added, removed or reordered
-            return self._RE_XML_ATTR.sub(lambda a: a[0] if a[2][1:-1] == new_attrs[a[1]][1:-1] else f'{a[1]}={new_attrs[a[1]]}', old)
+            if sorted(a for a, _ in self._RE_XML_ATTR.findall(old)) != sorted(new_attrs):
+                return new  # attribute added or removed (lxml puts xmlns:* first, the source order stays)
+            value = self._xml_attr_value
+            return self._RE_XML_ATTR.sub(lambda a: a[0] if value(a[2]) == value(new_attrs[a[1]])
+                                         else f'{a[1]}={new_attrs[a[1]]}', old)
 
         return self._RE_XML_START_TAG.sub(restore, body)
 
@@ -2351,6 +2435,7 @@ class Translate(TranslateBase):
             code = ord(m[0])
             return f'&#x{code:04x};'
         body = etree.tostring(input.tree, encoding=encoding, xml_declaration=False).decode(encoding)
+        body = self._put_top_level_space(input, body)
         if input.start_tags:
             body = self._restore_start_tags(input, body)
         data = re.sub(r'[\u2000-\u200f]', entity, decl + body).encode(encoding)
@@ -2363,11 +2448,9 @@ class Translate(TranslateBase):
         if self.dry_run:
             logger.debug(f'Write xml: {input.path.resolve()}')
             if (logger.level or logging.root.level) <= logging.DEBUG - 2:
-                # etree.indent(input.tree)
-                debug_print(decl + etree.tostring(input.tree, xml_declaration=False).decode())
+                debug_print(data.decode(encoding))
             if self.dump_output:
-                body = etree.tostring(input.tree, encoding=encoding, xml_declaration=False)
-                print((decl.encode(encoding) + body).decode(encoding))
+                print(data.decode(encoding))
         elif data != input.original:
             path = self._prepare_write_target(input.path.resolve(), base=input.base)
             path.write_bytes(data)

@@ -60,6 +60,10 @@ files are written. A changed file gets a backup (`{}~` by default) unless it
 is tracked by git without local changes (git can restore it); a warning is
 printed if the backup is not ignored by git.
 
+A written XML keeps the layout of its source: line breaks and spacing inside
+start tags and attribute values, attribute order, the lines around comments
+before and after the root and the final newline.
+
 Translations are checked on each run (warning only): number of `|||` forms
 must match `nplurals` of the language (`Plural-Forms` header), placeholders
 `{name}` must be the same as in `msgid`. Entries with placeholders get the
