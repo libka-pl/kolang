@@ -1,6 +1,6 @@
 """XML layout: a written XML keeps the layout of its source.
 
-Line breaks and spacing inside start tags, the whitespace around the top-level nodes (B41).
+Line breaks and spacing inside start tags, the whitespace around the top-level nodes (B41), `>` in text (B42).
 """
 from __future__ import annotations
 
@@ -84,6 +84,18 @@ def test_changed_attribute_is_written(addon, kolang_run):
     xml = _run_settings(addon, kolang_run, src)
     assert xml == _translated(src)
     assert 'label="30100"\n           cond="a\n  b"/>' in xml
+
+
+def test_text_gt_raw(addon, kolang_run):
+    """`>` in the text stays as is (lxml writes `&gt;`), a comment is not touched."""
+    src = f'<settings>\n  {MOVIES}/>\n  <x>a -> b, c > d</x>\n  <!-- p &gt; q -->\n</settings>\n'
+    assert _run_settings(addon, kolang_run, src) == _translated(src)
+
+
+def test_text_gt_escaped_kept(addon, kolang_run):
+    """A file with an escaped `>` in its text keeps it; lxml escapes every `>` in such a file."""
+    src = f'<settings>\n  {MOVIES}/>\n  <x>a &gt; b</x>\n</settings>\n'
+    assert _run_settings(addon, kolang_run, src) == _translated(src)
 
 
 def test_new_top_level_comment(tmp_path):

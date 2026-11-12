@@ -126,6 +126,8 @@ class XmlInput:
     #: Whitespace before each top-level node (comments, PIs, the root) and under None after the last one,
     #: lxml keeps none of it (B41). Empty: unknown layout (e.g. a DOCTYPE), written as lxml serializes it.
     top_space: dict[Element | None, str] = field(default_factory=dict, repr=False)
+    #: No escaped `>` in the text of the source: `>` written as is, not as lxml's `&gt;` (B42).
+    raw_gt: bool = False
 
 
 @dataclass
@@ -903,6 +905,9 @@ class Translate(TranslateBase):
     _RE_XML_START_TAG: re.Pattern = re.compile(r'''<!--.*?-->|<!\[CDATA\[.*?\]\]>|<\?.*?\?>|<!DOCTYPE(?:[^>\[]|\[.*?\])*>|</[^>]*>'''
                                                r'''|(?P<tag><[^\s/>!?](?:[^>"']|"[^"]*"|'[^']*')*>)''', re.DOTALL)
     _RE_XML_ATTR: re.Pattern = re.compile(r'''([^\s=<>/]+)\s*=\s*("[^"]*"|'[^']*')''')
+    # Markup (as _RE_XML_START_TAG, group `markup`) or an escaped `>` in the text (not after `]]`: it stays escaped).
+    _RE_XML_TEXT_GT: re.Pattern = re.compile(rf'''(?P<markup>{_RE_XML_START_TAG.pattern})'''
+                                             r'''|(?<!\]\])&(?:gt|#0*62|#x0*3[eE]);''', re.DOTALL)
 
     # `$LOCALIZE[...]` inside Python string literal — used by _replace_py.
     _RE_PY_LOCALIZE = re.compile(r'\$LOCALIZE\[(?:(?P<id>\d+)|(?P<text>(?:[\\%].|\[(?:[\\%].|[^]])*\]|[^]])+))\]')
@@ -1676,8 +1681,9 @@ class Translate(TranslateBase):
         elems = list(tree.iter(etree.Element))
         start_tags = dict(zip(elems, tags)) if len(tags) == len(elems) else {}
         top_space = self._top_level_space(tree, content, len(decl or ''))
+        raw_gt = all(m['markup'] for m in self._RE_XML_TEXT_GT.finditer(content))
         self.xml_inputs.append(XmlInput(path, tree, base, declaration=decl, encoding=encoding, original=content_bytes, start_tags=start_tags,
-                                        readonly=readonly, top_space=top_space))
+                                        readonly=readonly, top_space=top_space, raw_gt=raw_gt))
         if readonly:
             self._readonly_roots[tree.getroot()] = path
         self._scan_xml(tree, path=path)
@@ -2438,6 +2444,8 @@ class Translate(TranslateBase):
         body = self._put_top_level_space(input, body)
         if input.start_tags:
             body = self._restore_start_tags(input, body)
+        if input.raw_gt:
+            body = self._RE_XML_TEXT_GT.sub(lambda m: m['markup'] or '>', body)
         data = re.sub(r'[\u2000-\u200f]', entity, decl + body).encode(encoding)
         if input.readonly:
             if data != input.original:
