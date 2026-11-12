@@ -313,6 +313,20 @@ Granularity wins over general; defaults come from kolang's automat
 (letter-based heuristic that ignores Kodi format tags `[B]`/`[/B]`/`[CR]`/…
 and runtime placeholders `$INFO[…]`/`$VAR[…]`/…).
 
+A text with `$LOCALIZE[…]`, `$NUMBER[…]` or `$ADDON[…]` stays literal: Kodi
+resolves them in the label before `$ADDON`, a translated string would show
+them as they are (`$INFO[…]`, `$VAR[…]` work there). To translate a piece,
+mark it by hand:
+
+```xml
+<label>$LOCALIZE[31603] $ADDON[kbps]</label>
+<!-- kolang → -->
+<!-- L(31604, 'kbps') -->
+<label>$LOCALIZE[31603] $ADDON[skin.id 31604]</label>
+```
+
+`:translate=true:` on such a text is obeyed with a warning.
+
 You can combine on one line:
 
 ```xml
@@ -831,6 +845,8 @@ The flow on each invocation:
    - (none) → automat:
      * if :python=fstring is active and text contains {…} → don't translate
        (template runtime composes; PO would be redundant)
+     * text with `$LOCALIZE[`/`$NUMBER[`/`$ADDON[` → don't translate
+       (Kodi leaves them literal in a translated string)
      * else: letter test (Unicode `isalpha()` after stripping Kodi format
        tags and runtime placeholders)
 3. Translate matrix (when active and a value goes to PO):

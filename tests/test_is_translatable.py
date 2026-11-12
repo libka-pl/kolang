@@ -27,7 +27,12 @@ from kolang import Translate as T
     ('$LABEL[10]', False),
     ('$VAR[name]', False),
     ('Title: $INFO[X]', True),
-    ('Hello $LOCALIZE[31000]', True),
+    # B32: Kodi resolves $LOCALIZE/$NUMBER/$ADDON before $ADDON, a translated string keeps them literally.
+    ('Hello $LOCALIZE[31000]', False),
+    ('$NUMBER[5] items', False),
+    ('Hello $ADDON[x 1]', False),
+    ('$INFO[X,[COLOR c]$LOCALIZE[1]:[/COLOR] , kb/s]', False),
+    ('Total $INFO[X]', True),
     ('[B]$INFO[ListItem.Property(item.indent.label)][/B]', False),
 ])
 def test_is_translatable(text, expected):

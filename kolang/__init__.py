@@ -922,6 +922,9 @@ class Translate(TranslateBase):
     )
     # Generic Kodi runtime placeholder ($INFO[…], $VAR[…], …).
     _RE_KODI_PLACEHOLDER_OPEN = re.compile(r'\$\w+\[')
+    # Placeholders Kodi resolves in a label before `$ADDON` (CGUIInfoLabel::Parse steps 1-2), not in the string
+    # `$ADDON` puts in: a translated text keeps them literally (B32). `$INFO`, `$VAR`, `$MAP`, `$FEATURE` come later.
+    _RE_KODI_BEFORE_ADDON = re.compile(r'\$(?:LOCALIZE|NUMBER|ADDON)\[')
 
     def __init__(self, *,
                  dry_run: bool = False,
@@ -1441,8 +1444,12 @@ class Translate(TranslateBase):
         Heuristic: strip Kodi format tags ([B], [COLOR …], [CR], …) and runtime
         placeholders ($INFO[…], $VAR[…], …), then look for at least one Unicode
         letter. Pure punctuation, digits and whitespace don't qualify.
+        A text with `$LOCALIZE[…]`, `$NUMBER[…]` or `$ADDON[…]` doesn't either: Kodi leaves them literal
+        in a translated string (pieces can be marked `$ADDON[text]` by hand).
         Adjust this heuristic in one place if it proves too permissive/strict.
         """
+        if cls._RE_KODI_BEFORE_ADDON.search(text):
+            return False
         text = cls._RE_KODI_FORMAT.sub('', text)
         text = cls._strip_placeholders(text)
         return any(c.isalpha() for c in text)
@@ -1547,6 +1554,9 @@ class Translate(TranslateBase):
             if override is False:
                 return False
             if override is True:
+                if text and self._RE_KODI_BEFORE_ADDON.search(text):
+                    logger.warning(f'{path}:{node.sourceline}: :translate=true: on {text!r}, '
+                                   'Kodi leaves $LOCALIZE/$NUMBER/$ADDON of a translated string literal')
                 return True
             value = text or ''
             py_mode = self._python_mode(node, target, is_skin=(xtype == XmlType.Window))
