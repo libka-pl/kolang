@@ -1694,9 +1694,11 @@ class Translate(TranslateBase):
                         logger.debug(f'  found win.XML node {node.tag} attr {attr}, value {text!r}')
                         add(text, NodeValue(node, attr, trans=(Trans(None, start=0, end=len(text),
                                                                      fmt='$ADDON[{addon} {id}]'),)))
-            # $ADDON[ID TEXT]
-            for node in root.xpath('.//*[text()[contains(.,"$ADDON[")]]'):
-                text = node.text
+            # $ADDON[ID TEXT] in a text or an attribute value (`<gui:push_button text="$ADDON[… N]">`)
+            addon_values = [(node, None, node.text) for node in root.xpath('.//*[text()[contains(.,"$ADDON[")]]')]
+            addon_values += [(node, name, value) for node in root.xpath('.//@*[contains(.,"$ADDON[")]/..')
+                             for name, value in node.attrib.items() if '$ADDON[' in value and not name.startswith('{')]
+            for node, attr, text in addon_values:
                 mm = list(self._RE_ADDON.finditer(text))
                 for m in reversed(mm):  # from the end to avoid span move on text replace
                     if self.addon_id and m['addon'] and self.addon_id != m['addon']:
@@ -1708,7 +1710,7 @@ class Translate(TranslateBase):
                     trans = [Trans(None, start, end, fmt=None)]
                     if self.addon_id and not m['addon']:
                         trans.append(Trans(None, start, start, fmt=f'{self.addon_id} '))
-                    add(text[start:end], NodeValue(node, None, trans=tuple(trans)))
+                    add(text[start:end], NodeValue(node, attr, trans=tuple(trans)))
 
     def load_xml(self, path: str | Path, base: str | Path | None = None, *, readonly: bool = False):
         """Load XML and keep data."""

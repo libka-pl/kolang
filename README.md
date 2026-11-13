@@ -329,6 +329,11 @@ mark it by hand:
 
 `:translate=true:` on such a text is obeyed with a warning.
 
+`$ADDON[…]` works the same in an attribute value of a window XML (custom
+controls, e.g. `<gui:push_button text="$ADDON[addon.id 30114]">`): the ID is
+used (not obsolete), the comment is `L[text](30114, 'Rescan')`, a text
+`$ADDON[addon.id Rescan]` gets its ID.
+
 You can combine on one line:
 
 ```xml
