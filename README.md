@@ -390,6 +390,18 @@ of truth on the next run.
 The bracket form `L[name]` works for any XML attribute name including
 namespaced ones (e.g. `L[xmlns:foo]`, `L[font-size]`).
 
+Without the ID the comment is a new text, as `L('text')` in Python: the old
+number in the XML is dropped, the text gets the ID of the same text (or a new
+one), and the XML value and the comment get that ID on the next run.
+
+```xml
+<!-- L[label]('Configuration') -->      <!-- was L[label](32916, 'Accounts') -->
+<group id="5" label="32916">
+```
+
+Two comments for one value (e.g. the new one and the old one) stop kolang with
+an error naming both — keep one.
+
 XML comments cannot contain `--`, so kolang escapes every `-` in any
 run of 2+ dashes as `-` (Python‑style unicode escape) **inside the
 comment only**. Single `-` is left alone, and the PO `msgid` keeps the

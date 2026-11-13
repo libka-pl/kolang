@@ -227,20 +227,21 @@ _RE_CONTEXT_DIRECTIVE = re.compile(r'\s*:\s*context(?:\[[^\]]*\])?\s*=[^:]*:')
 #: Allowed `:python=…:` values.
 _PYTHON_VALUES = frozenset({'true', 'false', 'fstring'})
 
-# L() comment marker — `L(N, 'text')`, `L[attr](N, 'text')`, `L[attr#N](N, 'text')`, optional `ctx='…'`.
+# L() comment marker — `L(N, 'text')`, `L[attr](N, 'text')`, `L[attr#N](N, 'text')`, optional `ctx='…'`;
+# without `N` (`L[attr]('text')`) a new text, like `L('text')` in Python.
 # Empty `L[]` is rejected (ambiguous with `L(...)`).
 _RE_L_COMMENT = re.compile(
     r'\s*L'
     r'(?:\[(?P<attr>[A-Za-z_][\w.\-:]*(?:#\d+)?)\])?'
-    r'\s*\(\s*(?P<id>\d+)\s*,\s*'
+    r'\s*\(\s*(?:(?P<id>\d+)\s*,\s*)?'
     r"(?P<text>'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\")"
     r"(?:\s*,\s*ctx\s*=\s*(?P<ctx>'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"))?"
     r'\s*\)\s*'
 )
 
 
-def _parse_L_comment(comment_text: str) -> tuple[str | None, int, str, str] | None:
-    """Parse an XML comment text as `L(...)` marker. Return (attr, id, text, ctx) or None.
+def _parse_L_comment(comment_text: str) -> tuple[str | None, int | None, str, str] | None:
+    """Parse an XML comment text as `L(...)` marker. Return (attr, id, text, ctx) or None; id None: a new text.
 
     `attr` is None for text content, attribute name otherwise (may be 'name#N'
     for indexed lvalues). Text is decoded from Python literal (handles `\\u002d`,
@@ -254,7 +255,7 @@ def _parse_L_comment(comment_text: str) -> tuple[str | None, int, str, str] | No
         ctx = literal_eval(m.group('ctx')) if m.group('ctx') else ''
     except (ValueError, SyntaxError):
         return None
-    return m.group('attr'), int(m.group('id')), text, ctx
+    return m.group('attr'), int(m.group('id')) if m.group('id') else None, text, ctx
 
 
 def _node_value_target(nv) -> str | None:
@@ -266,7 +267,7 @@ def _node_value_target(nv) -> str | None:
     return nv.attr
 
 
-def _find_L_marker(node, target: str | None) -> tuple[int, str, str] | None:
+def _find_L_marker(node, target: str | None) -> tuple[int | None, str, str] | None:
     """Walk back through XML comments before `node`, find L(...) for `target`.
 
     Returns (id, text, ctx) of the matching marker; None if no marker found.
@@ -274,7 +275,7 @@ def _find_L_marker(node, target: str | None) -> tuple[int, str, str] | None:
     developer notes interleaved). Raise ValueError on the second marker for
     the same target (e.g. git merged two identical elements into one).
     """
-    found: tuple[int, str, str] | None = None
+    found: tuple[int | None, str, str] | None = None
     prev = node.getprevious()
     while isinstance(prev, etree._Comment):
         parsed = _parse_L_comment(prev.text or '')
@@ -282,14 +283,16 @@ def _find_L_marker(node, target: str | None) -> tuple[int, str, str] | None:
             attr, lid, text, ctx = parsed
             if attr == target:
                 if found is not None:
-                    raise ValueError(f'two L() comments for {target!r}: {found[:2]} and {(lid, text)}, element lost in merge?')
+                    raise ValueError(f'two L() comments for {target!r}: {_format_L_comment(attr, *found).strip()} and '
+                                     f'{_format_L_comment(attr, lid, text, ctx).strip()}, keep one '
+                                     f'(or an element was lost in a merge)')
                 found = lid, text, ctx
         prev = prev.getprevious()
     return found
 
 
-def _format_L_comment(attr: str | None, label_id: int, text: str, ctx: str = '') -> str:
-    """Format an L(...) marker as XML comment body (without `<!-- ... -->`).
+def _format_L_comment(attr: str | None, label_id: int | None, text: str, ctx: str = '') -> str:
+    """Format an L(...) marker as XML comment body (without `<!-- ... -->`), no ID if `label_id` is None.
 
     Each `--` sequence is escaped to `\\u002d` (per char) so the comment stays
     XML-valid. ast.literal_eval round-trips the value back when parsing.
@@ -298,9 +301,11 @@ def _format_L_comment(attr: str | None, label_id: int, text: str, ctx: str = '')
     if ctx:
         body_text = f'{body_text}, ctx={ctx!r}'
     body_text = re.sub(r'-{2,}', lambda m: '\\u002d' * len(m[0]), body_text)
+    if label_id is not None:
+        body_text = f'{label_id}, {body_text}'
     if attr:
-        return f' L[{attr}]({label_id}, {body_text}) '
-    return f' L({label_id}, {body_text}) '
+        return f' L[{attr}]({body_text}) '
+    return f' L({body_text}) '
 
 
 def _parse_translate_comment(text: str) -> tuple[bool | None, dict[str, bool]]:
@@ -1533,7 +1538,16 @@ class Translate(TranslateBase):
                                  f'context {cm_ctx!r} — refusing to discard either; edit `ctx=` in the L() comment.')
                     sys.exit(1)
                 logger.warning(f'{path}:{node.node.sourceline}: :context={ctx}: duplicates L() comment on {target!r}, removed.')
-            if is_numeric:
+            if cm_id is None:
+                # `L[attr]('text')`: a new text, like `L('text')` in Python — ID found or given by `_add_label`,
+                # a number in XML is the old one (no longer referenced here)
+                if not is_numeric and text != cm_text:
+                    logger.error(f'{path}:{node.node.sourceline}: L() comment text mismatch on {target!r}: '
+                                 f'XML={text!r}, comment={cm_text!r} — refusing to discard either; '
+                                 f'pick one source of truth.')
+                    sys.exit(1)
+                label = Label(None, cm_text, ctx=cm_ctx)
+            elif is_numeric:
                 xml_id = int(text)
                 if xml_id != cm_id:
                     logger.warning(

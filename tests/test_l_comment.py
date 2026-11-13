@@ -20,6 +20,9 @@ from kolang import _parse_L_comment as _parse_l_comment, _format_L_comment
     # context
     ("L[label](30100, 'Open', ctx='verb')", ('label', 30100, 'Open', 'verb')),
     ("L(30100, 'Open', ctx = \"menu: file\")", (None, 30100, 'Open', 'menu: file')),
+    # without ID: a new text
+    ("L[label]('Configuration')", ('label', None, 'Configuration', '')),
+    ("L('Open', ctx='verb')", (None, None, 'Open', 'verb')),
 ])
 def test_parse(comment, expected):
     assert _parse_l_comment(comment) == expected
@@ -49,6 +52,7 @@ def test_parse_invalid(comment):
     (None, 30100, 'A\\B'),
     (None, 30100, 'Filmy żółte'),
     (None, 30100, ''),
+    ('label', None, 'New text'),
 ])
 def test_roundtrip(attr, label_id, text):
     body = _format_L_comment(attr, label_id, text)
