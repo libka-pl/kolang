@@ -56,6 +56,19 @@ class GenerateStats:
     obsolete: int = 0
 
 
+@dataclass(frozen=True)
+class ImportEntry:
+    """Translation from `--import`: `msgstr` of `msgid`, `id` and `ctx` narrow the PO entry if the import has them."""
+
+    msgid: str
+    msgstr: str
+    #: Where the translation comes from, for warnings (`file:line` or `file: lang 'msgid'`).
+    where: str
+    id: int | None = None
+    ctx: str = ''
+    fuzzy: bool = False
+
+
 class NoFreeIdError(ValueError):
     """No free label ID in the ID range."""
 
@@ -171,6 +184,12 @@ class XmlValueInput:
 def local_now():
     tz = timezone(timedelta(seconds=round((datetime.now() - datetime.utcnow()).total_seconds())))
     return datetime.now(tz)
+
+
+def _addon_root(path: Path) -> Path | None:
+    """Return the add-on folder of `path`: the nearest folder (`path` itself or up) with addon.xml, None if none."""
+    path = path.resolve()
+    return next((p for p in (path, *path.parents) if (p / 'addon.xml').is_file()), None)
 
 
 def _git_root(path: Path) -> Path | None:
@@ -1016,6 +1035,8 @@ class Translate(TranslateBase):
         #: Map id → new (ctx, text) for labels renamed in `generate()`. Used by
         #: `translate()` to update the matching `msgid` in each PO.
         self._renamed_ids: dict[int, tuple[str, str]] = {}
+        #: Translations from `--import` per language, written into the PO by `translate()`.
+        self.imports: dict[str, list[ImportEntry]] = {}
         #: Files that are (or with `--dry-run` / `--check` would be) written because their content changes.
         self.changed: list[Path] = []
         #: `#:` references in PO: 'none', 'file', 'line'; None → derived from the base language PO (`#:` there).
@@ -1926,10 +1947,12 @@ class Translate(TranslateBase):
                    *,
                    skip: set[Path] = set(),
                    l8funcs: list[L8Func] | None = None,
-                   root: Path | None = None) -> None:
+                   root: Path | None = None,
+                   explicit: bool = False) -> None:
         """Load input file / py-dir (XML / py) and keep data.
 
         Source leaving `root` (addon dir, default: the dir itself or the file's dir) through a symlink is read-only.
+        An `explicit` file (given on the command line) is scanned even if git doesn't track it (`--git-only`).
         """
         res = None
         path = Path(path)
@@ -1953,7 +1976,7 @@ class Translate(TranslateBase):
                     logger.debug(f'Skipping non-tracked: {p}')
                 else:
                     res = self._load_input(p, l8funcs=l8funcs, readonly=dir_leaves or (p.is_symlink() and _leaves_root(p, root)))
-        elif not self._is_git_tracked(path):
+        elif not explicit and not self._is_git_tracked(path):
             logger.debug(f'Skipping non-tracked: {path}')
         else:
             res = self._load_input(path, l8funcs=l8funcs, readonly=_leaves_root(path, root))
@@ -2609,6 +2632,47 @@ class Translate(TranslateBase):
             logger.warning(f'{path}: Plural-Forms {header!r} differs from {expected!r} ({lang}){at}; '
                            f'fix the PO header')
 
+    def _apply_imports(self, lang: str, po: polib.POFile) -> tuple[int, int]:
+        """Write `--import` translations of `lang` into `po`, return the number of (imported, changed) translations.
+
+        Entry found by `msgid` (and ID, context if the import has them); an existing translation is replaced,
+        `fuzzy` follows the import.
+        """
+        imported = changed = 0
+        by_msgid: dict[str, list[polib.POEntry]] = {}
+        for entry in po:
+            if not entry.obsolete:
+                by_msgid.setdefault(entry.msgid, []).append(entry)
+        for imp in self.imports.get(lang, ()):
+            same = by_msgid.get(imp.msgid, [])
+            found = [e for e in same if (imp.id is None or e.msgctxt == f'#{imp.id}')
+                     and (not imp.ctx or self._entry_ctx(e) == imp.ctx)]
+            if len(found) != 1:
+                ids = ', '.join(e.msgctxt or 'no ID' for e in found or same)
+                other = next((e for e in po if imp.id is not None and e.msgctxt == f'#{imp.id}' and not e.obsolete),
+                             None)
+                if found:
+                    why = f'in {len(found)} entries ({ids}), give msgctxt "#ID"'
+                elif other is not None:
+                    why = f'#{imp.id} is {other.msgid!r} now'
+                elif same:
+                    why = f'not #{imp.id} or other context (it is {ids})'
+                else:
+                    why = 'not in PO (text not in sources?)'
+                logger.warning(f'{imp.where}: {imp.msgid!r} {why}, not imported')
+                continue
+            entry = found[0]
+            if entry.msgstr == imp.msgstr and entry.fuzzy == imp.fuzzy:
+                continue
+            if entry.msgstr:
+                changed += 1
+            else:
+                imported += 1
+            entry.msgstr, entry.fuzzy = imp.msgstr, imp.fuzzy
+            if not imp.fuzzy:
+                entry.previous_msgid = entry.previous_msgctxt = None   # `#|` belongs to a fuzzy entry
+        return imported, changed
+
     def _check_translations(self, lang: str, path: Path, po: polib.POFile) -> None:
         """Warn on translations broken at runtime: plural header, wrong number of `|||` forms, placeholders."""
         self._check_plural_header(lang, path, po)
@@ -2799,6 +2863,7 @@ class Translate(TranslateBase):
                              and int(mch.group('id')) in self._moved_ids and id(entry) not in kept)]
             for i in reversed(to_remove):
                 del po[i]
+        imported, changed = self._apply_imports(lang, po)
         for entry in po:
             # placeholders in msgid → msgfmt -c and PO editors check them in translations
             try:
@@ -2849,6 +2914,10 @@ class Translate(TranslateBase):
                 mv += f', fuzzy: {fz}'
             if pd := sum(1 for e in po if not e.msgctxt and not e.obsolete):
                 mv += f', pending: {pd}'
+            if imported:
+                mv += f', imported: {imported}'
+            if changed:
+                mv += f', changed: {changed}'
             if lang == BASE_LANG:
                 print(f'Language {lang}: translated: ---- ({tr}/{N}), obsolete: {ob}{nw}{mv}')
             else:
@@ -2978,7 +3047,8 @@ class Translate(TranslateBase):
             self.obsolete = ObsoleteAction.MARK if val else ObsoleteAction.KEEP
         if val := options.pop('obsolete', None):
             self.obsolete = ObsoleteAction(val)
-        if (val := options.pop('get-localized-string', None)) is not None:
+        val = options.pop('get-localized-string', None)
+        if val is not None and 'get-localized-string' not in self._cli_options:
             self.handle_getLocalizedString = bool(val)
         paths = []
         for source in conf.get('sources', []):
@@ -3053,18 +3123,99 @@ def unescape(text: str | None) -> str | None:
     return text.encode('latin-1', 'backslashreplace').decode('unicode-escape')
 
 
+def _import_lang(name: str, code: str) -> str:
+    """Return the language code of `--import` language `code` (`name` is the source, for the error)."""
+    try:
+        return Translate.lang_code(code)
+    except ValueError as exc:
+        raise ValueError(f'{name}: {exc}') from None
+
+
+def _import_json(name: str, text: str) -> dict[str, list[ImportEntry]]:
+    """Parse `--import` JSON `{"lang": {"msgid": "msgstr", …}, …}`, raise ValueError on a bad one."""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f'{name}:{exc.lineno}:{exc.colno}: invalid JSON: {exc.msg}') from None
+    if not isinstance(data, dict) or not all(isinstance(texts, dict) for texts in data.values()):
+        raise ValueError(f'{name}: JSON must be an object {{"lang": {{"msgid": "msgstr", …}}, …}}')
+    result: dict[str, list[ImportEntry]] = {}
+    for code, texts in data.items():
+        lang = _import_lang(name, code)
+        for msgid, msgstr in texts.items():
+            if not isinstance(msgstr, str):
+                raise ValueError(f'{name}: {code} {msgid!r}: translation must be a string, not {msgstr!r}')
+            result.setdefault(lang, []).append(ImportEntry(msgid, msgstr, where=f'{name}: {code} {msgid!r}'))
+    return result
+
+
+def _import_po(name: str, text: str) -> dict[str, list[ImportEntry]]:
+    """Parse `--import` PO (language from the `Language:` header), raise ValueError on a bad one."""
+    try:
+        po = polib.pofile(text, encoding='utf-8')
+    except OSError as exc:
+        raise ValueError(f'{name}: {exc}') from None
+    if not (code := po.metadata.get('Language', '').strip()):
+        raise ValueError(f'{name}: no "Language:" in the PO header; add it, '
+                         f'or import JSON {{"pl": {{"msgid": "msgstr"}}}}')
+    lang = _import_lang(name, code)
+    entries: list[ImportEntry] = []
+    for entry in po:
+        if entry.obsolete or not entry.msgstr:
+            continue
+        if entry.msgctxt is not None and (mch := Translate._RE_LABEL_NUM.fullmatch(entry.msgctxt)) is None:
+            logger.warning(f'{name}:{entry.linenum}: msgctxt {entry.msgctxt!r} is not "#ID", not imported')
+            continue
+        entries.append(ImportEntry(entry.msgid, entry.msgstr, where=f'{name}:{entry.linenum}',
+                                   id=int(mch['id']) if entry.msgctxt is not None else None,
+                                   ctx=Translate._entry_ctx(entry), fuzzy=entry.fuzzy))
+    return {lang: entries}
+
+
+def load_imports(sources: Sequence[str]) -> dict[str, list[ImportEntry]]:
+    """Read `--import` sources (`-` is stdin): JSON if the text starts with `{` or `[`, PO otherwise; exit on error."""
+    imports: dict[str, list[ImportEntry]] = {}
+    if list(sources).count('-') > 1:
+        logger.error('--import -: stdin can be read only once')
+        sys.exit(1)
+    for src in sources:
+        name = '<stdin>' if src == '-' else src
+        try:
+            text = (sys.stdin.buffer.read() if src == '-' else Path(src).read_bytes()).decode('utf-8-sig')
+            if not (head := text.lstrip()[:1]):
+                logger.warning(f'{name}: empty, nothing to import')
+                continue
+            data = _import_json(name, text) if head in ('{', '[') else _import_po(name, text)
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            logger.error(f'--import {exc}' if isinstance(exc, ValueError) else f'--import {name}: {exc}')
+            sys.exit(1)
+        for lang, entries in data.items():
+            imports.setdefault(lang, []).extend(entries)
+    return imports
+
+
+#: Options both on the command line and in `.kolang.json` (config name → `Translate` argument): not given (None)
+#: on the command line → the config sets it, else the `Translate` default.
+_CLI_CONFIG_OPTIONS: dict[str, str] = {
+    'id-policy': 'id_policy', 'addon-id': 'addon_id', 'get-localized-string': 'handle_getLocalizedString',
+    'backup-pattern': 'backup_pattern', 'mark-translated': 'mark_translated', 'multi-line-msg': 'multi_line_msg',
+    'po-wrap-width': 'po_wrap_width', 'encoding': 'encoding', 'git-only': 'git_only', 'rename': 'rename',
+}
+
+
 def process(inputs, *, args, langs=None, output=None):
+    """Scan `inputs`, update their IDs and the PO files of `langs` (and of the add-on config) as `args` say."""
+    cli = {name: val for name, arg in _CLI_CONFIG_OPTIONS.items()
+           if (val := getattr(args, 'gls' if arg == 'handle_getLocalizedString' else arg)) is not None}
     trans = Translate(dry_run=args.dry_run or args.check, dump_output=args.debug_cat_output,
                       dump_translations=args.debug_cat_translation, list_entries=args.list or (),
                       id_from=args.id_from, id_min=args.id_min, id_max=args.id_max,
-                      id_policy=args.id_policy, addon_id=args.addon_id,
-                      handle_getLocalizedString=args.gls, backup_pattern=args.backup_pattern,
-                      mark_translated=args.mark_translated, multi_line_msg=args.multi_line_msg,
-                      po_wrap_width=args.po_wrap_width, reserved_ids=args.id_reserve,
-                      git_only=args.git_only,
+                      reserved_ids=args.id_reserve,
                       cleanup_translate_comments=args.cleanup_translate_comments,
-                      rename=args.rename, compact_ids=args.compact_ids,
+                      compact_ids=args.compact_ids,
+                      **{_CLI_CONFIG_OPTIONS[name]: val for name, val in cli.items()},
                       )
+    trans._cli_options |= cli.keys()
     trans.skin = args.type == 'skin'
     if args.verbose:
         logging.basicConfig(level=args.verbose)
@@ -3077,17 +3228,22 @@ def process(inputs, *, args, langs=None, output=None):
     l8funcs = [L8Func(re.escape(name)) for name in args.localized_functions or ()]
     base = ''
     conf = None
-    if not output:
-        for path in inputs:
-            path = Path(path).resolve()
-            if path.is_dir() and (path / 'addon.xml').exists():
-                base = path
-                conf = trans.load_addon_config(path)
-                if conf:
-                    langs |= conf.langs
-                    l8funcs += conf.l8funcs
-                logger.info(f'Language storage is in {path}')
-                break
+    # add-on (and its .kolang.json) of `-t`, else of the first PATH (a file or folder inside the add-on too)
+    for path in [*([output] if output else []), *inputs]:
+        if (root := _addon_root(Path(path))) is not None:
+            base = root
+            conf = trans.load_addon_config(root)
+            if conf:
+                langs |= conf.langs
+                l8funcs += conf.l8funcs
+            logger.info(f'Add-on is {root}')
+            break
+    # some files only: what isn't scanned is unknown, not obsolete
+    some_files = any(not Path(path).is_dir() for path in inputs)
+    if some_files and args.obsolete is None and trans.obsolete is not ObsoleteAction.KEEP:
+        logger.warning(f'Only some files scanned: "obsolete": "{trans.obsolete.value}" from .kolang.json ignored '
+                       f'(keep), use --obsolete or scan the add-on folder')
+        trans.obsolete = ObsoleteAction.KEEP
 
     addon_type = 'resources/language/resource.language.{lang_lower}/strings.po'
     skin_type = 'language/resource.language.{lang_lower}/strings.po'
@@ -3119,6 +3275,12 @@ def process(inputs, *, args, langs=None, output=None):
                 except ValueError:
                     logger.warning(f'{lpath}: folder is not a language code, skipped')
     langs = _kodi_language_folders(langs, disk, pattern)
+    trans.imports = load_imports(args.imports or ())
+    for lang in sorted(trans.imports.keys() - (langs - {BASE_LANG})):
+        written = ', '.join(sorted(langs)) or 'no languages'
+        why = 'the base language' if lang == BASE_LANG else f'not written ({written})'
+        logger.warning(f'--import: {lang} is {why}, not imported')
+        del trans.imports[lang]
 
     was: dict[str, GenerateStats] = {}
     for lang in sorted(langs, key=lambda lang: (lang != BASE_LANG, lang)):  # base first: it wins if PO files are out of sync
@@ -3137,7 +3299,7 @@ def process(inputs, *, args, langs=None, output=None):
             else:
                 logger.warning(f'There is NOT an addon in {path}, skipping')
         else:
-            trans.load_input(path, l8funcs=l8funcs)
+            trans.load_input(path, l8funcs=l8funcs, root=Path(base) if base else None, explicit=True)
 
     # override settings from command-line
     if args.obsolete is not None:
@@ -3433,7 +3595,8 @@ def main(argv=None):
                    help='path string.po or folder with it or to resource folder, default "."')
     p.add_argument('-L', '--language', metavar='LANG', action='extend', type=parse_lang_arg,
                    help='new language like "en", "en_US", "pl"')
-    p.add_argument('--mark-translated', action='store_true', help='copy original string to all non-translated entries')
+    p.add_argument('--mark-translated', action='store_true', default=None,
+                   help='copy original string to all non-translated entries')
     p.add_argument('--remove', action='store_const', const='remove', dest='obsolete',
                    help='remove unused translations (alias for --obsolete=remove)')
     p.add_argument('--id-from', metavar='NUM', type=int, default=None,
@@ -3442,10 +3605,10 @@ def main(argv=None):
                    help=f'warn if any label ID is below NUM [--id-from, skin {Translate.SKIN_ID_RANGE[0]}]')
     p.add_argument('--id-max', metavar='NUM', type=int, default=None,
                    help=f'highest label ID for new entries [{Translate.ID_MAX_DEFAULT}, skin {Translate.SKIN_ID_RANGE[1]}]')
-    p.add_argument('--id-policy', choices=('max', 'min'), default='max', help='new label ID policy [max]')
+    p.add_argument('--id-policy', choices=('max', 'min'), help='new label ID policy [max]')
     p.add_argument('--id-reserve', metavar='ID[-ID]...', type=parse_ranges,
                    help='reserve IDs, move another to keep the range empty')
-    p.add_argument('--get-localized-string', dest='gls', action='store_true', default=True,
+    p.add_argument('--get-localized-string', dest='gls', action='store_true', default=None,
                    help='handle getLocalizedString() [default]')
     p.add_argument('--no-get-localized-string', dest='gls', action='store_false',
                    help='skip getLocalizedString()')
@@ -3457,20 +3620,20 @@ def main(argv=None):
     p.add_argument('--obsolete', choices=('keep', 'mark', 'remove'),
                    help='what to do with obsolete/non-used translations [keep]')
     p.add_argument('-s', '--skip', metavar='PATH', action='append', help='skip path')
-    p.add_argument('--backup-pattern', metavar='PATTERN', default='{}~', help='pattern for backup files [{}~]')
+    p.add_argument('--backup-pattern', metavar='PATTERN', help='pattern for backup files [{}~]')
     p.add_argument('--no-backup-pattern', action='store_const', const=False, dest='backup_pattern',
                    help='no backup files')
-    p.add_argument('--encoding', default='utf8', help='force files encoding [utf8]')
-    p.add_argument('--po-wrap-width', metavar='WIDTH', default=999999, type=int, help='.po wrap width [999999]')
+    p.add_argument('--encoding', help='force files encoding [utf8]')
+    p.add_argument('--po-wrap-width', metavar='WIDTH', type=int, help='.po wrap width [999999]')
     p.add_argument('-c', '--config', type=Path, help='load config [ADDON/.kolang.json]')
     p.add_argument('--single-line-msg', action='store_false', dest='multi_line_msg',
                    help='write po messages in single line [default]')
     p.add_argument('--multi-line-msg', action='store_true', dest='multi_line_msg',
                    help='write po messages in many lines if \\n is used')
-    p.set_defaults(multi_line_msg=False)
-    p.add_argument('--git-only', action='store_true', default=False,
+    p.set_defaults(multi_line_msg=None)
+    p.add_argument('--git-only', action='store_true', default=None,
                    help='scan only files tracked by git (in the index)')
-    p.add_argument('--no-rename', dest='rename', action='store_false', default=True,
+    p.add_argument('--no-rename', dest='rename', action='store_false', default=None,
                    help='disable in-place ID rename when text edits would otherwise '
                         'orphan an untranslated entry (default: rename when safe)')
     p.add_argument('--cleanup-translate-comments', action='store_true', default=False,
@@ -3494,6 +3657,9 @@ def main(argv=None):
     p.add_argument('--reset-ids', metavar='REF',
                    help='remove IDs new on this branch (not in PO at merge base with REF) before merge into REF, '
                         'translations wait in PO without ID; run kolang on REF after the merge')
+    p.add_argument('--import', dest='imports', metavar='FILE', action='append',
+                   help='write translations from FILE (repeatable, "-" is stdin): PO with the "Language:" header, '
+                        'or JSON {"pl": {"msgid": "msgstr"}} (the text starting with "{"); replaces existing ones')
     p.add_argument('--list', action='append', choices=('fuzzy', 'untranslated'),
                    help='list fuzzy or untranslated entries per language (repeatable), with --dry-run nothing is written')
     p.add_argument('--test-plural', help='test plural form and exit')
@@ -3516,7 +3682,7 @@ def main(argv=None):
     # print(args); exit()
 
     if args.generate_kolang_py:
-        copy_kolang_py(args.input[0], backup_pattern=args.backup_pattern)
+        copy_kolang_py(args.input[0], backup_pattern='{}~' if args.backup_pattern is None else args.backup_pattern)
         return
     if args.git_setup:
         git_setup(args.input)

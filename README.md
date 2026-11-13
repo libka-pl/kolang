@@ -526,6 +526,7 @@ Most-used options:
 | `--git-setup` | `.gitattributes`, merge driver, `post-merge` hook (see Git) |
 | `--reset-ids REF` | remove IDs new on the branch before merge into `REF` (see Git) |
 | `--list WHAT` | list `fuzzy` or `untranslated` entries per language (repeatable); with `--dry-run` it's a read-only report |
+| `--import FILE` | write translations from a PO or JSON file, `-` is stdin (repeatable, see below) |
 | `--verbose` / `--debug` | more output |
 | `--generate-kolang-py` | drop `kolang.py` (the runtime `L()` helper) into PATH, a changed one is overwritten (backup unless git restores it) |
 
@@ -534,7 +535,13 @@ Run `python kolang.pyz --help` for the complete list.
 ID range defaults follow the addon type: a skin (`xbmc.gui.skin` in `addon.xml` or `--type skin`) gets 31100–31999,
 because Kodi finds skin strings by number (`$LOCALIZE[N]`, `<label>N</label>`) only in 31000–31999 — a numeric
 reference to an own string outside it is reported. Other addons get 30100–32999 (33000–33999 are Kodi core strings).
-`--id-from` / `--id-min` / `--id-max` on the command line win over `.kolang.json`.
+An option given on the command line wins over `.kolang.json`, the config wins over the default.
+
+PATH can be the add-on folder, or files and folders inside it. Without `-c`, `.kolang.json` comes from the add-on of
+`-t`, else of the first PATH: the nearest folder up with `addon.xml` (its languages, functions, options; its
+`sources` only when PATH is the add-on folder). PO files without `-t` are those of that add-on. A file given as PATH
+is scanned even with `--git-only` when git doesn't track it. When PATH names files, not the whole add-on, a string
+not seen may still be used elsewhere: `obsolete` of the config is ignored then (warning), `--obsolete` still works.
 
 New IDs go above the highest used one (`--id-policy max`); when the top of the range is full, they fill gaps from
 `--id-from` (warning). With no free ID at all kolang stops with a hint: raise `--id-max`, free IDs held by unused PO
@@ -547,6 +554,29 @@ numbered around them. Unused PO entries follow the used ones (`--obsolete remove
 merge or `--reset-ids` other branches (every ID line changes), check that no other addon or skin uses the strings by
 number (kolang can't see them), commit (kolang refuses uncommitted sources/PO). `L()` in comments is not rewritten.
 Try `--dry-run --compact-ids` first (`move id: old → new`).
+
+#### Importing translations (`--import`)
+
+Translations made outside a PO editor (a script, an AI agent, a translator's PO file) go in with `--import FILE`,
+in the same run that gives new texts their IDs. `-` reads stdin. The format comes from the text, not the file
+name: starting with `{` (or `[`) it is JSON, else PO.
+
+```sh
+kolang --import - resources/lib/main.py <<'END'
+{"pl": {"Viewer": "Podgląd", "Owner": "Właściciel"}}
+END
+kolang --import translated.po .
+```
+
+- JSON: `{"lang": {"msgid": "msgstr", …}, …}`.
+- PO: the language from the `Language:` header (a PO without it is an error). `msgctxt "#ID"` and the
+  `#. context: …` comment, when there, narrow the entry; `#, fuzzy` goes along; entries with an empty `msgstr`
+  are skipped.
+- The entry is found by `msgid`. An existing translation is replaced (`changed: n` in the language line, new ones
+  `imported: n`), `fuzzy` is cleared. A text not in PO, an ID with another text, a text in several entries
+  (contexts) without `msgctxt`, the base language: warning, not imported.
+- Plural forms and `{placeholders}` are checked as on every run. `--dry-run` shows the result without writing.
+- An error (missing file, invalid JSON or PO, no `Language:`) stops kolang before anything is written.
 
 ---
 
