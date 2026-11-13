@@ -1,6 +1,7 @@
 """XML layout: a written XML keeps the layout of its source.
 
-Line breaks and spacing inside start tags, the whitespace around the top-level nodes (B41), `>` in text (B42).
+Line breaks and spacing inside start tags, the whitespace around the top-level nodes (B41), `>` in text (B42),
+empty elements (B44), BOM (B48), U+2000–U+200F (B49).
 """
 from __future__ import annotations
 
@@ -60,9 +61,11 @@ BODY = f'<settings>\n  {MOVIES}/>\n</settings>'
     pytest.param(f'{BODY}\n\n<!-- after -->\n<?pi x?>\n\n', id='epilog'),
     pytest.param(f'<?xml version="1.0"?>\n{BODY}', id='no-final-newline'),
     pytest.param(f'<?xml version="1.0"?>\n<!-- a -->{BODY}<!-- z -->', id='glued-kept'),
+    pytest.param(f'\ufeff<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n{BODY}\n', id='bom'),
+    pytest.param(f'\ufeff{BODY}\n', id='bom-no-declaration'),
 ])
 def test_top_level_whitespace(addon, kolang_run, src):
-    """Comments and PIs around the root keep their lines, the end of the file keeps its newlines (or none)."""
+    """Comments and PIs around the root keep their lines, the end keeps its newlines (or none), BOM stays."""
     assert _run_settings(addon, kolang_run, src) == _translated(src)
 
 
@@ -108,3 +111,18 @@ def test_new_top_level_comment(tmp_path):
     tree.getroot().addnext(etree.Comment(' end '))
     tr._write_xml(tr.xml_inputs[-1])
     assert path.read_bytes() == b'<?xml version="1.0"?>\n<!-- new -->\n<r>\n  <x/>\n</r>\n<!-- end -->\n\n'
+
+
+def test_empty_element_kept(addon, kolang_run):
+    """`<x></x>` stays (lxml writes `<x/>`), also with a prefix and with a translated attribute; `<x/>` stays."""
+    src = ('<settings xmlns:ff="ff">\n'
+           f'  {MOVIES}></setting>\n'
+           '  <a></a>\n  <b x="1"\n     ></b>\n  <ff:c></ff:c>\n  <d/>\n'
+           '</settings>\n')
+    assert _run_settings(addon, kolang_run, src) == _translated(src)
+
+
+def test_space_refs(addon, kolang_run):
+    """U+2000–U+200F written as a reference stay so (lxml writes them raw), raw ones stay raw."""
+    src = f'<settings>\n  {MOVIES}/>\n  <x>a&#x200b;b&#8204;c\u200dd\u2009e</x>\n</settings>\n'
+    assert _run_settings(addon, kolang_run, src) == _translated(src)

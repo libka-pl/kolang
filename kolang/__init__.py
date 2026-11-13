@@ -128,6 +128,8 @@ class XmlInput:
     top_space: dict[Element | None, str] = field(default_factory=dict, repr=False)
     #: No escaped `>` in the text of the source: `>` written as is, not as lxml's `&gt;` (B42).
     raw_gt: bool = False
+    #: U+2000–U+200F written in the source as references → the reference (kept, the rest stays raw)
+    space_refs: dict[str, str] = field(default_factory=dict, repr=False)
 
 
 @dataclass
@@ -897,14 +899,19 @@ class Translate(TranslateBase):
     _RE_ADDON = re.compile(r'\$ADDON\[(?:(?P<addon>[A-Za-z]\w*(?:\.\w+)+)\s+)?'
                            r'(?:\s*(?P<id>\d+)\s*|(?P<text>(?:\[[^]*]|"[^"]*"|[^]])*))\]')
     #                        r'(?:\s*(?P<id>\d+)\s*|(?P<text>(?:\[[^]*]|"[^"]*"|(?<!\$ADDON)[^]])*))\]')
-    _RE_XML_DECL: re.Pattern = re.compile(r'''\s*<\?(?:"(?:\.|[^"])*"|'(?:\.|[^'])*'|[^>])*>\s*''')
+    # BOM and declaration, both optional (kept as written)
+    _RE_XML_DECL: re.Pattern = re.compile(r'''\ufeff?'''
+                                          r'''(?:\s*<\?(?:"(?:\.|[^"])*"|'(?:\.|[^'])*'|[^>])*>\s*)?''')
     # bytes-version of _RE_XML_DECL — used before we know the file's encoding
-    _RE_XML_DECL_BYTES: re.Pattern = re.compile(rb'''\s*<\?(?:"(?:\.|[^"])*"|'(?:\.|[^'])*'|[^>])*>\s*''')
+    _RE_XML_DECL_BYTES: re.Pattern = re.compile(rb'''(?:\xef\xbb\xbf)?'''
+                                                rb'''\s*<\?(?:"(?:\.|[^"])*"|'(?:\.|[^'])*'|[^>])*>\s*''')
     _RE_XML_DECL_ENCODING: re.Pattern = re.compile(rb'''encoding\s*=\s*['"]([^'"]+)['"]''')
     # XML markup tokens, only start tags are captured (`tag`), the rest is skipped.
     _RE_XML_START_TAG: re.Pattern = re.compile(r'''<!--.*?-->|<!\[CDATA\[.*?\]\]>|<\?.*?\?>|<!DOCTYPE(?:[^>\[]|\[.*?\])*>|</[^>]*>'''
                                                r'''|(?P<tag><[^\s/>!?](?:[^>"']|"[^"]*"|'[^']*')*>)''', re.DOTALL)
     _RE_XML_ATTR: re.Pattern = re.compile(r'''([^\s=<>/]+)\s*=\s*("[^"]*"|'[^']*')''')
+    _RE_XML_TAG_NAME: re.Pattern = re.compile(r'<([^\s/>]+)')
+    _RE_XML_CHAR_REF: re.Pattern = re.compile(r'&#(?:x([0-9a-fA-F]+)|([0-9]+));')
     # Markup (as _RE_XML_START_TAG, group `markup`) or an escaped `>` in the text (not after `]]`: it stays escaped).
     _RE_XML_TEXT_GT: re.Pattern = re.compile(rf'''(?P<markup>{_RE_XML_START_TAG.pattern})'''
                                              r'''|(?<!\]\])&(?:gt|#0*62|#x0*3[eE]);''', re.DOTALL)
@@ -1692,8 +1699,10 @@ class Translate(TranslateBase):
         start_tags = dict(zip(elems, tags)) if len(tags) == len(elems) else {}
         top_space = self._top_level_space(tree, content, len(decl or ''))
         raw_gt = all(m['markup'] for m in self._RE_XML_TEXT_GT.finditer(content))
+        space_refs = {chr(code): m[0] for m in self._RE_XML_CHAR_REF.finditer(content)
+                      if 0x2000 <= (code := int(m[1], 16) if m[1] else int(m[2])) <= 0x200f}
         self.xml_inputs.append(XmlInput(path, tree, base, declaration=decl, encoding=encoding, original=content_bytes, start_tags=start_tags,
-                                        readonly=readonly, top_space=top_space, raw_gt=raw_gt))
+                                        readonly=readonly, top_space=top_space, raw_gt=raw_gt, space_refs=space_refs))
         if readonly:
             self._readonly_roots[tree.getroot()] = path
         self._scan_xml(tree, path=path)
@@ -2424,7 +2433,10 @@ class Translate(TranslateBase):
         return html.unescape(re.sub(r'\r\n|[\t\n\r]', ' ', source[1:-1]))
 
     def _restore_start_tags(self, input: XmlInput, body: str) -> str:
-        """Put back original start tags (lxml joins multi-line tags), with changed attribute values patched in place."""
+        """Put back original start tags (lxml joins multi-line tags), with changed attribute values patched in place.
+
+        An empty element written as `<x></x>` stays so (lxml writes `<x/>`).
+        """
         elems = iter(input.tree.iter(etree.Element))
 
         def restore(m: re.Match) -> str:
@@ -2432,6 +2444,12 @@ class Translate(TranslateBase):
             if not new:
                 return m[0]
             old = input.start_tags.get(next(elems, None))
+            if old is not None and new.endswith('/>') and not old.endswith('/>'):  # lxml writes `<x></x>` as `<x/>`
+                return start_tag(old, new[:-2].rstrip() + '>') + f'</{self._RE_XML_TAG_NAME.match(old)[1]}>'
+            return start_tag(old, new)
+
+        def start_tag(old: str | None, new: str) -> str:
+            """Return the source start tag `old` with the changed values of `new`, or `new` if they don't match."""
             if old is None or old == new or old.endswith('/>') != new.endswith('/>'):
                 return new
             new_attrs = dict(self._RE_XML_ATTR.findall(new))
@@ -2446,17 +2464,16 @@ class Translate(TranslateBase):
     def _write_xml(self, input):
         decl = input.declaration or ''
         encoding = input.encoding
-
-        def entity(m: re.Match) -> str:
-            code = ord(m[0])
-            return f'&#x{code:04x};'
         body = etree.tostring(input.tree, encoding=encoding, xml_declaration=False).decode(encoding)
         body = self._put_top_level_space(input, body)
         if input.start_tags:
             body = self._restore_start_tags(input, body)
         if input.raw_gt:
             body = self._RE_XML_TEXT_GT.sub(lambda m: m['markup'] or '>', body)
-        data = re.sub(r'[\u2000-\u200f]', entity, decl + body).encode(encoding)
+        body = decl + body
+        if input.space_refs:  # lxml writes them raw
+            body = re.sub(f'[{"".join(input.space_refs)}]', lambda m: input.space_refs[m[0]], body)
+        data = body.encode(encoding)
         if input.readonly:
             if data != input.original:
                 logger.warning(f'Not written: {input.path} -> {input.path.resolve()} (symlink outside the addon)')

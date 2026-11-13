@@ -20,8 +20,8 @@ def test_entities_in_attribute(addon, kolang_run, po_path):
     assert 'msgid "<tag> html"' in po
 
 
-def test_settings_xml_re_encodes_invisible_range(addon, kolang_run):
-    """Invisible-range char in :translate=false: stays as literal in XML, re-encoded."""
+def test_settings_xml_keeps_raw_invisible_range(addon, kolang_run):
+    """Invisible-range char in :translate=false: stays raw as in the source (B49: only references stay references)."""
     (addon / 'resources' / 'settings.xml').write_text(
         '<settings>'
         '<!-- :translate=false: -->'
@@ -31,5 +31,5 @@ def test_settings_xml_re_encodes_invisible_range(addon, kolang_run):
     rc, _ = kolang_run()
     assert rc == 0
     out = (addon / 'resources' / 'settings.xml').read_text(encoding='utf-8')
-    assert '&#x2009;' in out
-    assert ' ' not in out
+    assert '&#x2009;' not in out
+    assert ' ' in out
