@@ -46,6 +46,27 @@ FALLBACK_LOCALE: str = 'en-US'
 SOURCE_LOCALE: str = 'en-GB'
 
 
+#: Kodi addon folders in the order Kodi scans them (`AddonManager.cpp`).
+ADDON_FOLDERS: tuple[str, ...] = ('special://home/addons', 'special://xbmc/addons', 'special://xbmcbin/addons')
+#: Language of a locale → language of its Kodi language addon, if it differs (`no-NO` → `resource.language.nb_no`).
+LANGUAGE_ALIASES: dict[str, str] = {'no': 'nb'}
+
+
+def _addon_folders() -> list[Path]:
+    """Return existing Kodi addon folders (`ADDON_FOLDERS`), none without Kodi."""
+    try:
+        from xbmcvfs import translatePath
+    except ModuleNotFoundError:
+        # DEBUG & TESTS  (run w/o Kodi)
+        return []
+    return [path for folder in ADDON_FOLDERS if (path := Path(translatePath(folder))).is_dir()]
+
+
+def _language_folder(locale: str) -> str:
+    """Return Kodi language folder (addon) name suffix for the locale: `pl-PL` → `pl_pl`, `en-` → `en`."""
+    return locale.lower().replace('-', '_').rstrip('_')
+
+
 def _default_plural(n: int) -> int:
     """Gettext default plural rule: two forms, the first one for 1."""
     return int(n != 1)
@@ -131,7 +152,7 @@ class LabelGetter:
     def _po_path(self, locale: str) -> Path | None:
         """Find the addon PO file for the locale like Kodi loads it: exact `ll_cc` folder, then `en_gb`."""
         base = Path(self.addon.getAddonInfo('path')) / 'resources' / 'language'
-        for name in (f'resource.language.{locale.lower().replace("-", "_")}', 'resource.language.en_gb'):
+        for name in (f'resource.language.{_language_folder(locale)}', 'resource.language.en_gb'):
             if (path := base / name / 'strings.po').is_file():
                 return path
         return None
@@ -266,12 +287,46 @@ class KodiLabels:
         except RuntimeError:
             return None
 
+    def _po_path(self) -> Path | None:
+        """Find `strings.po` of the Kodi language addon for the locale, without `Addon()` (no exception logged).
+
+        Addon folders like Kodi (home first). Language addon: exact `ll_cc`, then the UI language addon if it has
+        the same language (`pt-PT` → `pt_br`), then the first `ll_*` alphabetically (`en-US` → `en_gb`).
+        Known limits: a disabled addon is read too, an addon in two folders is taken from the first one
+        (Kodi takes the higher version).
+        """
+        folders = _addon_folders()
+
+        def lang_of(locale: str) -> tuple[str, str]:
+            """Return (language, `ll_cc` folder suffix) of the locale, with the language alias applied."""
+            lang, _, region = _language_folder(locale).partition('_')
+            lang = LANGUAGE_ALIASES.get(lang, lang)
+            return lang, f'{lang}_{region}' if region else lang
+
+        def find(name: str) -> Path | None:
+            """Return `strings.po` of the language addon `name` from the first folder having it."""
+            for folder in folders:
+                if (path := folder / name / 'resources' / 'strings.po').is_file():
+                    return path
+            return None
+
+        lang, exact = lang_of(self.locale)
+        names = [f'resource.language.{exact}']
+        ui_lang, ui_exact = lang_of(kodi_locale())
+        if ui_lang == lang:
+            names.append(f'resource.language.{ui_exact}')
+        names.extend(sorted({path.name for folder in folders for path in folder.glob(f'resource.language.{lang}_*')}))
+        for name in names:
+            if path := find(name):
+                return path
+        return None
+
     @property
     def raw_translations(self) -> dict[int, tuple[str, str]]:
         """Get raw translations [id] = (en, loc), lazy loading."""
         if self._translations is None:
-            if addon := self.addon:
-                path = Path(addon.getAddonInfo('path')) / 'resources' / 'strings.po'
+            self._translations = {}
+            if path := self._po_path():
                 try:
                     with open(path, encoding='utf-8') as f:
                         self._translations = {
@@ -279,10 +334,8 @@ class KodiLabels:
                                              self._join_po_strings(mch['loc']))
                             for mch in self._rx.finditer(f.read())
                         }
-                except IOError:
-                    self._translations = {}
-            else:
-                self._translations = {}
+                except OSError as exc:
+                    _log(f'Can not read {path}: {exc}', 'warning')
         return self._translations
 
     @property
@@ -298,10 +351,10 @@ class KodiLabels:
         return {num: loc or en for num, (en, loc) in self.raw_translations.items()}
 
     def __call__(self, id: int | str) -> str:
-        """Get localized label."""
-        default = f'#{id}'
+        """Get localized label. English text without translation is returned as is, number as `#number`."""
         if isinstance(id, str):
-            return self.en_to_locale_translations.get(id, default)
+            return self.en_to_locale_translations.get(id, id)
+        default = f'#{id}'
         en, loc = self.raw_translations.get(id, (default, default))
         return loc or en
 
