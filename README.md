@@ -255,6 +255,46 @@ covers `L()` in `{…}` / raw Python values of the element. The same text used i
 more places gets all its notes. PO lines follow the sources on every run;
 other `#.` lines are kept.
 
+#### Lazy labels (`LL()`)
+
+`L()` returns the text in the Kodi language of the moment of the call. A call made too early keeps that
+language: on module level, in a class body, in a default argument or a decorator argument, in `__init__` of a
+long living object. It matters in a reused interpreter (`<reuselanguageinvoker>true</reuselanguageinvoker>`), in a
+service and in a long living window; a plain plugin starts a new interpreter on every call.
+
+`LL()` takes the same arguments (kolang scans it like `L()`) and returns a label translated when used:
+
+```python
+from kolang import L, LL
+
+TITLE = LL(30100, 'Movies')
+FILES = LL(30101, '{n} file|||{n} files')
+
+f'{TITLE}: …'                  # f-string (format spec too)
+str(TITLE)                     # Kodi API needs str: ListItem(str(TITLE))
+TITLE()                        # call
+FILES(n=3)                     # format arguments and n= when used (or given to LL())
+
+class Menu:
+    title = LL(30102, 'Settings')    # descriptor: Menu().title is str, Menu.title the lazy label
+```
+
+The text is kept until the Kodi language changes, using it is cheaper than `L()`. There is no `+` and no `==`
+(`'x ' + TITLE` raises `TypeError`; use an f-string). `Enum` doesn't make a descriptor a member, use
+`enum.member(LL(…))` (Python 3.11+); a `dataclass` default stays the lazy label.
+
+Language change: Kodi doesn't notify about it (it reloads addon strings and the skin). The runtime checks the Kodi
+language at most every second (`LANGUAGE_CHECK_INTERVAL`) when an `LL()` text or a plural rule is used, and for
+2 s after a change (`LANGUAGE_SETTLE`) it reads texts again: Kodi changes the language a few ms before it reloads
+addon strings. So a change is seen within about 1 s (up to 3 s while settling). `kolang.reset()` checks at once, e.g.:
+
+- Kodi 22: `xbmc.Monitor.onNotification` with `sender == 'xbmc'` and `method == 'GUI.OnSkinLoaded'` (the skin is
+  reloaded after a language change, addon strings are already new). Kodi 22 closes addon windows on a skin reload
+  (`GUI.OnSkinUnloading`); reopen them on `GUI.OnSkinLoaded`. Kodi 21 sends no notification.
+- a plugin call in a reused interpreter (before routing), `onInit` of a window, a service loop.
+
+The plural rule follows the language the same way (before it was kept until `reset()`).
+
 #### In XML — three independent layers
 
 **Plain text / attribute** (settings & skin standard places):

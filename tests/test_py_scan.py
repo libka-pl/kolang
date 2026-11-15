@@ -62,3 +62,17 @@ def test_reset_concatenated(addon: Path, kolang_run) -> None:
     t._replace_py(data, file=None)
     tr = t._by_id[30204].trans[0]
     assert data[:tr.start] + data[tr.id_end:] == "c = L('Part one '\n      'part two')\n"
+
+
+def test_lazy_ll(addon: Path, kolang_run, po_path: Path) -> None:
+    """`LL()` (lazy L, B57) is scanned like `L()`: ID inserted, same text same ID, ID-only call is used."""
+    py = addon / 'main.py'
+    py.write_text("from kolang import L, LL\nA = LL('Movies')\nb = L('Movies')\nC = LL('{n} file|||{n} files', n=2)\n"
+                  'D = LL(30200)\n', encoding='utf-8')
+    po_path.write_text(HEADER + 'msgctxt "#30200"\nmsgid "Ref"\nmsgstr ""\n\n', encoding='utf-8')
+    rc, out = kolang_run('--obsolete', 'mark')
+    assert rc == 0, out
+    assert py.read_text(encoding='utf-8') == (
+        "from kolang import L, LL\nA = LL(30201, 'Movies')\nb = L(30201, 'Movies')\n"
+        "C = LL(30202, '{n} file|||{n} files', n=2)\nD = LL(30200)\n")
+    assert '#~' not in po_path.read_text(encoding='utf-8')

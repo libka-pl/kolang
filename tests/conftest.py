@@ -29,6 +29,14 @@ ADDON_XML = textwrap.dedent('''
 ''').strip()
 
 
+@pytest.fixture(autouse=True)
+def kolang_runtime_state():
+    """Forget the runtime `kolang.py` state (language epoch, plural rules) before each test."""
+    from kolang import kolang
+    kolang.destroy()
+    yield
+
+
 @pytest.fixture
 def addon(tmp_path: Path):
     """Create a fresh addon skeleton in `tmp_path`. Returns the addon path."""
